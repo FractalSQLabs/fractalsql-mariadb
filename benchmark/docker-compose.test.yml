@@ -1,10 +1,10 @@
-# mariadb-fractalsql benchmark harness.
+# fractalsql-mariadb benchmark harness.
 #
 # Two services, each pinned to exactly one CPU so numbers are
 # reproducible across machines with different core counts:
 #
-#   mariadb  — runs the target server with the UDF pre-installed
-#   tester   — Node.js 24 driver that issues the benchmark queries
+#   mariadb  : runs the target server with the UDF pre-installed
+#   tester   : Node.js 24 driver that issues the benchmark queries
 #
 # Parameterise the server version via env:
 #   MARIADB_IMAGE=mariadb:10.6  FRACTAL_SO=fractal_mdb106.so  \

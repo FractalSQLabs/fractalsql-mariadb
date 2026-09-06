@@ -1,0 +1,76 @@
+services:
+  mariadb:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: demo
+    environment:
+      MARIADB_ROOT_PASSWORD: fractalsql
+      MARIADB_DATABASE: fractalsql_demo
+      # fractal_reason()/fractal_embed() read these once, on first call,
+      # from mysqld's process environment. See src/fractalsql_cognition.c's
+      # file header for why this is env vars rather than my.cnf system
+      # variables: mariadbd has no live-reloadable config mechanism a
+      # dlopen'd UDF library can hook into the way postgres's GUC system
+      # allows.
+      # Points at the "ollama" service below, which is up by default
+      # with NO model pulled: setting these unconditionally is
+      # harmless (nothing calls fractal_reason()/fractal_embed() unless
+      # you do, and a call before pulling a model gets a clear
+      # model-not-found error, not a broken install). Pull a model with
+      # the `pull-model` profile.
+      FRACTALSQL_REASONING_PLUGIN: /usr/lib/mysql/plugin/fractalsql-reasoning-http.so
+      FRACTALSQL_HTTP_URL: http://ollama:11434/v1/chat/completions
+      FRACTALSQL_HTTP_ALLOW_PLAINTEXT: "1"
+      FRACTALSQL_HTTP_MODEL: gpt-oss:20b
+      FRACTALSQL_HTTP_EMBED_URL: http://ollama:11434/v1/embeddings
+      FRACTALSQL_HTTP_EMBED_MODEL: nomic-embed-text
+      # Matches fractalsql-postgresql's docker-compose.yml "Slow or
+      # constrained hardware" guidance verbatim. The reasoning-http
+      # plugin's request is non-streaming, so a cold-loading local
+      # model on CPU-only hardware shows no partial progress. These are
+      # FSQL_REASONING_HTTP_* (the reasoning plugin's own env vars, not
+      # FRACTALSQL_* config bridged by fractalsql_cognition.c), read
+      # directly by fractalsql-reasoning-http.so itself.
+      FSQL_REASONING_HTTP_TIMEOUT_MS: "330000"
+      FSQL_REASONING_HTTP_LOW_SPEED_SECS: "300"
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Ollama is up by DEFAULT (no profile) with NO model pulled, the bare
+  # minimum turnkey state, matching fractalsql-postgresql's
+  # docker-compose.yml. Model download is user-initiated: run the
+  # `pull-model` one-shot below (or
+  # `docker compose exec ollama ollama pull <model>`). See
+  # docs/reasoning-setup.md for model choice rationale (gpt-oss:20b
+  # default, nomic-embed-text for embeddings).
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # --profile pull-model: opt-in one-shot that pulls gpt-oss:20b +
+  # nomic-embed-text into the ollama_data volume. Run with:
+  #   docker compose --profile pull-model run --rm pull-model
+  pull-model:
+    image: ollama/ollama:latest
+    profiles: ["pull-model"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "ollama:11434"
+    entrypoint: ["/bin/sh", "-c", "ollama pull gpt-oss:20b && ollama pull nomic-embed-text"]
+
+volumes:
+  ollama_data:

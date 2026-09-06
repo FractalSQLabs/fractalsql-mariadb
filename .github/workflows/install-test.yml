@@ -1,0 +1,484 @@
+name: Install test (packaging)
+
+# End-to-end validation of the shipped .deb and .rpm packages, across
+# every MariaDB major in the compat matrix (10.6 / 10.11 / 11.4 LTS /
+# 12.2 rolling), not just whatever major each distro's own default
+# repo happens to carry. Builds the artifacts, installs them into a
+# clean per-major MariaDB (via the MariaDB Foundation's own repo setup
+# script, the mariadb.org/mariadb.com equivalent of PGDG, auto-
+# detecting apt vs. yum), loads the UDFs, exercises fractal_search and
+# its params-bounds caps, then a reasoning round-trip against a
+# mock OpenAI-compatible endpoint (one gated major per family, the same
+# "don't run the same fixed-reply mock N times" reasoning as
+# fractalsql-postgresql's own install-test.yml). Also covers the
+# Rocky 8 legacy-glibc .rpm channel and a native macOS (Homebrew)
+# build+install, neither of which fit the per-major matrix model.
+#
+# NOTE: this workflow is drafted against MariaDB Foundation's
+# documented repo-setup flow (downloads.mariadb.com/MariaDB/
+# mariadb_repo_setup) but has not yet been run against real GitHub
+# Actions infrastructure. First real run may need small fixes to the
+# repo-setup invocation; everything else (package layout, UDF install,
+# smoke checks) mirrors build_test.sh's already-verified assertions.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-artifacts:
+    name: Build .so + .deb + .rpm (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build fractalsql.so
+        run: |
+          chmod +x build.sh
+          ./build.sh amd64
+      - name: Install fpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+      - name: Package .deb and .rpm (modern)
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh amd64
+
+      # Legacy profile (glibc 2.28), for RHEL 8 / Ubuntu 20.04-class
+      # hosts. Built unconditionally so the rocky8 smoke job below has
+      # something to test.
+      - name: Build fractalsql.so (legacy profile)
+        run: PROFILE=legacy ./build.sh amd64
+      - name: Package .deb and .rpm (legacy)
+        run: PROFILE=legacy scripts/package.sh amd64
+
+      - run: ls -l dist/packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-amd64
+          path: dist/packages/*
+          retention-days: 1
+          if-no-files-found: error
+
+  debian-install:
+    name: Debian, install + UDF exec (mdb${{ matrix.mdb }})
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mdb: ['10.6', '10.11', '11.4', '12.2']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install + verify in ubuntu:24.04 with mariadb-server ${{ matrix.mdb }}
+        env:
+          MDB_VER: ${{ matrix.mdb }}
+        run: |
+          cat > test-deb.sh <<SCRIPT
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y curl gnupg lsb-release ca-certificates
+
+          # MariaDB Foundation's repo setup pins one specific major
+          # (Ubuntu's own repos only ship one MariaDB major per
+          # release, the same problem PGDG solves for postgres).
+          curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+          chmod +x mariadb_repo_setup
+          ./mariadb_repo_setup --mariadb-server-version="mariadb-\${MDB_VER}" --skip-maxscale
+          apt-get update -qq
+          apt-get install -qq -y mariadb-server mariadb-client
+
+          mkdir -p /var/run/mysqld
+          chown mysql:mysql /var/run/mysqld
+
+          # Reasoning env must be in mariadbd's environment before it
+          # starts: fractalsql_cognition.c/fractalsql_textsql.c read
+          # FRACTALSQL_* via getenv() once, not a sysvar. Exported
+          # unconditionally; harmless on majors where this job's later
+          # reasoning step is skipped.
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib/mysql/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
+          mariadbd --user=mysql &
+          for i in \$(seq 1 120); do
+              mariadb-admin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb-admin ping
+
+          apt-get install -qq -y ./dist/packages/fractalsql-mariadb-amd64.deb
+
+          PLUGIN_DIR=\$(mariadb -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="\${PLUGIN_DIR%/}"
+          echo "plugin_dir: \$PLUGIN_DIR"
+          test -f "\$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from \$PLUGIN_DIR"; ls -la "\$PLUGIN_DIR" || true; exit 1; }
+          test -f "\$PLUGIN_DIR/fractalsql-reasoning-http.so" \
+              || { echo "FAIL: fractalsql-reasoning-http.so missing from \$PLUGIN_DIR"; exit 1; }
+          ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
+              || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
+
+          mariadb < /work/sql/install_udf.sql
+          mariadb < /work/sql/install_agents.sql
+
+          EDITION=\$(mariadb -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
+          VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
+          echo "edition=\$EDITION version=\$VERSION"
+          test "\$EDITION" = "Community"
+          test "\$VERSION" = "2.0.0"
+
+          # End-to-end fractal_search smoke. Trivial 4-row corpus, query
+          # equals row 0; expect a JSON document with dim/n_corpus/top_k.
+          RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
+          echo "\$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+
+          # Params bounds aligned to postgres (iterations<=10000,
+          # pop_size<=100000, diff_factor<=32). Verify each just-over-cap
+          # value is rejected (UDF sets *error=1, non-zero client exit).
+          for over_params in \
+              '{"iterations":10001}' \
+              '{"population_size":100001}' \
+              '{"diffusion_factor":33}'; do
+              if mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null; then
+                  echo "FAIL: expected rejection on params=\$over_params"; exit 1
+              fi
+              echo "ok: params-bound cap rejects \$over_params"
+          done
+          echo "ok: Debian install + UDF exec (mdb\${MDB_VER})"
+
+          # --- Reasoning + text-to-sql round-trip against a mock LLM --
+          # One major carries this (same reasoning as postgres's
+          # install-test.yml gating its tests/*.py block to pg16 --
+          # every major runs the identical mock, so N-major redundancy
+          # buys nothing beyond proving the plugin loads/links, which
+          # the ldd check above already covers on every cell).
+          if [ "\${MDB_VER}" = "11.4" ]; then
+              apt-get install -qq -y python3
+              python3 /work/scripts/ci/mock_llm.py 18080 &
+              MOCK_PID=\$!
+              for i in \$(seq 1 50); do
+                  (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+                  sleep 0.2
+              done
+
+              REASON=\$(mariadb -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
+              echo "reason reply: \${REASON:0:80}"
+              echo "\$REASON" | grep -qi sql \
+                  || { echo "FAIL: reasoning round-trip returned '\$REASON'"; kill \$MOCK_PID 2>/dev/null || true; exit 1; }
+              echo "ok: reasoning round-trip via mock endpoint (mdb\${MDB_VER})"
+
+              T2S=\$(mariadb -N -B -e "SELECT fractal_t2s_generate(CONNECTION_ID(), 'how many rows', '', NULL)")
+              echo "t2s generate: \${T2S:0:80}"
+              echo "\$T2S" | grep -qi select \
+                  || { echo "FAIL: text-to-sql GENERATE returned '\$T2S'"; kill \$MOCK_PID 2>/dev/null || true; exit 1; }
+              echo "ok: text-to-sql GENERATE round-trip via mock endpoint (mdb\${MDB_VER})"
+
+              kill \$MOCK_PID 2>/dev/null || true
+          fi
+          SCRIPT
+          chmod +x test-deb.sh
+          docker run --rm \
+              -e MDB_VER="${MDB_VER}" \
+              -v "${{ github.workspace }}:/work" -w /work \
+              ubuntu:24.04 bash /work/test-deb.sh
+
+  rpm-install:
+    name: RHEL (Rocky 9), install + UDF exec (mdb${{ matrix.mdb }})
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mdb: ['10.6', '10.11', '11.4', '12.2']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install + verify in rockylinux:9 with mariadb-server ${{ matrix.mdb }}
+        env:
+          MDB_VER: ${{ matrix.mdb }}
+        run: |
+          cat > test-rpm.sh <<SCRIPT
+          set -euo pipefail
+
+          # MariaDB Foundation's repo setup, same script as the Debian
+          # job, auto-detects dnf and pins the requested major.
+          curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+          chmod +x mariadb_repo_setup
+          ./mariadb_repo_setup --mariadb-server-version="mariadb-\${MDB_VER}" --skip-maxscale
+          dnf install -qy MariaDB-server MariaDB-client
+
+          mkdir -p /var/lib/mysql /var/log/mariadb /var/run/mariadb
+          chown -R mysql:mysql /var/lib/mysql /var/log/mariadb /var/run/mariadb
+          mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mariadb/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
+          mariadbd --user=mysql &
+          for i in \$(seq 1 120); do
+              mariadb-admin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb-admin ping
+
+          dnf install -qy ./dist/packages/fractalsql-mariadb-amd64.rpm
+
+          PLUGIN_DIR=\$(mariadb -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="\${PLUGIN_DIR%/}"
+          echo "plugin_dir: \$PLUGIN_DIR"
+          test -f "\$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from \$PLUGIN_DIR"; ls -la "\$PLUGIN_DIR" || true; exit 1; }
+          test -f "\$PLUGIN_DIR/fractalsql-reasoning-http.so" \
+              || { echo "FAIL: fractalsql-reasoning-http.so missing from \$PLUGIN_DIR"; exit 1; }
+          ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
+              || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
+
+          mariadb < /work/sql/install_udf.sql
+          mariadb < /work/sql/install_agents.sql
+
+          EDITION=\$(mariadb -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
+          VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
+          echo "edition=\$EDITION version=\$VERSION"
+          test "\$EDITION" = "Community"
+          test "\$VERSION" = "2.0.0"
+
+          RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
+          echo "\$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+
+          for over_params in \
+              '{"iterations":10001}' \
+              '{"population_size":100001}' \
+              '{"diffusion_factor":33}'; do
+              if mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null; then
+                  echo "FAIL: expected rejection on params=\$over_params"; exit 1
+              fi
+              echo "ok: params-bound cap rejects \$over_params"
+          done
+          echo "ok: RPM install + UDF exec (mdb\${MDB_VER})"
+
+          if [ "\${MDB_VER}" = "11.4" ]; then
+              dnf install -qy python3
+              python3 /work/scripts/ci/mock_llm.py 18080 &
+              MOCK_PID=\$!
+              for i in \$(seq 1 50); do
+                  (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+                  sleep 0.2
+              done
+
+              REASON=\$(mariadb -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
+              echo "reason reply: \${REASON:0:80}"
+              echo "\$REASON" | grep -qi sql \
+                  || { echo "FAIL: reasoning round-trip returned '\$REASON'"; kill \$MOCK_PID 2>/dev/null || true; exit 1; }
+              echo "ok: reasoning round-trip via mock endpoint (mdb\${MDB_VER})"
+
+              kill \$MOCK_PID 2>/dev/null || true
+          fi
+          SCRIPT
+          chmod +x test-rpm.sh
+          docker run --rm \
+              -e MDB_VER="${MDB_VER}" \
+              -v "${{ github.workspace }}:/work" -w /work \
+              rockylinux:9 bash /work/test-rpm.sh
+
+  rpm-install-rocky8:
+    name: RHEL (Rocky 8), install legacy .rpm + UDF exec
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install + verify in rockylinux:8 with mariadb-server
+        run: |
+          cat > test-rpm-legacy.sh <<'SCRIPT'
+          set -euo pipefail
+          # Rocky 8's AppStream ships mariadb-server natively (10.3 by
+          # default). The legacy build only cares that the UDF ABI is
+          # stable across majors, which it has been since 10.x, so no
+          # per-major matrix is needed here, unlike debian-install/
+          # rpm-install above.
+          dnf install -qy mariadb-server mariadb
+
+          mkdir -p /var/lib/mysql /var/log/mariadb /var/run/mariadb
+          chown -R mysql:mysql /var/lib/mysql /var/log/mariadb /var/run/mariadb
+          mysql_install_db --user=mysql --datadir=/var/lib/mysql 2>/dev/null \
+              || mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+          mysqld --user=mysql 2>/dev/null &
+          MARIADBD_PID=$!
+
+          for i in $(seq 1 120); do
+              mysqladmin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mysqladmin ping
+
+          # Install our LEGACY .rpm, built against glibc 2.28 so it
+          # actually loads on RHEL 8. The modern .rpm would fail at
+          # ld.so time on this host.
+          dnf install -qy ./dist/packages/fractalsql-mariadb-legacy-amd64.rpm
+
+          PLUGIN_DIR=$(mysql -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="${PLUGIN_DIR%/}"
+          echo "plugin_dir: $PLUGIN_DIR"
+          test -f "$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from $PLUGIN_DIR"; ls -la "$PLUGIN_DIR" || true; exit 1; }
+
+          mysql < /work/sql/install_udf.sql
+
+          EDITION=$(mysql -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
+          VERSION=$(mysql -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
+          echo "edition=$EDITION version=$VERSION"
+          test "$EDITION" = "Community"
+          test "$VERSION" = "2.0.0"
+
+          RESULT=$(mysql -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): ${RESULT:0:200}"
+          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+          echo "ok: Rocky 8 + legacy .rpm + UDF exec"
+          SCRIPT
+          chmod +x test-rpm-legacy.sh
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work \
+              rockylinux:8 bash /work/test-rpm-legacy.sh
+
+  macos-install:
+    name: macOS, build + install + reason (Homebrew, arm64)
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MariaDB (Homebrew) + client headers
+        run: |
+          set -euo pipefail
+          brew install mariadb mariadb-connector-c pkg-config
+          brew services start mariadb
+          for i in $(seq 1 30); do
+              mariadb -uroot -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb -uroot -e 'SELECT 1'
+
+      - name: Compile fractalsql.dylib (native arm64)
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
+          MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
+          mkdir -p dist/darwin
+          clang -Wall -Wextra -O3 -fPIC \
+              -arch arm64 \
+              ${MDB_CFLAGS} \
+              -Iinclude \
+              -ffunction-sections -fdata-sections -fvisibility=default \
+              -dynamiclib \
+              -Wl,-dead_strip \
+              -o dist/darwin/fractalsql.dylib \
+              src/fractalsql.c \
+              src/fractalsql_session.c \
+              src/fractalsql_vector.c \
+              src/fractalsql_cognition.c \
+              src/fractalsql_textsql.c \
+              src/fractalsql_enterprise.c \
+              "${CORE_A}" \
+              -lm -lpthread
+          ls -l dist/darwin/fractalsql.dylib
+
+      - name: Install into Homebrew's mariadb plugin_dir + register UDFs
+        run: |
+          set -euo pipefail
+          PLUGIN_DIR=$(mariadb -uroot -N -B -e "SELECT @@plugin_dir")
+          echo "plugin_dir: ${PLUGIN_DIR}"
+          cp dist/darwin/fractalsql.dylib "${PLUGIN_DIR}/fractalsql.so"
+          cp include/darwin-arm64/fractalsql-reasoning-http.so "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+          mariadb -uroot < sql/install_udf.sql
+          mariadb -uroot < sql/install_agents.sql
+
+          EDITION=$(mariadb -uroot -N -B -e "SELECT fractalsql_edition();")
+          VERSION=$(mariadb -uroot -N -B -e "SELECT fractalsql_version();")
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+          test "${VERSION}" = "2.0.0"
+
+          RESULT=$(mariadb -uroot -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
+          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "ok: macOS build + install + fractal_search"
+
+      - name: Reasoning round-trip against a mock endpoint
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/mock_llm.py 18080 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              nc -z 127.0.0.1 18080 >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          # Reasoning config is a process env var, read once by
+          # fractalsql_cognition.c. It must be set BEFORE mariadbd's
+          # next dlopen of a reasoning path. Restart via brew services
+          # so the new environment actually takes.
+          PLUGIN_DIR=$(mariadb -uroot -N -B -e "SELECT @@plugin_dir")
+          brew services stop mariadb
+          export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+          export FRACTALSQL_HTTP_URL="http://127.0.0.1:18080/v1/chat/completions"
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+          # brew services runs under launchd, which won't inherit this
+          # shell's export, so run mariadbd directly instead for this
+          # one check, matching the Linux jobs' manual-start pattern.
+          MARIADB_DATADIR=$(mariadb -uroot -N -B -e "SELECT @@datadir" 2>/dev/null || echo "$(brew --prefix)/var/mysql")
+          "$(brew --prefix mariadb)/bin/mariadbd" \
+              --datadir="${MARIADB_DATADIR}" --socket=/tmp/fsql_install_test.sock \
+              --skip-networking=0 --port=13306 --pid-file=/tmp/fsql_install_test.pid &
+          MDB_PID=$!
+          for i in $(seq 1 50); do
+              mariadb -uroot -P13306 --protocol=tcp -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 0.5
+          done
+
+          REPLY=$(mariadb -uroot -P13306 --protocol=tcp -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');")
+          echo "reason reply: ${REPLY:0:80}"
+          kill "${MOCK_PID}" 2>/dev/null || true
+          kill "${MDB_PID}" 2>/dev/null || true
+          echo "$REPLY" | grep -qi sql \
+              || { echo "FAIL: reasoning round-trip returned '${REPLY}'"; exit 1; }
+          echo "ok: macOS reasoning round-trip via mock endpoint"

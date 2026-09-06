@@ -1,0 +1,26 @@
+-- demo/enterprise-stress.sql
+--
+-- This file exercises a SQL surface this extension doesn't expose in
+-- this shape:
+--
+--   - A directly queryable `fractalsql_ledger` SQL TABLE. The ledger
+--     here is file-backed, not table-backed (MariaDB's C UDF ABI has
+--     no way for a UDF to run SQL against its own calling session).
+--     An optional read-only SQL mirror does exist, see
+--     sql/install_enterprise_connect.sql.
+--   - A `fractalsql_enterprise_ledger_key` system variable. Every
+--     FractalSQL config knob, enterprise tier included, is a process
+--     environment variable (FRACTALSQL_ENTERPRISE_LEDGER_KEY here),
+--     not a MariaDB sysvar/GUC.
+--
+-- The underlying capability both of those surfaced (an append-only,
+-- tamper-evident hash chain, `fractal_ledger_verify()`, HMAC tamper
+-- tagging) is implemented and working here too, just accessed through
+-- `fractal_ledger_*` functions and process environment variables
+-- instead of a table and a sysvar. See demo/enterprise-qtl-audit.sql
+-- for that working surface end to end.
+--
+-- This file is kept as a marker of the specific SQL shape above,
+-- rather than deleted outright or rewritten to hide the difference.
+
+SELECT 'demo/enterprise-stress.sql: this specific SQL surface (a directly queryable fractalsql_ledger TABLE and a fractalsql_enterprise_ledger_key sysvar) is not available in this extension. The underlying ledger capability is available through fractal_ledger_* functions and FRACTALSQL_ENTERPRISE_LEDGER_KEY instead, see demo/enterprise-qtl-audit.sql.' AS notice;

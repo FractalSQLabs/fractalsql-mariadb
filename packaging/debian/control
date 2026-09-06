@@ -1,56 +1,38 @@
-Source: mariadb-fractalsql
+Source: fractalsql-mariadb
 Section: database
 Priority: optional
 Maintainer: FractalSQLabs <ops@fractalsqlabs.io>
 Build-Depends:
  debhelper-compat (= 13),
- libluajit-5.1-dev,
  libmariadb-dev,
  pkg-config
 Standards-Version: 4.6.2
-Homepage: https://github.com/FractalSQLabs/mariadb-fractalsql
+Homepage: https://github.com/FractalSQLabs/fractalsql-mariadb
 
-Package: mariadb-fractalsql-v10.6
+# Reference-only control file: scripts/package.sh (fpm-based) is the
+# actual build/package path used by CI (release.yml, install-test.yml)
+# and documented in scripts/package.sh's own header -- it emits a
+# single generic fractalsql-mariadb_<version>_<arch>.deb, not a
+# per-major package, since the UDF ABI is stable across MariaDB
+# 10.6/10.11/11.4 LTS/12.2 rolling. This file is kept for maintainers
+# who prefer a native dpkg-buildpackage flow instead of fpm -- it is
+# not exercised by any workflow in this repo.
+Package: fractalsql-mariadb
 Architecture: amd64 arm64
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
- libc6 (>= 2.38),
- libluajit-5.1-2,
- libmariadb3,
- mariadb-server-10.6 | mariadb-server (>= 10.6)
-Description: Stochastic Fractal Search UDF for MariaDB 10.6
- mariadb-fractalsql registers the fractal_search() UDF, a LuaJIT-
- backed Stochastic Fractal Search optimizer that returns JSON top-k
- matches for a query vector against an inline corpus. Compiled
- against the MariaDB 10.6 UDF ABI.
-
-Package: mariadb-fractalsql-v10.11
-Architecture: amd64 arm64
-Depends:
- ${shlibs:Depends},
- ${misc:Depends},
- libc6 (>= 2.38),
- libluajit-5.1-2,
- libmariadb3,
- mariadb-server-10.11 | mariadb-server (>= 10.11)
-Description: Stochastic Fractal Search UDF for MariaDB 10.11
- mariadb-fractalsql registers the fractal_search() UDF, a LuaJIT-
- backed Stochastic Fractal Search optimizer that returns JSON top-k
- matches for a query vector against an inline corpus. Compiled
- against the MariaDB 10.11 UDF ABI.
-
-Package: mariadb-fractalsql-v11.4
-Architecture: amd64 arm64
-Depends:
- ${shlibs:Depends},
- ${misc:Depends},
- libc6 (>= 2.38),
- libluajit-5.1-2,
- libmariadb3,
- mariadb-server (>= 11.4) | mariadb-server-11.4
-Description: Stochastic Fractal Search UDF for MariaDB 11.4 LTS
- mariadb-fractalsql registers the fractal_search() UDF, a LuaJIT-
- backed Stochastic Fractal Search optimizer that returns JSON top-k
- matches for a query vector against an inline corpus. Compiled
- against the MariaDB 11.4 LTS UDF ABI.
+ libc6 (>= 2.34),
+ libcurl4,
+ mariadb-server
+Description: Stochastic Fractal Search UDF for MariaDB
+ fractalsql-mariadb registers the fractal_search() UDF, a Stochastic
+ Fractal Search optimizer that returns JSON top-k matches for a query
+ vector against an inline corpus, plus the full Discovery/Vector/
+ Cognition/Text-to-SQL/Agency/Enterprise-activation tier surface (see
+ docs/features.md). Pure-C vendored core, no LuaJIT runtime
+ dependency. Compatible with MariaDB 10.6 / 10.11 / 11.4 LTS / 12.2
+ rolling -- the UDF ABI has been stable across these majors. The
+ bundled fractalsql-reasoning-http.so plugin (Cognition/Text-to-SQL/
+ Vectorizer/Agency tiers) dynamically links libcurl at runtime, hence
+ the libcurl4 dependency above.

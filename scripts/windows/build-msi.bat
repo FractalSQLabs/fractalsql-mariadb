@@ -8,13 +8,13 @@ REM One MSI per (MariaDB major, arch) pair. The resulting MSI installs
 REM into the target server's on-disk layout:
 REM
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\lib\plugin\fractalsql.dll
-REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\mariadb-fractalsql\LICENSE
-REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\mariadb-fractalsql\LICENSE-THIRD-PARTY
-REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\mariadb-fractalsql\install_udf.sql
+REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\fractalsql-mariadb\LICENSE
+REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\fractalsql-mariadb\LICENSE-THIRD-PARTY
+REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\fractalsql-mariadb\install_udf.sql
 REM
 REM That matches MariaDB's default Windows install layout, so end-users
 REM who took the MSI server installer can run:
-REM     mysql -u root -p ^< "C:\Program Files\MariaDB ^<VER^>\share\doc\mariadb-fractalsql\install_udf.sql"
+REM     mysql -u root -p ^< "C:\Program Files\MariaDB ^<VER^>\share\doc\fractalsql-mariadb\install_udf.sql"
 REM with no further path munging.
 REM
 REM Prerequisites
@@ -23,9 +23,9 @@ REM   * dist\windows\mdb^<MARIADB_MAJOR^>\fractalsql.dll already produced
 REM     by scripts\windows\build.bat.
 REM
 REM Environment
-REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 — selects UpgradeCode and install-folder name
-REM   MSI_ARCH      x64 ^| arm64 — passed to candle -arch
-REM   MSI_VERSION   overrides Product Version (default 1.0.0)
+REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 ^| 12.2: selects UpgradeCode and install-folder name
+REM   MSI_ARCH      x64 ^| arm64: passed to candle -arch
+REM   MSI_VERSION   overrides Product Version (default 2.0.0, read from src\fractalsql.c's FSQL_VERSION if not set)
 
 setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 
@@ -37,11 +37,17 @@ if "%MARIADB_MAJOR%"==""    (
     popd ^& exit /b 1
 )
 if "%MSI_ARCH%"==""    set MSI_ARCH=x64
-if "%MSI_VERSION%"=="" set MSI_VERSION=1.0.0
+if "%MSI_VERSION%"=="" (
+    for /f "tokens=3" %%V in ('findstr /r "^#define FSQL_VERSION" src\fractalsql.c') do set MSI_VERSION=%%~V
+)
+if "%MSI_VERSION%"=="" (
+    echo ==^> ERROR: could not read FSQL_VERSION from src\fractalsql.c; set MSI_VERSION explicitly
+    popd ^& exit /b 1
+)
 
 set DLL=dist\windows\mdb%MARIADB_MAJOR%\fractalsql.dll
 if not exist "%DLL%" (
-    echo ==^> ERROR: %DLL% missing — run build.bat with MARIADB_MAJOR=%MARIADB_MAJOR% first
+    echo ==^> ERROR: %DLL% missing: run build.bat with MARIADB_MAJOR=%MARIADB_MAJOR% first
     popd ^& exit /b 1
 )
 
@@ -55,7 +61,7 @@ mkdir "%STAGE%"
 copy /Y "%DLL%"                "%STAGE%\fractalsql.dll"     > nul
 copy /Y sql\install_udf.sql    "%STAGE%\install_udf.sql"    > nul
 copy /Y LICENSE                "%STAGE%\LICENSE"            > nul
-copy /Y LICENSE-THIRD-PARTY    "%STAGE%\LICENSE-THIRD-PARTY" > nul
+copy /Y THIRD-PARTY-NOTICES.md "%STAGE%\LICENSE-THIRD-PARTY" > nul
 
 REM Per-cell README ships in the MSI so users who only grab the .msi
 REM still see the "which MariaDB major, which arch" pairing without
@@ -69,15 +75,15 @@ REM hopping to GitHub.
   echo     C:\Program Files\MariaDB %MARIADB_MAJOR%\lib\plugin\fractalsql.dll
   echo.
   echo After install, activate the UDFs once per server:
-  echo     mysql -u root -p ^< "C:\Program Files\MariaDB %MARIADB_MAJOR%\share\doc\mariadb-fractalsql\install_udf.sql"
+  echo     mysql -u root -p ^< "C:\Program Files\MariaDB %MARIADB_MAJOR%\share\doc\fractalsql-mariadb\install_udf.sql"
   echo     mysql -u root -p -e "SELECT fractalsql_edition^(^), fractalsql_version^(^);"
 ) > "%STAGE%\README.txt"
 
 if not exist obj mkdir obj
 REM candle preprocessor can't take a dotted major without escaping;
 REM expose two sanitized variants:
-REM   MAJOR_TAG   — underscore-safe, used in WiX Ids and filenames
-REM   MAJOR_HEX   — 4-digit hex-safe, padded, used inside GUID strings
+REM   MAJOR_TAG   underscore-safe, used in WiX Ids and filenames
+REM   MAJOR_HEX   4-digit hex-safe, padded, used inside GUID strings
 REM                 which MUST be pure hex [0-9A-F].
 set MAJOR_TAG=%MARIADB_MAJOR:.=_%
 if "%MARIADB_MAJOR%"=="10.6"   set MAJOR_HEX=0A06
@@ -101,7 +107,7 @@ echo ==^> MSI_VERSION   = %MSI_VERSION%
 echo ==^> STAGE         = %STAGE%
 echo ==^> MSI           = %MSI%
 
-REM -arch propagates into $(sys.BUILDARCH) inside the WXS — used there
+REM -arch propagates into $(sys.BUILDARCH) inside the WXS, used there
 REM to set <Package Platform="..."/> and keep ICE80 happy about the
 REM component/directory bitness pairing.
 REM

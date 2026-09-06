@@ -1,6 +1,6 @@
 // benchmark/tester/run.js
 //
-// Minimal Node.js 24 driver for the mariadb-fractalsql UDF. Generates a
+// Minimal Node.js 24 driver for the fractalsql-mariadb UDF. Generates a
 // random corpus + query in JS, calls fractal_search() BENCH_ITERATIONS
 // times, records wall-clock latency, and prints mean / p50 / p95 / p99.
 //

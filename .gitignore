@@ -16,7 +16,7 @@ dist/
 *.deb
 *.rpm
 packaging/debian/.debhelper/
-packaging/debian/mariadb-fractalsql-v*/
+packaging/debian/fractalsql-mariadb-v*/
 packaging/debian/files
 packaging/debian/*.log
 packaging/debian/*.substvars
@@ -31,6 +31,10 @@ packaging/rpm/SRPMS/
 benchmark/tester/node_modules/
 benchmark/tester/package-lock.json
 benchmark/tester/results/
+
+# Python cache
+__pycache__/
+*.pyc
 
 # Editor / OS cruft
 .vscode/

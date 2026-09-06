@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  scripts/windows/fractalsql.wxs — WiX Toolset source for the
+  scripts/windows/fractalsql.wxs: WiX Toolset source for the
   FractalSQL MariaDB UDF Windows MSI.
 
   Driven by four preprocessor vars supplied by build-msi.bat:
-    -dMARIADB_MAJOR=10.6 | 10.11 | 11.4      (dotted, for display)
-    -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4  (sanitized, for WiX IDs)
+    -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.2 (dotted, for display)
+    -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_2 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-mdb...
-    -dMSI_VERSION=1.0.0
+    -dMSI_VERSION=2.0.0
   plus the standard candle -arch x64|arm64, which populates
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 
@@ -18,7 +18,7 @@
        folder that MariaDB's own MSI server installer created, i.e.
        the folder containing lib\plugin\.
     3. Install copies fractalsql.dll into lib\plugin\, and the
-       install SQL plus LICENSE files into share\doc\mariadb-fractalsql\.
+       install SQL plus LICENSE files into share\doc\fractalsql-mariadb\.
     4. Uninstall removes every file cleanly.
 
   Per-MariaDB-major UpgradeCode
@@ -61,7 +61,7 @@
 
     <!-- WixUI_InstallDir targets the MariaDB-install-root folder. The
          power-user override for a non-default MariaDB root (e.g.
-         D:\MariaDB\11.4) retargets the whole tree — fractalsql.dll
+         D:\MariaDB\11.4) retargets the whole tree: fractalsql.dll
          still lands under lib\plugin\ of that chosen root. PLUGINDIR
          is exposed separately for scripted installs that want to
          point the DLL at an even more unusual location. -->
@@ -82,7 +82,7 @@
                plugin\              fractalsql.dll
              share\
                doc\
-                 mariadb-fractalsql\ LICENSE
+                 fractalsql-mariadb\ LICENSE
                                      LICENSE-THIRD-PARTY
                                      install_udf.sql
                                      README.txt
@@ -95,7 +95,7 @@
           </Directory>
           <Directory Id="ShareDir" Name="share">
             <Directory Id="DocDir" Name="doc">
-              <Directory Id="FractalSqlDocDir" Name="mariadb-fractalsql" />
+              <Directory Id="FractalSqlDocDir" Name="fractalsql-mariadb" />
             </Directory>
           </Directory>
         </Directory>
@@ -103,7 +103,7 @@
     </Directory>
 
     <!-- Each file is its own Component so uninstall removes exactly
-         the set we installed — no orphan files, no touching existing
+         the set we installed: no orphan files, no touching existing
          MariaDB files. GUIDs embed MARIADB_MAJOR_TAG so each
          (major, file) pair is deterministic across rebuilds without
          colliding across majors. -->

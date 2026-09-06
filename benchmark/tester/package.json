@@ -1,8 +1,8 @@
 {
-  "name": "mariadb-fractalsql-tester",
+  "name": "fractalsql-mariadb-tester",
   "version": "1.0.0",
   "private": true,
-  "description": "Node.js 24 benchmark driver for the mariadb-fractalsql UDF.",
+  "description": "Node.js 24 benchmark driver for the fractalsql-mariadb UDF.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"

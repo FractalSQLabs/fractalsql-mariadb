@@ -1,0 +1,123 @@
+name: Post-release SBOM + Attestation + Sign
+
+# Runs after release.yml publishes a Release. Isolated from release.yml
+# by design: a failure here does not affect the Release's primary
+# artifacts, only the supplementary SBOM / attestation / signatures.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to process (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sbom-attest-sign:
+    name: SBOM + Attest + Sign
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+              echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Generate SPDX SBOM with Syft
+        uses: anchore/sbom-action@v0.20.7
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: fractalsql-mariadb-${{ steps.tag.outputs.tag }}.spdx.json
+          output-file: sbom.spdx.json
+          upload-release-assets: true
+          upload-artifact: true
+
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.tag.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --dir dist \
+              --pattern '*.deb' \
+              --pattern '*.rpm' \
+              --pattern '*.msi' \
+              --pattern '*.zip' \
+              || echo "note: no matching assets on release yet, continuing"
+          ls -la dist || true
+
+      - name: Check there is anything to sign
+        id: have_assets
+        run: |
+          count=$(find dist -maxdepth 1 -type f \
+                \( -name '*.deb' -o -name '*.rpm' -o -name '*.msi' -o -name '*.zip' \) \
+                2>/dev/null | wc -l)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "Found ${count} release artifact(s) to attest + sign."
+
+      - name: Attest build provenance
+        if: steps.have_assets.outputs.count != '0'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.msi
+            dist/*.zip
+
+      - name: Install cosign
+        if: steps.have_assets.outputs.count != '0'
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign release artifacts with cosign
+        if: steps.have_assets.outputs.count != '0'
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          for f in dist/*.deb dist/*.rpm dist/*.msi dist/*.zip; do
+              [ -f "$f" ] || continue
+              echo "--- signing $f ---"
+              cosign sign-blob \
+                  --yes \
+                  --output-signature "${f}.sig" \
+                  --output-certificate "${f}.pem" \
+                  "$f"
+          done
+
+      - name: Upload signatures + certs to release
+        if: steps.have_assets.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t sigs < <(ls dist/*.sig dist/*.pem 2>/dev/null || true)
+          if [ ${#sigs[@]} -eq 0 ]; then
+              echo "note: no signatures produced, nothing to upload"
+              exit 0
+          fi
+          gh release upload \
+              "${{ steps.tag.outputs.tag }}" \
+              "${sigs[@]}" \
+              --repo "${{ github.repository }}" \
+              --clobber

@@ -1,0 +1,365 @@
+name: build-test
+
+# Public CI wrapper around run_build_test.sh / build_test.sh: the same
+# scripts a dev runs locally, so local == CI (a convention shared with
+# fractalsql-core's foundry-tests.yml and fractalsql-postgresql's own
+# build-test.yml). Compiles fractalsql.so once (one .so covers every
+# MariaDB major, unlike postgres's per-major rebuild) and exercises the
+# behavioral gate suite (see build_test.sh's header for exactly which
+# gates exist and which are still pending) against a throwaway cluster
+# for every supported MariaDB major on every push/PR.
+#
+# docker/Dockerfile.test runs build_test.sh --mdb <major> as a RUN
+# step, so a passing `docker build` cell IS the test result: no
+# separate `docker run` / cluster-cleanup dance in the workflow itself.
+#
+# Extra jobs alongside the Linux/Docker gate matrix:
+#   windows-gate-matrix: build_test.ps1 (a PowerShell port of
+#              build_test.sh) against archive.mariadb.org's per-major
+#              winx64 zip, MariaDB 10.6/10.11/11.4/12.2 on
+#              windows-latest. Unverified as of this writing: written
+#              by direct translation from the verified-working
+#              build_test.sh but never run against a real Windows box,
+#              so this job's first real run is what will actually
+#              confirm or break it. See build_test.ps1's own
+#              .DESCRIPTION.
+#   darwin-gate-matrix: build_test.sh (the same script, unmodified) on
+#              macos-14 via Homebrew's `mariadb` formula. A single
+#              cell, not a 4-major matrix, since Homebrew's mariadb
+#              formula is not per-major the way fractalsql-postgresql's
+#              CI can rely on postgresql@<N> being: there is no
+#              mariadb@10.6 / mariadb@11.4 formula to select a specific
+#              major with. Whatever major Homebrew currently tracks is
+#              what this job tests.
+#   linux-asan / linux-ubsan: build_test.sh --asan / --ubsan, MariaDB
+#              11.4 LTS only (the recommended ASan/UBSan
+#              representative), weekly/workflow_dispatch-only cadence.
+#              Installs 11.4 directly via MariaDB's official apt repo
+#              on ubuntu-latest, not Docker, mirroring postgres's own
+#              linux-asan job's reasoning for avoiding a Debian-
+#              Bookworm-base Docker image: LD_PRELOADing a sanitizer
+#              runtime into a full-featured official image can hang
+#              the dynamic linker on some glibc builds. It's untested
+#              whether the mariadb:11.4 Docker image has the same
+#              problem postgres's postgres:16-bookworm image did, so
+#              this job sidesteps it the same way rather than assuming
+#              it's fine.
+#   windows-asan/windows-ubsan, darwin-asan/darwin-ubsan: same 11.4-
+#              only, weekly-cadence pattern as linux-asan/ubsan above.
+#   coverage: weekly/on-demand only. A gcov-instrumented build_test.sh
+#              --coverage run, with the lcov/genhtml report uploaded as
+#              a workflow artifact. Note that the Makefile does not
+#              currently wire COVERAGE=1/ASAN=1/UBSAN=1 through to
+#              CFLAGS/LDFLAGS (see build_test.sh gate_01's own TODO
+#              comment), so this job runs today but is not yet actually
+#              measuring instrumented coverage until that Makefile gap
+#              closes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 5 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate-matrix:
+    name: build_test mdb${{ matrix.mdb }}
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mdb: ["10.6", "10.11", "11.4", "12.2"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: docker build (runs build_test.sh --mdb ${{ matrix.mdb }})
+        run: |
+          set -euo pipefail
+          chmod +x run_build_test.sh
+          ./run_build_test.sh --mdb ${{ matrix.mdb }}
+
+  windows-gate-matrix:
+    name: build_test.ps1 mdb${{ matrix.mdb }} (Windows)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mdb: "10.6"
+            mariadb_ver: "10.6.20"
+          - mdb: "10.11"
+            mariadb_ver: "10.11.10"
+          - mdb: "11.4"
+            mariadb_ver: "11.4.4"
+          - mdb: "12.2"
+            mariadb_ver: "12.2.2"
+    # Same version pins as release.yml's build-windows-msi matrix:
+    # single source of truth, don't let these drift independently.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download + unpack MariaDB ${{ matrix.mariadb_ver }} x64 binaries
+        shell: pwsh
+        env:
+          MARIADB_VER: ${{ matrix.mariadb_ver }}
+        run: |
+          $zipName = "mariadb-${env:MARIADB_VER}-winx64.zip"
+          $url     = "https://archive.mariadb.org/mariadb-${env:MARIADB_VER}/winx64-packages/$zipName"
+          Write-Host "Fetching $url"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+          $unpacked = "deps\mariadb\mariadb-${env:MARIADB_VER}-winx64"
+          if (Test-Path $unpacked) {
+            Rename-Item -Path $unpacked -NewName "root"
+          } else {
+            Write-Host "FATAL: expected $unpacked inside $zipName"
+            exit 1
+          }
+
+      - name: Build fractalsql.dll (release.yml's build-windows-msi path)
+        shell: pwsh
+        run: |
+          .\scripts\windows\build-windows.ps1 -MariaDbDir "deps\mariadb\root" -MariaDbMajor ${{ matrix.mdb }}
+          # NOTE: scripts\windows\build-windows.ps1 does not exist yet
+          # in this repo (only build.bat and build-msi.bat do, both
+          # pure-C with no LuaJIT dependency). release.yml's own
+          # windows job still builds via scripts\windows\build.bat.
+          # This step is left wired here, pointing at the PowerShell
+          # script this job wants, rather than omitted, so the workflow
+          # shape is ready once that script is written; it will need
+          # adjusting to match its actual parameter names at that time.
+          Copy-Item "dist\windows\mdb${{ matrix.mdb }}\fractalsql.dll" "fractalsql.dll"
+
+      - name: build_test.ps1 -MdbDir deps\mariadb\root -MdbMajor ${{ matrix.mdb }}
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "${{ matrix.mdb }}" -TimeoutMult 2
+          exit $LASTEXITCODE
+
+  darwin-gate-matrix:
+    name: build_test.sh (macOS, Homebrew mariadb)
+    if: github.event_name != 'schedule'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install mariadb jq
+          echo "$(brew --prefix mariadb)/bin" >> "$GITHUB_PATH"
+
+      - name: build_test.sh (whatever major Homebrew currently tracks)
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh
+
+  linux-asan:
+    name: build_test.sh --asan mdb11.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq
+          wget -qO- https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat build-essential
+
+      - name: build_test.sh --asan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --asan
+
+  linux-ubsan:
+    name: build_test.sh --ubsan mdb11.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq
+          wget -qO- https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat build-essential
+
+      - name: build_test.sh --ubsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --ubsan
+
+  windows-asan:
+    name: build_test.ps1 -Asan mdb11.4 (Windows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Download + unpack MariaDB 11.4.4 x64 binaries
+        shell: pwsh
+        run: |
+          $url = "https://archive.mariadb.org/mariadb-11.4.4/winx64-packages/mariadb-11.4.4-winx64.zip"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+          Rename-Item -Path "deps\mariadb\mariadb-11.4.4-winx64" -NewName "root"
+      - name: build_test.ps1 -Asan mdb11.4
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Asan -TimeoutMult 4
+          exit $LASTEXITCODE
+
+  windows-ubsan:
+    name: build_test.ps1 -Ubsan mdb11.4 (Windows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Download + unpack MariaDB 11.4.4 x64 binaries
+        shell: pwsh
+        run: |
+          $url = "https://archive.mariadb.org/mariadb-11.4.4/winx64-packages/mariadb-11.4.4-winx64.zip"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+          Rename-Item -Path "deps\mariadb\mariadb-11.4.4-winx64" -NewName "root"
+      - name: build_test.ps1 -Ubsan mdb11.4
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Ubsan -TimeoutMult 4
+          exit $LASTEXITCODE
+
+  darwin-asan:
+    name: build_test.sh --asan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MariaDB (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install mariadb jq
+      - name: build_test.sh --asan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --asan
+
+  darwin-ubsan:
+    name: build_test.sh --ubsan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MariaDB (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install mariadb jq
+      - name: build_test.sh --ubsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --ubsan
+
+  coverage:
+    name: coverage (lcov)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4 + lcov
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg lcov jq
+          wget -qO- https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat build-essential
+
+      - name: build_test.sh --coverage
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-html
+          path: coverage_html/
+          retention-days: 30
+          if-no-files-found: warn

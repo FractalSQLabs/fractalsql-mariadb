@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+#
+# fractalsql-mariadb test image: runs build_test.sh's gate matrix for
+# ONE MariaDB major inside the official mariadb:<major> image. A
+# successful `docker build` IS the test result: gates run as a RUN
+# step, so a gate failure fails the build with a non-zero exit and the
+# log in the build output. Mirrors fractalsql-postgresql's
+# docker/Dockerfile.test structure exactly; the difference is only the
+# base image family and the majors in the matrix (10.6 / 10.11 / 11.4 /
+# 12.2 instead of PG 14-18).
+#
+# Usage (single major):
+#   docker build -f docker/Dockerfile.test --build-arg MDB_MAJOR=11.4 \
+#       -t fractalsql-mariadb-test:mdb11.4 .
+#
+# Usage (all majors): see run_build_test.sh at the repo root, which
+# drives this Dockerfile once per major in the compat matrix.
+
+ARG MDB_MAJOR=11.4
+ARG FSQL_TEST_TIMEOUT_MULT=1
+# "" (default) | "asan" | "ubsan": passed through to build_test.sh as
+# --asan/--ubsan.
+ARG FSQL_SAN_MODE=""
+FROM mariadb:${MDB_MAJOR}
+ARG MDB_MAJOR
+ARG FSQL_TEST_TIMEOUT_MULT
+ARG FSQL_SAN_MODE
+
+USER root
+# libcurl4: fractalsql-reasoning-http.so (dlopen'd by the reasoning-tier
+# gates below) dynamically links libcurl.so.4. Without it, dlopen fails
+# silently from a plain UDF's perspective; the failure is invisible
+# unless you check `ldd` on the plugin directly, so it's easy to miss
+# without this dependency being explicit here. python3: scripts/ci/
+# mock_llm.py, the reasoning-tier gates' deterministic HTTP stub.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        binutils \
+        file \
+        libmariadb-dev \
+        libmariadb-dev-compat \
+        libcurl4 \
+        python3 \
+        jq \
+        mariadb-plugin-connect \
+        libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . /build
+RUN chown -R mysql:mysql /build
+
+# build_test.sh's setup runs mariadb-install-db / mariadbd, which
+# refuses to run as root the same way postgres's initdb does. Matches
+# fractalsql-postgresql's Dockerfile.test running its gates as the
+# `postgres` user.
+USER mysql
+ENV MDB_MAJOR=${MDB_MAJOR}
+ENV FSQL_TEST_TIMEOUT_MULT=${FSQL_TEST_TIMEOUT_MULT}
+
+RUN chmod +x build_test.sh \
+ && ./build_test.sh --mdb ${MDB_MAJOR} \
+      $(case "${FSQL_SAN_MODE}" in asan) echo --asan ;; ubsan) echo --ubsan ;; esac)

@@ -2,363 +2,163 @@
   <img src="FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
 </p>
 
-# mariadb-fractalsql by FractalSQLabs
+# FractalSQL: Sovereign Data Intelligence
+### Sovereign, Agentic MariaDB
 
-**Stochastic Fractal Search as a MariaDB UDF.** One function, four
-arguments, a JSON document back.
+**Vector Search. In-Database Reasoning. Production-Safe Agency. All beside your data.**
 
-mariadb-fractalsql ships a LuaJIT-backed metaheuristic optimizer that
-runs inside the MariaDB server process. You hand it a corpus of
-vectors, a query, how many matches you want, and a tuning blob — it
-returns the continuous best point plus the top-k stored vectors as a
-single JSON string that MariaDB's own `JSON_EXTRACT()` can slice.
+FractalSQL transforms MariaDB from a passive data store into an active agentic
+database. FractalSQL adds what traditional RAG (Retrieval-Augmented Generation)
+stops short of: reasoning over what it retrieves, and, when you enable it,
+acting on the result, whether that's running a generated query or executing a
+decision an agent computed. All of it happens inside the same database process.
 
-## Zero-Dependency Posture
+By bringing reasoning and agency directly into the MariaDB server, FractalSQL
+enables **Sovereign Data Intelligence**: the ability to reason, plan, and act upon
+your data with the deployment topology under your control. Run fully on-prem or in
+your own containers with Ollama/vLLM for zero data egress, or point at your
+organization's cloud AI accounts (Bedrock, Azure OpenAI, Vertex), BAA-covered
+where your compliance posture requires it, for managed-model scale. You control
+the trade, not the product.
 
-- **Static LuaJIT** — `libluajit-5.1.a` is built with `-fPIC` +
-  `BUILDMODE=static` from Mike Pall's GitHub mirror and folded into
-  `fractalsql.so`. No `libluajit-5.1.so` dependency, no `luajit`
-  RPM requirement.
-- **Static C/C++ runtime** — `-static-libgcc -static-libstdc++` +
-  `-D_GLIBCXX_USE_CXX11_ABI=0`; the shipped `.so` depends on glibc
-  only (libc, libm, libdl, libpthread, ld-linux — the kernel
-  shortlist).
-- **Static MSVC CRT on Windows** — `/MT /GL /LTCG`; the shipped
-  `.dll` has no VC++ Redistributable requirement.
-- **One .so per Linux arch** — the MariaDB UDF ABI (`UDF_INIT`,
-  `UDF_ARGS`, `MYSQL_ERRMSG_SIZE`, the init/main/deinit signatures)
-  has been stable across 10.6 / 10.11 / 11.4 LTS and 12.2 rolling,
-  so the same binary works on every supported major. The `.deb` /
-  `.rpm` depends on `mariadb-server` generically.
-- **Minimum glibc 2.38** — aligned with Ubuntu 24.04 LTS / Debian 13
-  and any RHEL-family distro shipping glibc 2.34+.
-
-## Compatibility matrix
-
-|                    | Linux amd64 | Linux arm64 | Windows x86 | Windows x64 | Windows arm64 |
-| ------------------ | :---------: | :---------: | :---------: | :---------: | :-----------: |
-| MariaDB 10.6       |     ✓       |      ✓      |     —       |     ✓       |       —       |
-| MariaDB 10.11      |     ✓       |      ✓      |     —       |     ✓       |       —       |
-| MariaDB 11.4 LTS   |     ✓       |      ✓      |     —       |     ✓       |       —       |
-| MariaDB 12.2 rolling |   ✓       |      ✓      |     —       |     ✓       |       —       |
-
-**Linux.** One `fractalsql.so` per arch covers every listed MariaDB
-major — no per-major fan-in.
-**Windows.** MariaDB Foundation does not publish 32-bit Windows
-server binaries on the current LTS majors, and has not yet shipped
-Windows ARM64 in an extractable `.zip` form — both cells are
-deferred until upstream host binaries exist. Windows x64 ships one
-MSI per MariaDB major because the install path is major-specific
-(`C:\Program Files\MariaDB <VER>\lib\plugin\`).
-
-**11.4 vs 12.2.** 11.4 is the current LTS line (5-year support);
-12.2 is a rolling / short-term-support release. Both expose the
-same UDF ABI and both ship Windows x64 binaries upstream, so the
-Community Edition covers each identically.
-
-MariaDB 11.7+ introduced a native VECTOR type (distinct from MySQL
-9.0's encoding). The UDF signature here accepts only CSV /
-bracketed-JSON inputs — VECTOR values round-tripped through
-`VEC_ToText()` work transparently. A dedicated binary-decode path
-can be enabled behind a compile flag in a later iteration.
-
----
-
-## The UDFs
-
-```sql
-fractal_search(
-    vector_csv   TEXT,   -- corpus of stored vectors (or empty string)
-    query_csv    TEXT,   -- single query vector
-    k            INT,    -- top-k to return (capped at len(corpus))
-    params       TEXT    -- JSON object of SFS tuning knobs
-) RETURNS STRING         -- JSON document
-
-fractalsql_edition()  RETURNS STRING     -- 'Community'
-fractalsql_version()  RETURNS STRING     -- '1.0.0'
-```
-
-### Input encoding
-
-Vectors travel as either a bracketed JSON-ish form or a flat CSV:
-
-| Form | Example |
+| Traditional RAG Stack | The Sovereign Way (FractalSQL) |
 | --- | --- |
-| Nested JSON array | `'[[1,0,0],[0,1,0],[0,0,1]]'` |
-| Semicolon rows    | `'1,0,0;0,1,0;0,0,1'` |
-| Single vector     | `'0.6,0.6,0'` or `'[0.6,0.6,0]'` |
-| Empty corpus      | `''` (skips top-k, returns only `best_point`) |
-
-### Params (JSON, all optional)
-
-| Key | Default | Range | Notes |
-| --- | --- | --- | --- |
-| `iterations`       | 30  | 1..100 000 | SFS generations |
-| `population_size`  | 50  | 2..10 000  | candidate points held per generation |
-| `diffusion_factor` | 2   | 1..100     | walks-per-particle (MDN) |
-| `walk`             | 0.5 |            | 0 = pure self-diffusion, 0.5 = canonical SFS |
-| `debug`            | false |          | includes per-generation trace in output |
-
-### Output document
-
-```json
-{
-  "dim": 3,
-  "n_corpus": 4,
-  "best_point": [0.601, 0.598, 0.003],
-  "best_fit": 0.00014,
-  "top_k": [
-    {"idx": 3, "dist": 0.021},
-    {"idx": 0, "dist": 0.183},
-    {"idx": 1, "dist": 0.201}
-  ],
-  "trace": { ... }
-}
-```
-
-Slice it with MariaDB's JSON functions — no client-side parsing
-needed:
-
-```sql
-SELECT
-  JSON_EXTRACT(r, '$.best_point')     AS best_point,
-  JSON_EXTRACT(r, '$.top_k[0].idx')   AS top_hit,
-  JSON_EXTRACT(r, '$.top_k[0].dist')  AS top_dist
-FROM (
-  SELECT fractal_search(
-      '[[1,0,0],[0,1,0],[0,0,1],[0.5,0.5,0]]',
-      '0.6,0.6,0',
-      3,
-      '{"iterations":30,"population_size":50,"walk":0.5}'
-  ) AS r
-) t;
-```
+| **Mode Collapse**: top-K search returns near-duplicates, starving the LLM of diverse context. | **Scout Discovery**: MMR-style diverse semantic search that discovers the data's real structure. |
+| **Fragmented Logic**: app pulls rows, calls LLM, handles retries, and glues answers in middleware. | **In-Database Reasoning**: reasoning and embedding happen inside the backend process itself. |
+| **Passive Retrieval**: you ask a question, the DB returns rows, and you hope the LLM is correct. | **Autonomous Agency**: self-correcting SQL, loop detection, and trajectory forecasting. |
 
 ---
 
-## Installation
+## From zero to your first agent
 
-### Linux — from release packages
+FractalSQL's docs follow a single linear path. Each step answers one question
+and hands off to the next. You don't need to read everything; follow the path.
 
-Grab the `.deb` or `.rpm` matching your CPU arch from
-[GitHub Releases](https://github.com/FractalSQLabs/mariadb-fractalsql/releases).
-One binary covers MariaDB 10.6 / 10.11 / 11.4 LTS:
+1. **What is this and why do I care?**: you are here. Sovereign Data Intelligence, in one page.
+2. **How do I get the UDFs running in 5 minutes?** → [Getting Started](docs/getting-started.md) (`docker compose up -d`, or the native `.deb`/`.rpm`/`.msi`, then your first Scout search).
+3. **How do I apply this to my industry?** → [Starter Kits](docs/starter-kits.md): a problem → agent map using the 15 shipped agents, plus all eleven industry-vertical demo *scripts*, verified end to end (see [demo/README.md](demo/README.md#industry-vertical-demos)).
+4. **How does a specific agent work and what are its inputs?** → [Agent Reference](docs/api-agency.md): the fifteen installable agents, each with a real `CALL` example.
+5. **How do I build a proprietary agent that isn't in the box?** → [Composition Guide](docs/composition-guide.md): the design patterns behind the shipped agents.
+
+> New here? Step 2 is a one-command demo. Step 4 is the reference you'll keep
+> coming back to.
+
+---
+
+## 🎯 Who are you?
+
+Depending on your role, you'll want to start in different places:
+
+- **AI Engineer**: You want to improve RAG quality and reasoning.
+  → Start with **[docs/features.md](docs/features.md)** and **[docs/reasoning-setup.md](docs/reasoning-setup.md)**.
+- **DBA / Security Architect**: You care about stability, safety, and grants.
+  → See **[docs/text-to-sql-setup.md](docs/text-to-sql-setup.md)**'s safety-pipeline section, and note MariaDB's **no Row-Level Security** gap called out there plainly: this repo doesn't paper over it.
+- **Product Developer**: You want to build agentic features quickly.
+  → Run the **[Docker Demo](docs/docker-demo.md)**, then pick a **[Starter Kit](docs/starter-kits.md)**.
+
+---
+
+## 🧩 What's in the box
+
+Four tiers of SQL-callable primitives, composable into agents with plain
+MariaDB stored procedures.
+
+- **Discovery**: diverse, mode-collapse-free retrieval: `fractal_search` (Sniper), `fractal_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`).
+- **Cognition**: in-database LLM integration: `fractal_reason` (Bedrock, Azure OpenAI, Vertex, Ollama), `fractal_embed`, `fractal_text_to_sql`, plus an automatic **Vectorizer** pipeline (trigger-driven, MariaDB 11.7+ native `VECTOR(n)` aware).
+- **Agency**: self-correcting stored procedures: **fifteen installable agents** spanning anomaly triage, portfolio allocation, hybrid recall, route planning, deterioration triage, regime detection, and more. See the [Agent Reference](docs/api-agency.md).
+- **Analytics**: fractal/dimension primitives: `fractal_dimension_dfa`, `fractal_dimension_boxcount`, `fractal_optimize_portfolio`, and more.
+
+Every primitive is an ordinary SQL function or stored procedure, no
+`CREATE EXTENSION`, no dependent-extension system, UDFs registered once via
+`sql/install_udf.sql` and `sql/install_agents.sql`. When you're ready to build
+your own agent, the [Composition Guide](docs/composition-guide.md) walks
+through the patterns the shipped agents use.
+
+MariaDB has no SPI (a C UDF can't run SQL against the calling session) and no
+table-returning UDFs. Every primitive that would otherwise be a
+table-scanning or set-returning C function is re-architected instead:
+inline-corpus arguments for Discovery, `CALL`-with-`OUT`-JSON-param
+stored procedures for anything that touches a table (schema
+introspection, text-to-sql, the vectorizer, every agent). See any
+`docs/api-*.md` page for the exact calling convention of a given
+primitive.
+
+---
+
+## 🚀 Get it running
+
+The fastest path is one command. See **[Getting Started](docs/getting-started.md)**
+for the 5-minute Docker run and the native installers:
 
 ```bash
-# amd64 / x86_64
-sudo apt install ./mariadb-fractalsql-amd64.deb
-# or
-sudo rpm -i mariadb-fractalsql-amd64.rpm
-
-# arm64 / aarch64 (AWS Graviton, Apple Silicon, Ampere Altra, …)
-sudo apt install ./mariadb-fractalsql-arm64.deb
-sudo rpm -i mariadb-fractalsql-arm64.rpm
+docker compose up -d   # then connect and run your first Scout search
 ```
 
-The package drops `fractalsql.so` into `/usr/lib/mysql/plugin/` and
-the registration script + LICENSE files into
-`/usr/share/mariadb-fractalsql/` / `/usr/share/doc/mariadb-fractalsql/`.
-Activate once:
-
-```sql
-SOURCE /usr/share/mariadb-fractalsql/install_udf.sql;
--- or from the shell:
--- mysql -u root -p < /usr/share/mariadb-fractalsql/install_udf.sql
-```
-
-Verify:
-
-```sql
-SELECT fractalsql_edition(), fractalsql_version();
-SELECT name, dl FROM mysql.func;
-```
-
-### Windows — MSI install
-
-Download the MSI matching your MariaDB major from
-[GitHub Releases](https://github.com/FractalSQLabs/mariadb-fractalsql/releases):
-
-```
-FractalSQL-MariaDB-10.6-1.0.0-x64.msi
-FractalSQL-MariaDB-10.11-1.0.0-x64.msi
-FractalSQL-MariaDB-11.4-1.0.0-x64.msi
-```
-
-Interactive install (standard Windows double-click flow):
-
-```powershell
-msiexec /i FractalSQL-MariaDB-11.4-1.0.0-x64.msi
-```
-
-Silent install (scripting / MDM):
-
-```powershell
-msiexec /i FractalSQL-MariaDB-11.4-1.0.0-x64.msi /qn
-```
-
-Targeting a non-default MariaDB install root (e.g.
-`D:\MariaDB 11.4`):
-
-```powershell
-msiexec /i FractalSQL-MariaDB-11.4-1.0.0-x64.msi /qn ^
-    MARIADBROOT="D:\MariaDB 11.4"
-```
-
-The MSI drops `fractalsql.dll` into
-`C:\Program Files\MariaDB <VER>\lib\plugin\` and the install SQL
-plus LICENSE files into
-`C:\Program Files\MariaDB <VER>\share\doc\mariadb-fractalsql\`.
-Activate once from the MariaDB client:
-
-```powershell
-mysql -u root -p < "C:\Program Files\MariaDB 11.4\share\doc\mariadb-fractalsql\install_udf.sql"
-```
-
-### Building from source — Linux
-
-The canonical build is Docker-driven and emits a single per-arch
-`.so`:
-
-```bash
-./build.sh amd64   # -> dist/amd64/fractalsql.so
-./build.sh arm64   # -> dist/arm64/fractalsql.so
-```
-
-The Dockerfile (`docker/Dockerfile`) builds a PIC-enabled static
-LuaJIT from the GitHub mirror, compiles `fractalsql.so` against
-`libmariadb-dev`, and runs `docker/assert_so.sh` to verify the
-zero-dependency posture (ldd shortlist, no `__cxx11::basic_string`
-leaks, size ceiling, UDF entry points in `.dynsym`). Cross-arch
-builds use buildx + QEMU; CI runs both arches on every tag.
-
-For quick local iteration against whatever libmariadb-dev is on
-your path (does NOT produce a shipping artifact — uses dynamic
-LuaJIT linkage):
-
-```bash
-sudo apt install -y build-essential libmariadb-dev libluajit-5.1-dev pkg-config
-make
-sudo make install
-mysql -u root -p < sql/install_udf.sql
-```
-
-### Building from source — Windows
-
-Requires a Developer Command Prompt for Visual Studio, a MariaDB
-binaries `.zip` unpacked (for `include\mysql\*.h`), and the WiX
-Toolset if you want to rebuild the MSI:
-
-```cmd
-:: Build static LuaJIT
-git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git deps\LuaJIT
-cd deps\LuaJIT\src && call msvcbuild.bat static && cd ..\..\..
-
-:: Build fractalsql.dll
-set LUAJIT_DIR=%CD%\deps\LuaJIT\src
-set MARIADB_DIR=C:\path\to\unpacked\mariadb-11.4.4-winx64
-set MARIADB_MAJOR=11.4
-call scripts\windows\build.bat
-
-:: Build the MSI
-set MSI_ARCH=x64
-call scripts\windows\build-msi.bat
-```
+Native installers (MariaDB 10.6 / 10.11 / 11.4 LTS / 12.2 rolling): `.deb` /
+`.rpm` for Linux amd64/arm64, an unsigned `.zip` for macOS (arm64/x86_64, copy
+into your Homebrew MariaDB's `plugin_dir` by hand, since MariaDB has no
+extension-install mechanism to script against there), and a per-major `.msi`
+for Windows x64. See the compatibility table below.
 
 ---
 
-## Architectural Performance
+## 🏛️ Enterprise Tier
 
-The core optimizer is distributed as **pre-compiled LuaJIT bytecode**
-embedded in the shared library. No Lua source ships with the plugin.
-
-### No script parsing at runtime
-
-A conventional LuaJIT embedding loads source, invokes the parser,
-and generates bytecode before the first opcode executes.
-mariadb-fractalsql skips all of this: the bytecode is compiled once
-at release time and embedded in `fractalsql.so` as a C byte array.
-Loading the optimizer on a UDF call is a `luaL_loadbuffer` over an
-in-memory buffer — no tokenizer, no parser, no AST walk.
-
-### FFI hot loops
-
-Every per-generation computation runs in pre-allocated `double[]`
-FFI cdata buffers. The inner loops — fitness evaluation, diffusion
-walks, bound checking — JIT-compile to tight machine code comparable
-to hand-written C. The population and all scratch buffers are
-allocated once per SFS run and reused across generations.
+Everything above is Community edition and fully functional on its own.
+Discovery, Cognition, and Agency don't depend on anything in this section.
+The Enterprise tier adds a tamper-evident, hash-chained decision ledger
+and CISO audit trail: a `FRACTALSQL_ENTERPRISE_LIB` environment
+variable names a separately-built library, dlopen'd lazily, backing
+ten thin `fractal_ledger_*`/`fractal_audit_*` UDFs that return a clean
+`NULL` (never an error or a crash) while the library isn't loaded, and
+a genuine, file-backed persistent chain once it is. See
+**[Enterprise Tier](docs/enterprise.md)** for the full reference.
 
 ---
 
-## Benchmarking
+## 📊 Compatibility & License
 
-A reproducible harness lives in `benchmark/`:
+| MariaDB | Linux amd64 | Linux arm64 | Windows x64 | macOS (Homebrew) |
+| --- | :---: | :---: | :---: | :---: |
+| 10.6 | ✓ | ✓ | ✓ | ✓ |
+| 10.11 | ✓ | ✓ | ✓ | ✓ |
+| 11.4 LTS | ✓ | ✓ | ✓ | ✓ |
+| 12.2 rolling | ✓ | ✓ | ✓ | ✓ |
 
-```bash
-./build.sh amd64        # builds fractalsql.so first
+One `fractalsql.so`/`.dll`/`.dylib` per (platform, arch) covers every major
+above. The UDF ABI is stable across the whole range, no per-major fan-in on
+Linux/macOS (Windows ships one `.msi` per major purely because the install
+path is major-specific: `C:\Program Files\MariaDB <VER>\lib\plugin\`).
+MariaDB 11.7+ additionally exposes a native `VECTOR(n)` column type this
+repo's vector functions transparently interoperate with. See
+[docs/vectorizer-setup.md](docs/vectorizer-setup.md).
 
-MARIADB_IMAGE=mariadb:10.6  \
-  docker compose -f benchmark/docker-compose.test.yml up --abort-on-container-exit
+**License**: Apache-2.0. See `LICENSE`. Third-party components are under
+their own permissive licenses (BSD-2-Clause, MIT, and others).
+See `THIRD-PARTY-NOTICES.md`.
 
-MARIADB_IMAGE=mariadb:10.11 \
-  docker compose -f benchmark/docker-compose.test.yml up --abort-on-container-exit
-
-MARIADB_IMAGE=mariadb:11.4  \
-  docker compose -f benchmark/docker-compose.test.yml up --abort-on-container-exit
-```
-
-The compose file pins each container to a single dedicated CPU core
-(MariaDB on core 0, Node tester on core 1) so latency numbers stay
-comparable across machines with different core counts. Tunable via
-env vars — see `benchmark/docker-compose.test.yml`.
-
-The tester (Node.js 24, `benchmark/tester/run.js`) generates a random
-corpus + query on each iteration, issues the UDF call, and reports
-mean / p50 / p95 / p99 latency.
+For enterprise editions, licensing, and support, contact
+**enterprise@fractalsqlabs.com**.
 
 ---
 
-## Architecture notes
+## 📚 Documentation
 
-**One Lua state per UDF invocation.** MariaDB is multi-threaded with
-no stable thread affinity across calls. The plugin constructs a fresh
-`lua_State` in the `*_init` stage, stashes the pointer in
-`initid->ptr`, and tears it down in `*_deinit`. Complete isolation
-between connections *and* between calls on the same connection.
+*Follow the path above; the links below are the same steps, expanded.*
 
-**Memory.** All FFI buffers allocated inside the optimizer are GC'd
-when the Lua function returns. The UDF context's result buffer is
-`realloc`'d on demand and freed in `*_deinit`.
-
-**MariaDB 11 note.** Plugin-loader changes in MariaDB 11.x affect
-storage engines and server plugins. UDFs registered via
-`CREATE FUNCTION ... SONAME` take a different, unchanged code path —
-this UDF is unaffected. Result-memory lifetime contracts are also
-unchanged.
-
-**Determinism.** LuaJIT's `math.random` is xoshiro256\*\*. Because each
-call builds a fresh Lua state, results are reproducible across calls
-when you pin `population_size` and seed `math.randomseed` in a custom
-build.
-
----
-
-## Third-Party Components
-
-mariadb-fractalsql embeds two third-party components. Full notices
-live in [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY) at the repo root
-(and inside every installed package under
-`/usr/share/doc/mariadb-fractalsql/` on Linux,
-`\share\doc\mariadb-fractalsql\` on Windows).
-
-- **SFS Core Math** — Stochastic Fractal Search algorithm, from
-  Hamid Salimi (2014). BSD-3-Clause.
-- **LuaJIT** — Just-In-Time compiler and execution engine, (C)
-  2005-2023 Mike Pall. MIT.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- **[Getting Started](docs/getting-started.md)**: 5-minute Docker / native install.
+- **[Starter Kits](docs/starter-kits.md)**: problem → agent mapping for common use cases.
+- **[Agent Reference](docs/api-agency.md)**: the fifteen installable agents, each with a real `CALL` example.
+- **[Composition Guide](docs/composition-guide.md)**: build your own agent.
+- **[Features](docs/features.md)**: the full capability map and API reference.
+- **[Discovery API](docs/api-discovery.md)** · **[Cognition API](docs/api-cognition.md)** · **[Analytics API](docs/api-analytics.md)**: per-tier function reference.
+- **[Reasoning Setup](docs/reasoning-setup.md)**: LLM provider configuration (Ollama, OpenAI, Bedrock, Azure, Vertex).
+- **[Text-to-SQL Setup](docs/text-to-sql-setup.md)**: pipeline details and the security model.
+- **[Vectorizer Setup](docs/vectorizer-setup.md)**: automatic embedding pipelines, including the native `VECTOR(n)` path.
+- **[Docker Demo](docs/docker-demo.md)**: a one-command end-to-end demo.
+- **[Demo Index](demo/README.md)**: every runnable demo script in this repo.
+- **[Enterprise Tier](docs/enterprise.md)**: what's real (activation gating) and what isn't (ledger storage) today.
+- **[COOKBOOK](docs/COOKBOOK.md)**: worked example wiring the [fractalsql-reasoning-http](https://github.com/FractalSQLabs/fractalsql-reasoning-http) plugin into a live MariaDB instance.
 
 ---
 
