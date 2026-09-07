@@ -1,12 +1,11 @@
 """tests/_t2s_common.py: shared helpers for the fractal_text_to_sql
 test suite (test_text_to_sql_*.py, test_scout.py, test_vectorizer.py).
 
-Deliberately much thinner than fractalsql-postgresql's own
-_t2s_common.py: MariaDB's reasoning config is a handful of FRACTALSQL_*
+MariaDB's reasoning config is a handful of FRACTALSQL_*
 process environment variables read once by
 fractalsql_cognition.c/fractalsql_textsql.c's ensure_env_config(), NOT
-a postgres-style GUC. There is no ALTER SYSTEM SET + pg_reload_conf()
-+ reconnect equivalent. Once mariadbd has started (see build_test.sh
+a server variable that can be changed while the server runs. There is
+no ALTER SYSTEM SET + reload + reconnect equivalent. Once mariadbd has started (see build_test.sh
 and the install-test.yml jobs, which export FRACTALSQL_REASONING_PLUGIN
 / HTTP_URL / HTTP_EMBED_URL / HTTP_ALLOW_PLAINTEXT into mariadbd's own
 environment before launch), the reasoning plugin path and endpoint URL
@@ -99,8 +98,8 @@ class MutableMockLLMServer:
     canned reply AFTER the server is already running, via set_content().
 
     Needed because mariadbd's FRACTALSQL_HTTP_URL is fixed at process
-    start -- a test can't point it at a fresh server per test case the
-    way postgres's configure_reasoning()+reconnect() can. Instead, one
+    start -- a test can't point it at a fresh server per test case,
+    nor reconfigure the running server after startup. Instead, one
     server is started ONCE (before or alongside mariadbd, at the SAME
     port FRACTALSQL_HTTP_URL already names), and each test case calls
     set_content() to change what the NEXT request gets back.

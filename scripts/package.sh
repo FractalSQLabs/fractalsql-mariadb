@@ -11,7 +11,7 @@
 #   dist/packages/fractalsql-mariadb-arm64.deb
 #   dist/packages/fractalsql-mariadb-arm64.rpm
 #
-# One binary covers MariaDB 10.6 / 10.11 / 11.4 LTS and 12.2 rolling:
+# One binary covers MariaDB 10.6 / 10.11 / 11.4 LTS and 12.3 LTS:
 # the UDF ABI is stable across those majors, so the package depends on
 # mariadb-server generically rather than pinning a specific major.
 #
@@ -152,7 +152,7 @@ fpm -s dir -t deb \
     -v "${VERSION}" \
     -a "${PKG_ARCH}" \
     --iteration "${ITERATION}" \
-    --description "FractalSQL: Stochastic Fractal Search UDF for MariaDB (10.6 / 10.11 / 11.4 LTS, 12.2 rolling)" \
+    --description "FractalSQL: Stochastic Fractal Search UDF for MariaDB (10.6 / 10.11 / 11.4 LTS, 12.3 LTS)" \
     --license "Apache-2.0" \
     --depends "libc6 (>= ${GLIBC_DEP})" \
     --depends "libcurl4" \
@@ -166,7 +166,7 @@ fpm -s dir -t rpm \
     -v "${VERSION}" \
     -a "${RPM_ARCH}" \
     --iteration "${ITERATION}" \
-    --description "FractalSQL: Stochastic Fractal Search UDF for MariaDB (10.6 / 10.11 / 11.4 LTS, 12.2 rolling)" \
+    --description "FractalSQL: Stochastic Fractal Search UDF for MariaDB (10.6 / 10.11 / 11.4 LTS, 12.3 LTS)" \
     --license "Apache-2.0" \
     --depends "libcurl.so.4()(64bit)" \
     --depends "mariadb-server" \

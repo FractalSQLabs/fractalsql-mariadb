@@ -4,8 +4,8 @@ edge-case coverage beyond build_test.sh's gate 03 smoke check (table
 names, comments, foreign keys, and the nonexistent-table SIGNAL path).
 
 No reasoning plugin / LLM needed -- fractal_schema_context is pure
-INFORMATION_SCHEMA introspection (sql/install_udf.sql), unlike its
-postgres namesake which formats pg_catalog output.
+INFORMATION_SCHEMA introspection (sql/install_udf.sql), with no
+catalog-formatting layer in between.
 
 Skip-safe: exits 0 with a SKIP: message if the mariadb connector is
 missing or no DB is reachable.

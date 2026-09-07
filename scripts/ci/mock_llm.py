@@ -27,13 +27,11 @@ adversarial string instead of trying to make an LLM misbehave on
 demand, deterministic, and already covers that logic thoroughly
 without needing a second mock reply mode.
 
-Ported from fractalsql-postgresql's scripts/ci/mock_llm.py (same file,
-generic enough to reuse as-is), plus an embeddings route this repo's
+Serves a fixed chat reply plus an embeddings route that this repo's
 Vectorizer/fractal_embed gates
-need that the postgres original doesn't serve from this same script
-(postgres tests embed via a fake in-process reasoning-VFS plugin
-instead of an HTTP mock -- see build_test.sh's reasoning-gates header
-comment for why that approach was deliberately NOT ported here).
+need (the reasoning-VFS-ABI test fixtures prove the plugin-ABI path
+directly; this HTTP mock covers the real dlopen/curl/HTTP path -- see
+build_test.sh's reasoning-gates header comment for the split).
 
 Usage: python3 mock_llm.py [port]   (default port 18080)
 

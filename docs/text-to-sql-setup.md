@@ -8,7 +8,7 @@
 
 Unlike naive LLM-to-SQL wrappers, FractalSQL treats SQL generation as a **hard-constrained engineering problem**, not a probabilistic one. It employs a multi-stage validation pipeline to ensure that every returned statement is syntactically correct and policy-compliant before it ever reaches your application.
 
-**MariaDB note for anyone coming from the PostgreSQL edition**: this is a `CALL`-able stored procedure with `OUT` parameters here, not a function you `SELECT`. MariaDB's C UDF ABI has no SPI (no way for C code to run SQL against the calling session), so the orchestration (GENERATE, then ALLOWLIST, then EXPLAIN-equivalent, then RETURN) lives in SQL/PSM (`sql/install_udf.sql`) calling out to a handful of C primitives, not in one C function the way PostgreSQL's binding does it.
+**A note on the call shape**: this is a `CALL`-able stored procedure with `OUT` parameters, not a function you `SELECT`. MariaDB's C UDF ABI gives C code no way to run SQL against the calling session, so the orchestration (GENERATE, then ALLOWLIST, then EXPLAIN-equivalent, then RETURN) lives in SQL/PSM (`sql/install_udf.sql`) calling out to a handful of C primitives.
 
 ---
 
@@ -49,13 +49,13 @@ GENERATE ──▶ ALLOWLIST ──▶ [REVIEW, optional] ──▶ EXPLAIN-equi
 ```
 
 1. **GENERATE**: `fractal_t2s_generate(session_id, prompt, schema_context, system_tag)` sends the question plus a schema description (from `fractal_schema_context()`) to the configured LLM. Sets the reasoning plugin's response mode to fenced-code extraction internally, so the model's ```` ```sql ... ``` ```` block is pulled out automatically, with no separate config step.
-2. **ALLOWLIST**: `fractal_t2s_check_allowlist(sql)` runs a hand-written lexical scanner (`src/fractalsql_textsql.c`) over the candidate. It rejects multiple statements, disallowed statement types (anything but `SELECT`, or `SELECT`/`INSERT`/`UPDATE` if `FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update`), and `INTO OUTFILE`/`INTO DUMPFILE` (a MariaDB-dialect filesystem-write hazard with no PostgreSQL equivalent). **MariaDB-specific note**: MariaDB's `WITH` clause is SELECT-only at the CTE-body level (`WITH d AS (DELETE FROM t ...) SELECT ...` is not even valid MariaDB syntax), so PostgreSQL's "data-modifying CTE hidden behind a top-level SELECT" attack class is structurally impossible here. A CTE feeding a top-level DML statement (`WITH cte AS (SELECT ...) DELETE FROM t WHERE id IN (SELECT id FROM cte)`) is still caught, the same as PostgreSQL, just via a shallower mechanism: the scanner classifies the statement by its actual leading keyword *after* skipping past the CTE definitions, not by a real parse tree. See `fractalsql_textsql.c`'s own header comment for the full account.
+2. **ALLOWLIST**: `fractal_t2s_check_allowlist(sql)` runs a hand-written lexical scanner (`src/fractalsql_textsql.c`) over the candidate. It rejects multiple statements, disallowed statement types (anything but `SELECT`, or `SELECT`/`INSERT`/`UPDATE` if `FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update`), and `INTO OUTFILE`/`INTO DUMPFILE` (a MariaDB-dialect filesystem-write hazard). **MariaDB-specific note**: MariaDB's `WITH` clause is SELECT-only at the CTE-body level (`WITH d AS (DELETE FROM t ...) SELECT ...` is not even valid MariaDB syntax), so the "data-modifying CTE hidden behind a top-level SELECT" attack class is structurally impossible here. A CTE feeding a top-level DML statement (`WITH cte AS (SELECT ...) DELETE FROM t WHERE id IN (SELECT id FROM cte)`) is still caught, just via a shallower mechanism: the scanner classifies the statement by its actual leading keyword *after* skipping past the CTE definitions, not by a real parse tree. See `fractalsql_textsql.c`'s own header comment for the full account.
 3. **REVIEW** *(optional, default off)*: `fractal_t2s_review(session_id, question, candidate_sql)`, a second LLM call that critiques the candidate against the original question. Enable with `FRACTALSQL_TEXT_TO_SQL_USE_REVIEW=1`. Returns `NULL` on PASS, or the model's rejection text on FAIL, the same NULL-means-pass convention as the allowlist.
 4. **EXPLAIN-equivalent**: the candidate is `PREPARE`d (not executed) inside the procedure. MariaDB's `PREPARE` mechanically catches malformed SQL and unknown-column errors the same way EXPLAIN would, without running the statement, caught via a `DECLARE CONTINUE HANDLER FOR SQLEXCEPTION` so a bad candidate never aborts the caller's session.
 5. **RETURN or RETRY**: on success, `out_sql` is set and the loop ends. On failure at any stage, the rejection reason is fed back into the next attempt's prompt as explicit correction feedback, up to `FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS` (default 2).
 
-### Building on `PREPARE`, not a subtransaction
-The PostgreSQL binding wraps its EXPLAIN check in an internal subtransaction so a late-stage constraint failure only rolls back that one attempt. MariaDB's `PREPARE`/`DEALLOCATE PREPARE` never executes the candidate at all, so there is nothing to roll back. This repo gets the same "never touches your session's transaction state" guarantee through a structurally different, arguably simpler mechanism.
+### Building on `PREPARE`, no rollback needed
+MariaDB's `PREPARE`/`DEALLOCATE PREPARE` never executes the candidate at all, so there is nothing to roll back: even a late-stage failure leaves your session's transaction state untouched. The "never touches your session's transaction state" guarantee comes structurally, not from wrapping the check in a subtransaction.
 
 ---
 
@@ -82,7 +82,7 @@ Table and column `COMMENT`s (if set) are included in the description, a cheap wa
 ## Configuration & Security
 
 ### Environment Variables
-These are process environment variables, read once by `mariadbd` at startup and cached for that process's entire lifetime (`src/fractalsql_textsql.c`'s `ensure_env_config`). There is **no SQL statement, sysvar, or GUC** that changes them: MariaDB never adopted a system-variable config surface for any reasoning tier. To change one, export a new value and **restart `mariadbd`**.
+These are process environment variables, read once by `mariadbd` at startup and cached for that process's entire lifetime (`src/fractalsql_textsql.c`'s `ensure_env_config`). There is **no SQL statement or server system variable** that changes them: none of the reasoning tiers registers a sysvar. To change one, export a new value and **restart `mariadbd`**.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -98,7 +98,7 @@ These are process environment variables, read once by `mariadbd` at startup and 
 To secure your Text-to-SQL implementation:
 1. **Dedicated account**: create a restricted MariaDB user with `SELECT` grants only on the tables the use case needs.
 2. **Execute as that account**: run the *returned* SQL as that restricted user, not as `root` or a DBA account.
-3. **No Row-Level Security**: unlike PostgreSQL's RLS, MariaDB has no native row-level security mechanism. If you need row-level filtering, it has to live in the SQL itself (a `WHERE` clause the application adds, a view) or an application-layer check on the result. This is a real capability gap versus the PostgreSQL edition's RLS-based Visibility Boundary claim, not just different phrasing for the same guarantee.
+3. **No Row-Level Security**: MariaDB has no native row-level security mechanism. If you need row-level filtering, it has to live in the SQL itself (a `WHERE` clause the application adds, a view) or an application-layer check on the result.
 
 ---
 
@@ -108,12 +108,12 @@ To secure your Text-to-SQL implementation:
 - **Shadow Testing**: `tests/test_text_to_sql_shadow.py` runs a hard multi-constraint question against a real configured model and diffs the executed result against ground truth computed directly in SQL. One model per run: fixed-at-startup config means this can't loop over several models in one script, so rerun it against a differently-configured `mariadbd` to compare models.
 - **Schema Context**: `tests/test_text_to_sql_schema_context.py` covers table names, comments, foreign keys, filtered vs. all-tables mode, and the clean-`SIGNAL` path for a nonexistent table.
 - **Smoke**: `tests/test_text_to_sql_smoke.py` is the fast "is anything on fire" gate, deliberately not a correctness check (works against `scripts/ci/mock_llm.py`'s fixed reply too, with no real model attached).
+- **Memory-safety fuzzing of the reasoning-plugin ABI**: `tests/evil_nonterminating_plugin.c`, an adversarial C plugin that hands back a deliberately non-NUL-terminated response, is driven by `build_test.sh`'s gate 05 (`gate_05_evil_overread`) against all three call sites that read a plugin response (`fractal_text_to_sql`, bare `fractal_reason()`, `fractal_t2s_review()`), with a `mariadbd` restart before each site since `call_count` state is process-wide here rather than per-backend.
 
 ---
 
 ## Known Limitations
 
-- **No memory-safety fuzzing of the reasoning-plugin ABI**: an adversarial C plugin that hands `fractal_text_to_sql` a deliberately non-NUL-terminated response, to lock in a buffer-over-read fix, is not implemented here yet. Deferred, not silently dropped; see `build_test.sh`'s own header comment for the fuller account.
 - **Distinct-value sampling**: the current version does not sample enum-like columns (e.g. `'Completed'` vs `'completed'`) to help the model with value normalization.
 - **Table ranking**: for very large schemas, all visible tables are described linearly; a `fractal_search`-based relevance ranking to subset which tables get described is not implemented.
 - **Schema caps**: `fractal_schema_context()` caps an explicit `table_names` list at 512 entries.

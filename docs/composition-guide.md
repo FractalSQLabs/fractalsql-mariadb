@@ -4,7 +4,7 @@
 
 # Composition Guide: Build Your Own Agent
 
-You have read the [fifteen agent recipes](api-agency.md#the-fifteen-recipes)
+You have read the [sixteen agent recipes](api-agency.md#the-sixteen-recipes)
 and, maybe, run the industry starter kits (see
 [`docs/starter-kits.md`](starter-kits.md) for the full list of eleven).
 Now the question is: **how do I build a proprietary agent that isn't in
@@ -22,12 +22,12 @@ and follow the same shape (validate inputs → gather via a search primitive
 or dynamic SQL → analyze → `fractal_reason` → assemble the `OUT` JSON).
 
 > **No separate "Universal Agent" C-level tier here, but all six are
-> available.** fractalsql-postgresql has an intermediate layer of six
-> C-level Universal Agents (`fractal_search_agent`, `fractal_rag_agent`,
+> available.** MariaDB's C UDF ABI has no way to run SQL against the
+> calling session, so none of
+> the six (`fractal_search_agent`, `fractal_rag_agent`,
 > `fractal_sql_agent`, `fractal_agent_plan_explore`,
-> `fractal_agent_trajectory_predict`, `fractal_agent_detect_loop`) that the
-> sixteen recipes are built on top of. This repo has no SPI, so none of
-> the six exist as C-level primitives here. A MariaDB stored
+> `fractal_agent_trajectory_predict`, `fractal_agent_detect_loop`) exist
+> as C-level primitives here. A MariaDB stored
 > PROCEDURE can reach the same table access via dynamic SQL
 > (`PREPARE`/`EXECUTE`), which is exactly how the table-backed
 > compositions below already work. All six are implemented as stored
@@ -63,8 +63,7 @@ here is the pick-list.
 
 Everything above is a plain `CALL`/`SELECT` you can chain directly.
 Table-backed compositions are procedures with a trailing `OUT p_result
-JSON`, never a `SELECT function(...)` the way postgres's SPI-backed
-equivalents work.
+JSON`, never a `SELECT function(...)`.
 
 ---
 
@@ -132,9 +131,8 @@ GRANT SELECT ON mydb.invoices TO 'fractal_analyst'@'%';
 ```
 
 Set `FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select` on `mariadbd`'s own
-environment (not a per-role GUC the way postgres's
-`ALTER ROLE ... SET fractalsql.text_to_sql_allowed_statements` works: this
-repo's config is a single process-wide env var, see
+environment (this repo's config is a single process-wide env var, not a
+per-role setting — there is no `ALTER ROLE ... SET` surface for it, see
 [`docs/text-to-sql-setup.md`](text-to-sql-setup.md)), then run the analyst's
 queries through that restricted account.
 
@@ -213,7 +211,7 @@ you'd treat any NL→SQL surface:
   per-role setting, see [`docs/text-to-sql-setup.md`](text-to-sql-setup.md))
   gates which statement classes the pipeline may emit; keep it at the
   default `select` unless the workload genuinely needs writes.
-- **No Row-Level Security.** Unlike PostgreSQL, MariaDB has no native RLS.
+- **No Row-Level Security.** MariaDB has no native RLS.
   If the agent's context subquery must be scoped per-tenant/per-user, that
   filtering has to live in the SQL itself (a `WHERE` clause, a view), not
   in a policy the engine enforces for you. A real capability gap, not just
@@ -250,7 +248,7 @@ These bit the shipped agents; they'll bite yours too.
 ## Where next
 
 - **Full signatures and per-agent behaviour** →
-  [api-agency.md](api-agency.md) (the primitives and the fifteen recipes).
+  [api-agency.md](api-agency.md) (the primitives and the sixteen recipes).
 - **The industry-vertical gap and problem→agent mapping** →
   [starter-kits.md](starter-kits.md).
 - **Configure the reasoning endpoint** the primitives call →

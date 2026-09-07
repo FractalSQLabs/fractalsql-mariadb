@@ -36,7 +36,11 @@
  * serializes statement execution per connection), but the registry does
  * not assume that: entries are refcounted, so a concurrent eviction
  * sweep can never free a ctx a caller is actively holding, even under a
- * misused/shared session_id.
+ * misused/shared session_id. For the search ctx specifically, where a
+ * second thread would race the core itself rather than just the
+ * registry's bookkeeping, the exclusive acquire variant fails such
+ * concurrent reuse up front instead (see
+ * fractal_session_acquire_exclusive).
  */
 #ifndef FRACTALSQL_SESSION_H
 #define FRACTALSQL_SESSION_H
@@ -84,6 +88,26 @@ fsql_ctx *fractal_session_acquire_embed(unsigned long long session_id, bool *out
  * stomp reason_ctx's plain-chat config or vice versa, the same
  * reasoning as reason_ctx vs embed_ctx above. */
 fsql_ctx *fractal_session_acquire_t2s(unsigned long long session_id, bool *out_loaded);
+
+/* Exclusive-use acquire of session_id's Diversify/search ctx, for
+ * fractal_search()/fractal_explore() only. Same contract as
+ * fractal_session_acquire plus a per-entry busy pin: a second concurrent
+ * exclusive acquire of the SAME session_id fails with *out_busy = true
+ * (and NULL) instead of handing out the same ctx to two threads, since
+ * the core's search entry point is not safe for concurrent use on one
+ * ctx (MariaDB serializes statements per connection, but a caller is
+ * free to pass another connection's session_id, so this cannot be
+ * assumed). Busy entries are treated as pinned by the idle sweep, LRU
+ * eviction, and registry_close, exactly like refcounted ones.
+ * Release with fractal_session_release_exclusive exactly once, on every
+ * path, same discipline as the plain acquire/release pair. */
+fsql_ctx *fractal_session_acquire_exclusive(unsigned long long session_id,
+                                            bool *out_busy);
+
+/* Release an exclusive acquire (fractal_session_acquire_exclusive):
+ * clears the busy pin and drops the refcount atomically. Safe to call
+ * on an id with no live entry (no-op, defensive only). */
+void fractal_session_release_exclusive(unsigned long long session_id);
 
 /* Mark session_id's reason/embed/t2s ctx as having a reasoning plugin
  * successfully attached (see fractal_session_acquire_reason/_embed/

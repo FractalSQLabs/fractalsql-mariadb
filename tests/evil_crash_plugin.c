@@ -6,10 +6,11 @@
  * through a NULL pointer -- an unrecoverable SIGSEGV, not a bug we can
  * guard against (unlike the over-read/lying-length classes covered by
  * evil_nonterminating_plugin.c). No in-process defense can stop this;
- * the only thing to verify is that PostgreSQL's own crash-recovery
- * does what its architecture promises: the postmaster detects the
- * abnormal child exit, tears down and reinitializes shared memory,
- * and comes back up automatically with no data loss.
+ * the only thing to verify is that the server survives the UDF crash
+ * and restarts cleanly: committed data is preserved by InnoDB's own
+ * crash recovery (redo-log replay on next startup), and whatever outer
+ * supervisor runs mariadbd (build_test.sh's gate 06 picks one) brings
+ * the process back up automatically with no data loss.
  *
  * Used by build_test.sh's gate 06 (crash_recovery) to turn that
  * architectural claim into something CI actually checks on every run,

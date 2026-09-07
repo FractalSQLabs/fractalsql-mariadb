@@ -12,7 +12,7 @@
 -- reasoning configured as process environment variables in mariadbd's
 -- own environment BEFORE it starts (MariaDB has no live-reloadable
 -- config mechanism a dlopen'd UDF library can hook into, so this can't
--- be a SET GLOBAL; see docs/COOKBOOK.md and build_test.sh's mdb_setup
+-- be a SET GLOBAL; see docs/reasoning-setup.md and build_test.sh's mdb_setup
 -- for the export pattern). Confirm with:
 --   SELECT fractal_reason(CONNECTION_ID(), 'reply with a short confirmation that this connection works');
 -- before running this script.

@@ -34,7 +34,7 @@
 --   1. SOURCE sql/install_udf.sql;      (the base UDF set)
 --   2. SOURCE sql/install_agents.sql;   (fractal_agent_patient_deterioration_triage
 --      -- sections 0-6 need nothing else)
---   3. Reasoning configured (see docs/COOKBOOK.md) -- Section 3's
+--   3. Reasoning configured (see docs/reasoning-setup.md) -- Section 3's
 --      fractal_agent_patient_deterioration_triage preset calls
 --      fractal_reason internally.
 --

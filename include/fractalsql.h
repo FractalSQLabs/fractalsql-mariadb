@@ -1,6 +1,6 @@
 /* include/fractalsql.h
  *
- * libfractalsql-core: public C ABI.
+ * libfractalsql-core — public C ABI.
  *
  * SPDX-License-Identifier: Apache-2.0 AND BSD-2-Clause
  * SPDX-FileCopyrightText: 2014 Hamid Salimi (SFS algorithmic lineage)
@@ -12,12 +12,12 @@
  * ABI break; the v2 surface was added purely ADDITIVELY (no v1 symbol
  * removed or changed), so v1 consumers keep linking unchanged.
  *
- * Minimal tier (this header, 11 symbols, frozen at the v1 baseline):
+ * Minimal tier (this header — 11 symbols, frozen at the v1 baseline):
  *   fsql_new_minimal, fsql_free, fsql_release, fsql_search,
  *   fsql_search_ptr, fsql_last_error, fsql_edition, fsql_storage,
  *   fsql_version, fsql_abi_version, fsql_free_string.
  *
- * Sovereign tier (declared in fractalsql_sql.h, 22 additional symbols):
+ * Sovereign tier (declared in fractalsql_sql.h — 22 additional symbols):
  *   5 v1 sovereign-only (fsql_new_sovereign + 4 reasoning ABI calls)
  *   + 17 v2 sovereign-only (diversify / entropy / feedback / ledger /
  *   audit). Total exported sovereign surface = 33 (pinned in
@@ -198,24 +198,24 @@ FSQL_API fsql_ctx *fsql_new_minimal(void);
 FSQL_API void fsql_free(fsql_ctx *ctx);
 
 /* ---------------------------------------------------------------- */
-/* String deallocator (V1: Pattern A/B/C contract)                  */
+/* String deallocator (V1 — Pattern A/B/C contract)                 */
 /* ---------------------------------------------------------------- */
 
 /* Free a string allocated by the library on behalf of the caller.
  * The Pattern A/B/C contract documents three ownership models for
  * strings the library returns:
  *
- *   Pattern A: library-owned, ctx-lifetime.
+ *   Pattern A — library-owned, ctx-lifetime:
  *     Pointer valid until next call on same ctx OR fsql_free.
  *     Used by: fsql_search* result_json, fsql_last_error.
  *     Caller MUST NOT free.
  *
- *   Pattern B: caller-owned, malloc'd.
+ *   Pattern B — caller-owned, malloc'd:
  *     Library mallocs, returns pointer; caller frees via fsql_free_string.
- *     Used by: none in v1.0 minimal (sovereign reasoning paths use
- *     Pattern B / Pattern C).
+ *     Used by: (none in v1.0 minimal — sovereign reasoning paths
+ *     use Pattern B / Pattern C).
  *
- *   Pattern C: caller-owned, paired free.
+ *   Pattern C — caller-owned, paired free:
  *     Library returns a struct with a string pointer + a paired
  *     free function. Used by: fsql_ai_response_free (sovereign).
  *
@@ -229,7 +229,7 @@ FSQL_API void fsql_free(fsql_ctx *ctx);
 FSQL_API void fsql_free_string(char *s);
 
 /* ---------------------------------------------------------------- */
-/* Search: text corpus + text query (CSV / bracketed-JSON)          */
+/* Search — text corpus + text query (CSV / bracketed-JSON)         */
 /* ---------------------------------------------------------------- */
 
 /*
@@ -238,7 +238,7 @@ FSQL_API void fsql_free_string(char *s);
  * corpus_len  : length in bytes (not bytes-plus-NUL)
  * query       : single vector in the same formats as one corpus row
  * query_len   : length in bytes
- * k           : 1..1,000,000, number of top matches to return.
+ * k           : 1..1,000,000 — number of top matches to return.
  *               If k exceeds the corpus row count, k is silently
  *               clamped to n_rows.
  * params_json : '{}' or a subset of:
@@ -257,11 +257,11 @@ FSQL_API void fsql_free_string(char *s);
  *               population of "population_size" particles. When a
  *               corpus is supplied, the fitness is min-distance-to-any-
  *               stored-vector, so with no cross-particle best-pull the
- *               particles settle into DISTINCT data basins: the
+ *               particles settle into DISTINCT data basins — the
  *               diversity/discovery workload (many clusters per query,
  *               vs Sniper top-k which collapses to one basin). Scout
  *               defaults "walk" to 0.0 unless the caller sets it.
- *               Scout is a MODE of this call, not a new ABI symbol; the
+ *               Scout is a MODE of this call — no new ABI symbol; the
  *               minimal surface stays at its frozen 11. It is the
  *               expensive mode (O(rows * iterations * population) per
  *               query): use it on small or pre-filtered corpora.
@@ -274,7 +274,7 @@ FSQL_API void fsql_free_string(char *s);
  *                 - Omitted or 0  → the engine synthesizes a
  *                   non-deterministic per-context default (mix of
  *                   wall clock + monotonic clock + ctx pointer).
- *                   Two calls, even same ctx and same inputs, take
+ *                   Two calls — even same ctx, same inputs — take
  *                   different SFS trajectories and may return
  *                   different best_point / ranking.
  *                 - Any non-zero value → the walk is deterministic
@@ -288,7 +288,7 @@ FSQL_API void fsql_free_string(char *s);
  *               SECURITY: a caller that routes on this output and
  *               cannot tolerate an attacker re-rolling the result
  *               by simply re-issuing the query (a retry/reroll
- *               oracle, e.g. probing past a classifier or guard)
+ *               oracle — e.g. probing past a classifier or guard)
  *               MUST pin "seed" to a value derived deterministically
  *               from the query (plus any tenant/policy salt for
  *               cross-call-stable per-tenant isolation). The default
@@ -326,7 +326,7 @@ FSQL_API int fsql_search(
 /*
  * Zero-copy variant. Corpus is a flat row-major double array of
  * n_rows * dim elements; query is query_dim elements. The library
- * does not take ownership of these buffers; they must remain valid
+ * does not take ownership of these buffers — they must remain valid
  * for the duration of the call.
  *
  * All other semantics match fsql_search. In particular the output

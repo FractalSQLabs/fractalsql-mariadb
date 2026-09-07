@@ -1,16 +1,27 @@
 # Build artifacts
 *.so
 *.o
+*.obj
 *.a
 *.dylib
+*.pdb
 fractalsql.so
 fractal_mdb*.so
+
+# Gate-harness run logs (build_test.ps1 / build_test.sh output)
+build_test*.log
 
 # NOTE: include/sfs_core_bc.h is a tracked source file
 # (pre-compiled LuaJIT bytecode). Do not add it to this list.
 
 # Build output trees
 dist/
+deps/
+
+# gcov/lcov coverage artifacts (build_test.sh --coverage)
+*.gcno
+*.gcda
+coverage_html/
 
 # Packaging temp files (fpm + debhelper + rpmbuild stagedirs)
 *.deb
@@ -28,9 +39,9 @@ packaging/rpm/SPECS/
 packaging/rpm/SRPMS/
 
 # Benchmark tester (Node.js 24)
-benchmark/tester/node_modules/
-benchmark/tester/package-lock.json
-benchmark/tester/results/
+bench/tester/node_modules/
+bench/tester/package-lock.json
+bench/tester/results/
 
 # Python cache
 __pycache__/

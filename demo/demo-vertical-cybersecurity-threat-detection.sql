@@ -47,7 +47,7 @@
 --   2. Section 6 narrates that its reasoning step is folded into the
 --      Section 5 preset rationales (fractal_agent_regime_triage /
 --      fractal_agent_track_anomaly), which call fractal_reason()
---      internally -- see docs/COOKBOOK.md for reasoning setup.
+--      internally -- see docs/reasoning-setup.md for reasoning setup.
 --
 -- Run:
 --   mariadb -u root -p <your_database> < demo/demo-vertical-cybersecurity-threat-detection.sql

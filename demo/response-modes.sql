@@ -29,7 +29,7 @@
 --   2. Reasoning configured as process environment variables in
 --      mariadbd's own environment (MariaDB has no live-reloadable
 --      config mechanism a dlopen'd UDF library can hook into); see
---      docs/COOKBOOK.md and build_test.sh's mdb_setup.
+--      docs/reasoning-setup.md and build_test.sh's mdb_setup.
 
 -- ============================================================
 -- Plain text: raw model output, unchanged. This is what demo.sql and

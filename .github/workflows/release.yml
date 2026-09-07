@@ -19,11 +19,11 @@ concurrency:
 jobs:
   # ------------------------------------------------------------------
   # Linux: build fractalsql.so per arch. The UDF ABI is stable across
-  # MariaDB 10.6 / 10.11 / 11.4 LTS and 12.2 rolling, so one .so per
+  # MariaDB 10.6 / 10.11 / 11.4 LTS and 12.3 LTS, so one .so per
   # arch covers the whole supported range, no per-major fan-in.
   #
   # amd64 gets a native smoke test inside real mariadb:11.4 AND
-  # mariadb:12.2 containers (edition + version + fractal_search
+  # mariadb:12.3 containers (edition + version + fractal_search
   # cosine-similarity convergence), the same .so in, both containers
   # out, which is the actual cross-major-ABI proof.
   # arm64 skips the smoke test: QEMU + mariadbd is too slow and flaky,
@@ -50,10 +50,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Build fractalsql.so for ${{ matrix.arch }}
         run: |
@@ -67,11 +67,11 @@ jobs:
           set -euo pipefail
           SO="dist/amd64/fractalsql.so"
 
-          # Validate the same fractalsql.so against both a current LTS
-          # (11.4) and a current rolling release (12.2). Same binary in,
-          # both containers out, proving the UDF ABI stability claim
-          # instead of just asserting it in commentary.
-          for TAG in 11.4 12.2; do
+          # Validate the same fractalsql.so against both current LTS
+          # majors (11.4 and 12.3). Same binary in, both containers
+          # out, proving the UDF ABI stability claim instead of just
+          # asserting it in commentary.
+          for TAG in 11.4 12.3; do
               M="mdb-${TAG}"
               echo "=============================================="
               echo "  Smoke test against mariadb:${TAG}"
@@ -152,7 +152,7 @@ jobs:
           done
 
       - name: Upload .so artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}-so
           path: dist/${{ matrix.arch }}/fractalsql.so
@@ -174,10 +174,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Download fractalsql.so
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}-so
           path: dist/${{ matrix.arch }}
@@ -257,7 +257,7 @@ jobs:
           done
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}
           path: dist/packages/*
@@ -265,7 +265,7 @@ jobs:
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/packages/*
           fail_on_unmatched_files: false
@@ -275,18 +275,15 @@ jobs:
   # ------------------------------------------------------------------
   # macOS: fractalsql.dylib for Apple Silicon (native) + Intel
   # (cross-compiled), pure-C, vendored core archive, zero-dependency
-  # posture. Matches fractalsql-postgresql's v2.0.0 build-darwin job:
-  # no LuaJIT anywhere in this path (see build.sh/Makefile/
+  # posture. No LuaJIT anywhere in this path (see build.sh/Makefile/
   # docker/Dockerfile, already migrated). Static-links
   # include/darwin-<arch>/libfractalsql-community-sovereign-c.a, the
   # same vendored core archive the Linux build links.
   #
   # Both cells run on macos-14, since GitHub retired the free macos-13
   # (Intel) runner in Dec 2025, so amd64 is a cross-compile
-  # (`-arch x86_64`) on the arm64 runner rather than a native build,
-  # the same fix fractalsql-postgresql's build-darwin job already made.
-  # No `-bundle_loader`/dynamic-lookup workaround is needed the way
-  # postgres's PGXS build required for its cross cell: this is a
+  # (`-arch x86_64`) on the arm64 runner rather than a native build.
+  # No `-bundle_loader`/dynamic-lookup workaround is needed: this is a
   # plain `-dynamiclib` link with no loader-provided symbol resolution
   # to worry about, and the vendored core archive is a real per-arch
   # static lib (not a host binary), so cross-linking it from either
@@ -296,8 +293,6 @@ jobs:
   # only, no client library is linked (see the compile line below:
   # only -lm, matching the Linux/Windows builds). plugin_dir varies
   # across Homebrew arch + install path, so this ships .dylib + a
-  # README and lets the user `cp` it to the right one, per
-  # docs/COOKBOOK.md's own documented paths.
   #
   # Unsigned release: users run `xattr -d com.apple.quarantine` once.
   # ------------------------------------------------------------------
@@ -316,7 +311,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install MariaDB client headers
         run: |
@@ -350,6 +345,7 @@ jobs:
               -Wl,-dead_strip \
               -o "${OUT_DIR}/fractalsql.dylib" \
               src/fractalsql.c \
+              src/fractalsql_parse.c \
               src/fractalsql_session.c \
               src/fractalsql_vector.c \
               src/fractalsql_cognition.c \
@@ -453,11 +449,20 @@ jobs:
           cp LICENSE "${STAGE}/"
           cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
           cp sql/install_udf.sql "${STAGE}/install_udf.sql"
+          cp sql/install_agents.sql "${STAGE}/install_agents.sql"
+          install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
           fractalsql-mariadb 2.0.0 Community (${{ matrix.platform_tag }})
 
           Unsigned MariaDB UDF for macOS. Compatible with MariaDB
-          10.6 / 10.11 / 11.4 LTS / 12.2 via Homebrew.
+          10.6 / 10.11 / 11.4 LTS / 12.3 LTS via Homebrew.
+
+          Automated: run ./install.sh (uses mariadb_config on PATH, or
+          MDB_CONFIG=/path/to/mariadb_config ./install.sh for a specific
+          server). It does steps 1-3 and 5-6 below for you; scripts/
+          easy_install.sh's own darwin path calls it the same way.
+
+          Manual steps, if you'd rather not run install.sh:
 
           1. Find your mariadbd's plugin_dir:
                  mariadb -uroot -p -e "SELECT @@plugin_dir;"
@@ -473,7 +478,7 @@ jobs:
 
           3. (Optional) Copy the reasoning plugin alongside it, needed
              for fractal_reason()/fractal_embed()/text-to-sql, see
-             docs/COOKBOOK.md:
+             docs/reasoning-setup.md:
                  sudo cp fractalsql-reasoning-http.so \\
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so
 
@@ -482,8 +487,9 @@ jobs:
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql.so \\
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so
 
-          5. Register the UDFs:
+          5. Register the UDFs and agent procedures:
                  mariadb -uroot -p < install_udf.sql
+                 mariadb -uroot -p < install_agents.sql
 
           6. Verify:
                  mariadb -uroot -p -e "SELECT fractalsql_edition(), fractalsql_version();"
@@ -493,7 +499,7 @@ jobs:
           ls -l "${DIST_DIR}/${ZIP_NAME}"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fractalsql-mariadb-${{ matrix.platform_tag }}
           path: dist/packages/fractalsql-mariadb-${{ matrix.platform_tag }}.zip
@@ -501,7 +507,7 @@ jobs:
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/packages/fractalsql-mariadb-${{ matrix.platform_tag }}.zip
           fail_on_unmatched_files: false
@@ -521,8 +527,8 @@ jobs:
   #           7-Zip silent extraction to harvest include\mysql\*.h.
   #           This cell is deliberately deferred rather than shipped
   #           half-implemented.
-  #   x64   : full coverage for 10.6 / 10.11 / 11.4 LTS and 12.2
-  #           rolling via the official archive.mariadb.org
+  #   x64   : full coverage for 10.6 / 10.11 / 11.4 LTS and 12.3
+  #           LTS via the official archive.mariadb.org
   #           mariadb-<VER>-winx64.zip publishes.
   #
   # The minor versions pinned below (10.6.20 etc.) are current as of
@@ -547,18 +553,18 @@ jobs:
             mariadb_ver:   "11.4.4"
             arch: x64
             runner: windows-latest
-          - mariadb_major: "12.2"
-            mariadb_ver:   "12.2.2"
+          - mariadb_major: "12.3"
+            mariadb_ver:   "12.3.3"
             arch: x64
             runner: windows-latest
     runs-on: ${{ matrix.runner }}
     name: windows mdb${{ matrix.mariadb_major }} / ${{ matrix.arch }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up MSVC dev cmd (${{ matrix.arch }})
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
         with:
           arch: ${{ matrix.arch }}
 
@@ -633,6 +639,12 @@ jobs:
           set MARIADB_DIR=%CD%\deps\mariadb\root
           set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%
           if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          REM OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+          REM check, not vendored by fractalsql-core. Same vcpkg tool and
+          REM install path fractalsql-reasoning-http's own Windows build
+          REM already uses for libcurl (pre-installed on this runner image).
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
           call scripts\windows\build.bat
           if errorlevel 1 exit /b 1
           dir "%OUT_DIR%\fractalsql.dll"
@@ -719,7 +731,7 @@ jobs:
           dir dist\windows\*.msi
 
       - name: Upload MSI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fractalsql-mariadb-windows-mdb${{ matrix.mariadb_major }}-${{ matrix.arch }}
           path: dist/windows/FractalSQL-MariaDB-${{ matrix.mariadb_major }}-*-${{ matrix.arch }}.msi
@@ -727,7 +739,7 @@ jobs:
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/windows/FractalSQL-MariaDB-${{ matrix.mariadb_major }}-*-${{ matrix.arch }}.msi
           fail_on_unmatched_files: false

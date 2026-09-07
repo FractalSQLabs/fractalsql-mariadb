@@ -5,10 +5,11 @@
  * Adversarial reasoning plugin that allocates a tiny real buffer but
  * reports an implausible response_len_out (32 MiB) -- comfortably over
  * FSQL_MAX_AI_RESPONSE_BYTES (16 MiB, fractalsql.c) but safely under
- * PostgreSQL's own palloc ceiling (~1 GiB), so a build missing
+ * the ~1 GiB ceiling a single server-side string allocation is still
+ * allowed to reach, so a build missing
  * guard_ai_response_len() would actually attempt to read ~32 MiB out
- * of an 8-byte allocation via pnstrdup/cstring_to_text_with_len --
- * not just hit a different, unrelated palloc error.
+ * of an 8-byte allocation through the response-copy path --
+ * not just fail fast on a different, unrelated allocation error.
  *
  * Proves guard_ai_response_len() rejects a lying plugin BEFORE any
  * read of `summary` is attempted, at all three call sites that use it

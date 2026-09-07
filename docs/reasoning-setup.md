@@ -32,12 +32,10 @@ orchestrators, FractalSQL performs the synthesis inside the backend:
    query result, allowing you to combine reasoning with standard SQL
    filters, joins, and aggregations in a single statement.
 
-`session_id` (pass `CONNECTION_ID()`) is required and first, a
-MariaDB-specific requirement absent from the PostgreSQL edition. MariaDB is
-one shared multithreaded process for every connection (not one OS process
-per connection the way PostgreSQL is), so reasoning/embedding context is
-explicitly keyed per-connection rather than living in a process-global
-static.
+`session_id` (pass `CONNECTION_ID()`) is required and first. MariaDB is
+one shared multithreaded process for every connection, so
+reasoning/embedding context is explicitly keyed per-connection rather than
+living in a process-global static.
 
 ---
 
@@ -52,7 +50,7 @@ standalone `dlopen`'d shared object; it is **not** a MariaDB `INSTALL
 SONAME` plugin. MariaDB's plugin loader requires an exact
 interface-version/`MYSQL_VERSION_ID` match to the running server, down to
 the patch level, and a single prebuilt `.so` could never satisfy that across
-this repo's 10.6-12.2 compat matrix the way a stable UDF ABI does. Instead,
+this repo's 10.6-12.3 compat matrix the way a stable UDF ABI does. Instead,
 this repo's own C code `dlopen`s it directly, the same portable mechanism
 `src/fractalsql_enterprise.c` uses for the (separate) enterprise library.
 See `docker/Dockerfile`'s own header comment for the full rejected-design
@@ -82,20 +80,20 @@ packages already do this for you).
 
 ## Step 1: Point mariadbd at the plugin
 
-**There is no `postgresql.conf`, GUC, sysvar, or `SET GLOBAL` here.** This
-repo never adopted a MariaDB system-variable config surface for any
-reasoning tier. Configuration is a **process environment variable**, read
+**There is no server config file, sysvar, or `SET GLOBAL` here.** No
+reasoning tier registers a server system variable. Configuration is a
+**process environment variable**, read
 once by `mariadbd` and cached for that process's entire lifetime. Set it
 **before** `mariadbd` starts:
 
 ```bash
 # systemd EnvironmentFile, docker run -e, or your process manager's
-# equivalent. NOT postgresql.conf-style config-file syntax.
+# equivalent. Not a server config file; plain process-environment syntax.
 FRACTALSQL_REASONING_PLUGIN=/usr/lib/mysql/plugin/fractalsql-reasoning-http.so
 ```
 
-The plugin loads lazily on the first reasoning call in a session, same as
-the PostgreSQL edition, but there is no live reload: changing any of these
+The plugin loads lazily on the first reasoning call in a session, but there
+is no live reload: changing any of these
 variables means restarting `mariadbd`.
 
 ## Step 2: Universal LLM Connectivity
@@ -171,12 +169,10 @@ gcloud auth activate-service-account --key-file=sa-key.json
 gcloud auth print-access-token    # paste the output into FRACTALSQL_HTTP_TOKEN
 ```
 
-**Rotating it is a real, honest gap versus the PostgreSQL edition.** On
-PostgreSQL, `fractalsql.http_token` is a GUC: `ALTER SYSTEM SET
-fractalsql.http_token = '...'` plus `pg_reload_conf()` rotates it live,
-with no restart (the token's own read happens per-call, not once at load).
-Here, `FRACTALSQL_HTTP_TOKEN` is read once by `mariadbd` and cached for the
-process's lifetime. The token is short-lived (~1 hour) and this repo has
+**Rotating it requires a restart.** `FRACTALSQL_HTTP_TOKEN` is read once by
+`mariadbd` and cached for the process's lifetime: there is no server system
+variable for it, so no SQL-level live rotation exists here.
+The token is short-lived (~1 hour) and this repo has
 **no mechanism to rotate it without restarting `mariadbd`**. For a
 long-running Vertex install, plan around scheduled restarts (or front it
 with a token-refreshing proxy that MariaDB's `FRACTALSQL_HTTP_URL` points
@@ -218,8 +214,7 @@ environment, not a config file. Restart `mariadbd` after changing them.
 This repo's C code (`src/fractalsql_cognition.c`,
 `src/fractalsql_textsql.c`) reads one set of variables and **translates**
 them, at plugin-load time, into a second, lower-level set the vendored
-`fractalsql-reasoning-http.so` plugin itself reads: the same plugin family
-the PostgreSQL edition uses, unaware it's running under MariaDB.
+`fractalsql-reasoning-http.so` plugin itself reads.
 
 | You set (this repo's bridge) | Becomes (the plugin's own var) |
 | --- | --- |
@@ -317,23 +312,21 @@ what the LLM can see.
 CREATE USER 'fsql_reasoning'@'%' IDENTIFIED BY '...';
 GRANT SELECT (id, title, body) ON mydb.documents TO 'fsql_reasoning'@'%';
 ```
-MariaDB supports column-level `GRANT` (as above); port that part of any
-PostgreSQL guidance directly.
+MariaDB supports column-level `GRANT` (as above), so scope the account down
+to exactly the columns the reasoning queries need.
 
 ### No Row-Level Security
-**Unlike PostgreSQL, MariaDB has no native Row-Level Security mechanism at
-all.** PostgreSQL's guidance to "enable RLS so the context subquery only
-returns rows the current session's user may see" has no equivalent here.
-This is a real capability gap, not different phrasing for the same
-guarantee. If cross-tenant leakage into an LLM context is a concern, the
+**MariaDB has no native Row-Level Security mechanism.** There is no
+engine-level policy you can enable so the context subquery only
+returns rows the current session's user may see.
+If cross-tenant leakage into an LLM context is a concern, the
 filtering has to live in the SQL itself (an explicit `WHERE`, a view scoped
 by the connecting account's own grants) or an application-layer check;
 there is no engine-enforced backstop to fall back on.
 
 ### Prompt Injection (OWASP LLM01)
 The plugin prepends a baseline anti-injection instruction to every system
-message as a best-effort mitigation, unchanged from the PostgreSQL
-edition, same plugin family. No system-prompt instruction can fully
+message as a best-effort mitigation. No system-prompt instruction can fully
 prevent prompt injection from untrusted context, since the model still
 can't reliably distinguish instructions from data. Treat it as raising the
 bar, not closing the door. The real defense is architectural: column-level

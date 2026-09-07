@@ -4,8 +4,8 @@
   FractalSQL MariaDB UDF Windows MSI.
 
   Driven by four preprocessor vars supplied by build-msi.bat:
-    -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.2 (dotted, for display)
-    -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_2 (sanitized, for WiX IDs)
+    -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.3 (dotted, for display)
+    -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_3 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-mdb...
     -dMSI_VERSION=2.0.0
   plus the standard candle -arch x64|arm64, which populates
@@ -36,8 +36,8 @@
       <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB002" ?>
   <?elseif $(var.MARIADB_MAJOR_HEX) = "0B04" ?>
       <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB003" ?>
-  <?elseif $(var.MARIADB_MAJOR_HEX) = "0C02" ?>
-      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB004" ?>
+  <?elseif $(var.MARIADB_MAJOR_HEX) = "0C03" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB005" ?>
   <?else ?>
       <?error Unsupported MARIADB_MAJOR_HEX: $(var.MARIADB_MAJOR_HEX) ?>
   <?endif ?>

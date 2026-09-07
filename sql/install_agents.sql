@@ -9,17 +9,19 @@
 -- Prerequisite: sql/install_udf.sql must already be run. This script calls
 -- fractal_search/_telemetry, fractal_hybrid_clinical_search, fractal_
 -- search_trajectory, fractal_reason, fractal_dimension_*, fractal_
--- optimize_portfolio, fractal_morphological_complexity, fractal_
--- diversify_*, fractal_feedback_report/_isolate_background, and
+-- optimize_portfolio(_multimodal), fractal_morphological_complexity,
+-- fractal_diversify_*, fractal_feedback_report/_isolate_background, and
 -- fractal_sql_agent, all base-tier primitives.
 --
--- 15 lettered engines (A-O), each a real composition of fractalsql
+-- 16 lettered engines (A-P), each a real composition of fractalsql
 -- primitives across Discovery, Cognition, and Analytics, with the
 -- user's tables and columns passed as arguments rather than hardcoded.
--- Engine P (fractal_agent_diverse_portfolios) is not available in this
--- edition: it needs fractal_optimize_portfolio_multimodal, an
--- enterprise-tier primitive loaded from the enterprise core shared
--- library, which this edition does not implement.
+-- Engine P (fractal_agent_diverse_portfolios) calls fractal_optimize_
+-- portfolio_multimodal, an enterprise-tier primitive: dormant (returns
+-- NULL) on a Community deployment with no FRACTALSQL_ENTERPRISE_LIB set,
+-- same as the fractal_ledger_* enterprise functions in sql/install_udf.sql,
+-- real once that variable points at a loaded enterprise core library.
+-- See docs/enterprise.md.
 --
 -- Five additional base-tier "Universal Agent" procedures use the same
 -- compositional style (embed/search/reason over a caller-named table):
@@ -42,9 +44,14 @@
 --      which the base primitives already require and resolve, is
 --      always what gets returned, not a caller-chosen alternate
 --      column.
---   2. No enterprise audit-chain logging. That primitive isn't
---      available in this edition, so it's omitted here outright rather
---      than wired up as a call that would always no-op anyway.
+--   2. Enterprise audit-chain logging: every decision-making engine
+--      below also logs its own decision, best-effort, to the kind=2
+--      decision-audit chain (fractal_audit_log, an enterprise-tier UDF
+--      in sql/install_udf.sql, see docs/enterprise.md). A dormant call
+--      returns NULL and writes nothing, so a missing enterprise tier
+--      never breaks the agent; the three pure-retrieval/pure-analytics
+--      engines (recall_hybrid, recommend_diverse, feedback_audit) don't
+--      make a decision worth auditing and aren't wired up.
 --   3. JSON-array-string arguments and returns, not float8[]/text[]/
 --      int8[]/RETURNS TABLE. Same convention the rest of this
 --      extension uses everywhere; see sql/install_udf.sql for the full
@@ -67,6 +74,7 @@
 
 DROP PROCEDURE IF EXISTS fractal_agent_anomaly_triage;
 DROP PROCEDURE IF EXISTS fractal_agent_allocate;
+DROP PROCEDURE IF EXISTS fractal_agent_diverse_portfolios;
 DROP PROCEDURE IF EXISTS fractal_agent_route_task;
 DROP PROCEDURE IF EXISTS fractal_agent_outlier_intercept;
 DROP PROCEDURE IF EXISTS fractal_agent_recall_hybrid;
@@ -111,6 +119,7 @@ BEGIN
     DECLARE v_drift        TEXT;
     DECLARE v_reasoning    TEXT;
     DECLARE v_window       INT DEFAULT IFNULL(p_baseline_window, 32);
+    DECLARE v_audit        BIGINT DEFAULT 0;
 
     IF p_log_table IS NULL OR p_metric_col IS NULL OR p_time_col IS NULL OR p_filter_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_anomaly_triage: identifier arguments must not be NULL';
@@ -136,6 +145,10 @@ BEGIN
         CONCAT('Triage this anomaly: ', v_drift),
         JSON_OBJECT('table', p_log_table, p_filter_col, p_filter_val));
 
+    SET v_audit = fractal_audit_log('agent_anomaly_triage', JSON_OBJECT(
+        'threat_score', IFNULL(JSON_VALUE(v_drift, '$.drift'), 0.0),
+        'anomaly_type', 'vector_drift', 'triage_summary', v_reasoning));
+
     SET p_result = JSON_OBJECT(
         'threat_score', IFNULL(JSON_VALUE(v_drift, '$.drift'), 0.0),
         'anomaly_type', 'vector_drift',
@@ -159,6 +172,7 @@ BEGIN
     DECLARE v_opt      TEXT;
     DECLARE v_sharpe    DOUBLE;
     DECLARE v_reasoning TEXT;
+    DECLARE v_audit     BIGINT DEFAULT 0;
 
     SET v_opt = fractal_optimize_portfolio(p_mu, p_cov, p_cardinality, '{}');
     SET v_sharpe = IFNULL(JSON_VALUE(v_opt, '$.sharpe'), 0.0);
@@ -175,6 +189,11 @@ BEGIN
     -- "already JSON" by JSON_OBJECT/JSON_ARRAY). That hint does not
     -- survive being stored in a variable first, even one itself
     -- populated via JSON_EXTRACT.
+    -- Complements fractal_optimize_portfolio's own audit-chain entry:
+    -- the optimizer logs the raw decision, this logs the narrated one.
+    SET v_audit = fractal_audit_log('agent_allocate', JSON_OBJECT(
+        'sharpe', v_sharpe, 'cardinality', p_cardinality, 'rationale', v_reasoning));
+
     SET p_result = JSON_OBJECT('allocation', JSON_EXTRACT(v_opt, '$'), 'sharpe', v_sharpe, 'rationale', v_reasoning);
 END$$
 
@@ -201,6 +220,7 @@ BEGIN
     DECLARE v_confidence DOUBLE;
     DECLARE v_rationale  TEXT;
     DECLARE v_cost       INT DEFAULT IFNULL(p_cost_per_route, 150);
+    DECLARE v_audit      BIGINT DEFAULT 0;
 
     IF p_cap_table IS NULL OR p_cap_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_route_task: identifier arguments must not be NULL';
@@ -219,6 +239,10 @@ BEGIN
         CONCAT('Route this task to capability ', IFNULL(v_routed_to, '?'),
                ' (cosine distance ', v_dist, '). Justify the routing in one sentence.'),
         JSON_OBJECT('budget', p_budget, 'cost_per_route', v_cost));
+
+    SET v_audit = fractal_audit_log('agent_route_task', JSON_OBJECT(
+        'routed_to', v_routed_to, 'confidence', v_confidence,
+        'remaining_budget', p_budget - v_cost, 'rationale', v_rationale));
 
     SET p_result = JSON_OBJECT(
         'routed_to', v_routed_to, 'confidence', v_confidence,
@@ -244,6 +268,7 @@ BEGIN
     DECLARE v_dist       DOUBLE;
     DECLARE v_intercepted BOOLEAN;
     DECLARE v_reason     TEXT;
+    DECLARE v_audit      BIGINT DEFAULT 0;
 
     IF p_history_table IS NULL OR p_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: identifier arguments must not be NULL';
@@ -263,6 +288,11 @@ BEGIN
                IF(v_intercepted, 'INTERCEPT', 'allow'),
                '. Justify the decision in one sentence.'),
         JSON_OBJECT('threshold', p_threshold, 'intercepted', v_intercepted));
+
+    -- High-value trail: this engine can block a proposed state/action.
+    SET v_audit = fractal_audit_log('agent_outlier_intercept', JSON_OBJECT(
+        'intercepted', v_intercepted, 'nearest_distance', v_dist,
+        'threshold', p_threshold, 'reason', v_reason));
 
     SET p_result = JSON_OBJECT('intercepted', v_intercepted, 'reason', v_reason);
 END$$
@@ -401,6 +431,7 @@ BEGIN
     DECLARE v_status      VARCHAR(20);
     DECLARE v_result_json JSON;
     DECLARE v_analysis    TEXT;
+    DECLARE v_audit       BIGINT DEFAULT 0;
 
     CALL fractal_sql_agent(p_question, p_table_names, IFNULL(p_max_retries, 2), TRUE, v_sql, v_status, v_result_json);
 
@@ -408,6 +439,11 @@ BEGIN
         CONCAT('Analyze this database query result and answer in one paragraph: ',
                IFNULL(CAST(v_result_json AS CHAR), 'null')),
         IFNULL(p_context, '{}'));
+
+    -- High-value trail: this engine auto-executes LLM-generated SQL.
+    SET v_audit = fractal_audit_log('agent_data_analyst', JSON_OBJECT(
+        'question', p_question, 'generated_sql', v_sql,
+        'execution_status', v_status, 'analysis', v_analysis));
 
     -- JSON_EXTRACT(v_result_json, '$'): see Engine B's identical comment above.
     SET p_result = JSON_OBJECT('analysis', v_analysis, 'generated_sql', v_sql, 'result_json', JSON_EXTRACT(v_result_json, '$'));
@@ -440,6 +476,7 @@ BEGIN
     DECLARE v_traj_dist   DOUBLE;
     DECLARE v_rationale   TEXT;
     DECLARE v_cohort_matches JSON;
+    DECLARE v_audit        BIGINT DEFAULT 0;
 
     IF p_patient_table IS NULL OR p_vec_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_patient_deterioration_triage: identifier arguments must not be NULL';
@@ -499,6 +536,11 @@ BEGIN
     -- values it can see are JSON-producing expressions). Wrapping in
     -- JSON_EXTRACT(..., '$') makes it nest v_cohort_matches as a real
     -- array instead of a JSON-encoded string.
+    SET v_audit = fractal_audit_log('agent_patient_deterioration_triage', JSON_OBJECT(
+        'nearest_cohort_id', v_cohort_id, 'cohort_distance', v_cohort_dist,
+        'drift_distance', v_traj_dist, 'rationale', v_rationale,
+        'cohort_matches', JSON_EXTRACT(v_cohort_matches, '$')));
+
     SET p_result = JSON_OBJECT(
         'nearest_cohort_id', v_cohort_id, 'cohort_distance', v_cohort_dist,
         'drift_distance', v_traj_dist, 'rationale', v_rationale,
@@ -609,6 +651,7 @@ BEGIN
     DECLARE v_dist          DOUBLE;
     DECLARE v_confidence    DOUBLE;
     DECLARE v_rationale     TEXT;
+    DECLARE v_audit         BIGINT DEFAULT 0;
 
     IF p_node_table IS NULL OR p_node_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_schedule_workload: identifier arguments must not be NULL';
@@ -645,6 +688,9 @@ BEGIN
                'Justify the placement in one sentence.'),
         IFNULL(p_context, '{}'));
 
+    SET v_audit = fractal_audit_log('agent_schedule_workload', JSON_OBJECT(
+        'assigned_node', v_assigned, 'confidence', v_confidence, 'rationale', v_rationale));
+
     SET p_result = JSON_OBJECT('assigned_node', v_assigned, 'confidence', v_confidence, 'rationale', v_rationale);
 END$$
 
@@ -673,6 +719,7 @@ BEGIN
     DECLARE v_alloc_id  VARCHAR(255);
     DECLARE v_dist       DOUBLE;
     DECLARE v_rationale  TEXT;
+    DECLARE v_audit      BIGINT DEFAULT 0;
 
     IF p_alloc_table IS NULL OR p_alloc_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_rebalance_sibling: identifier arguments must not be NULL';
@@ -697,6 +744,10 @@ BEGIN
         IFNULL(p_context, '{}'));
 
     -- JSON_EXTRACT(v_weights, '$'): see Engine B's identical comment.
+    SET v_audit = fractal_audit_log('agent_rebalance_sibling', JSON_OBJECT(
+        'sharpe', v_sharpe, 'nearest_alloc_id', v_alloc_id,
+        'nearest_distance', v_dist, 'rationale', v_rationale));
+
     SET p_result = JSON_OBJECT(
         'sharpe', v_sharpe, 'weights', JSON_EXTRACT(v_weights, '$'),
         'nearest_alloc_id', v_alloc_id, 'nearest_distance', v_dist, 'rationale', v_rationale);
@@ -723,6 +774,7 @@ BEGIN
     DECLARE v_dist      DOUBLE;
     DECLARE v_bc         DOUBLE;
     DECLARE v_rationale  TEXT;
+    DECLARE v_audit      BIGINT DEFAULT 0;
 
     IF p_vehicle_table IS NULL OR p_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detour_classify: identifier arguments must not be NULL';
@@ -743,6 +795,10 @@ BEGIN
                ' (nearest fleet peer); its GPS trace has box-counting dimension ', v_bc,
                '. Classify the detour in one sentence.'),
         JSON_OBJECT('trajectory_distance', v_dist, 'trace_complexity', v_bc));
+
+    SET v_audit = fractal_audit_log('agent_detour_classify', JSON_OBJECT(
+        'nearest_fleet_id', v_fleet_id, 'trajectory_distance', v_dist,
+        'trace_complexity', v_bc, 'rationale', v_rationale));
 
     SET p_result = JSON_OBJECT(
         'nearest_fleet_id', v_fleet_id, 'trajectory_distance', v_dist,
@@ -769,6 +825,7 @@ BEGIN
     DECLARE v_dist      DOUBLE;
     DECLARE v_dfa        DOUBLE;
     DECLARE v_rationale   TEXT;
+    DECLARE v_audit       BIGINT DEFAULT 0;
 
     IF p_track_table IS NULL OR p_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_track_anomaly: identifier arguments must not be NULL';
@@ -789,6 +846,10 @@ BEGIN
                '; its heading-change series has DFA exponent ', v_dfa,
                ' (dfa=-1 means insufficient window). Triage the track in one sentence.'),
         JSON_OBJECT('trajectory_distance', v_dist, 'dfa_exponent', v_dfa));
+
+    SET v_audit = fractal_audit_log('agent_track_anomaly', JSON_OBJECT(
+        'nearest_fleet_id', v_track_id, 'trajectory_distance', v_dist,
+        'dfa_exponent', v_dfa, 'rationale', v_rationale));
 
     SET p_result = JSON_OBJECT(
         'nearest_fleet_id', v_track_id, 'trajectory_distance', v_dist,
@@ -820,6 +881,7 @@ BEGIN
     DECLARE v_dd            BOOLEAN;
     DECLARE v_threshold      DOUBLE DEFAULT IFNULL(p_drift_threshold, 0.5);
     DECLARE v_rationale       TEXT;
+    DECLARE v_audit           BIGINT DEFAULT 0;
 
     IF p_point_cloud IS NULL OR p_drift_series IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_network_coverage_alert: point_cloud and drift_series are required';
@@ -839,6 +901,10 @@ BEGIN
                ' (drift_detected=', v_dd, ', threshold ', v_threshold, '). ',
                'Issue the coverage alert in one sentence.'),
         IFNULL(p_context, '{}'));
+
+    SET v_audit = fractal_audit_log('agent_network_coverage_alert', JSON_OBJECT(
+        'morph_dimension', v_md, 'lacunarity', v_lac,
+        'drift_detected', v_dd, 'rationale', v_rationale));
 
     SET p_result = JSON_OBJECT(
         'morph_dimension', v_md, 'lacunarity', v_lac,
@@ -868,6 +934,7 @@ BEGIN
     DECLARE v_ba            DOUBLE;
     DECLARE v_threshold      DOUBLE DEFAULT IFNULL(p_drift_threshold, 0.5);
     DECLARE v_rationale       TEXT;
+    DECLARE v_audit           BIGINT DEFAULT 0;
 
     IF p_series IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_regime_triage: series is required';
@@ -886,9 +953,102 @@ BEGIN
                ', baseline_alpha=', v_ba, '). Triage the regime change in one sentence.'),
         IFNULL(p_context, '{}'));
 
+    SET v_audit = fractal_audit_log('agent_regime_triage', JSON_OBJECT(
+        'dfa_exponent', v_dfa, 'drift_detected', v_dd, 'drift', v_dv,
+        'rationale', v_rationale));
+
     SET p_result = JSON_OBJECT(
         'dfa_exponent', v_dfa, 'drift_detected', v_dd,
         'recent_alpha', v_ra, 'baseline_alpha', v_ba, 'rationale', v_rationale);
+END$$
+
+-- =====================================================================
+-- Engine P: fractal_agent_diverse_portfolios
+-- fractal_optimize_portfolio_multimodal(_pareto) + fractal_reason. Same
+-- composition shape as Engine B (fractal_agent_allocate), but returns a
+-- diverse SET of candidate allocations instead of one, and narrates the
+-- trade-offs across them. p_objective_mode selects the objective:
+-- 'sharpe' (default, NULL accepted) ranks candidates by scalar Sharpe
+-- with asset-overlap diversity; 'pareto' scores each by decomposed
+-- (return, risk) and reduces them to a genuine non-dominated Pareto
+-- front. Enterprise-tier: both backing functions return NULL when no
+-- enterprise library is loaded, in which case this procedure signals a
+-- clean error rather than passing a NULL straight to fractal_reason as
+-- if it were real data.
+-- =====================================================================
+CREATE PROCEDURE fractal_agent_diverse_portfolios(
+    IN  p_mu                JSON,
+    IN  p_cov                JSON,
+    IN  p_cardinality        INT,
+    IN  p_n_restarts         INT,
+    IN  p_overlap_threshold  DOUBLE,
+    IN  p_quality_frac       DOUBLE,
+    IN  p_context            TEXT,
+    IN  p_objective_mode     TEXT,
+    OUT p_result             JSON
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_session_id BIGINT UNSIGNED DEFAULT CONNECTION_ID();
+    DECLARE v_opt      TEXT;
+    DECLARE v_n_found   INT;
+    DECLARE v_reasoning TEXT;
+    DECLARE v_mode      TEXT;
+    DECLARE v_audit     BIGINT DEFAULT 0;
+
+    SET v_mode = LOWER(IFNULL(p_objective_mode, 'sharpe'));
+    IF v_mode NOT IN ('sharpe', 'pareto') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_agent_diverse_portfolios: objective_mode must be ''sharpe'' or ''pareto''';
+    END IF;
+
+    IF v_mode = 'pareto' THEN
+        SET v_opt = fractal_optimize_portfolio_multimodal_pareto(
+            p_mu, p_cov, p_cardinality,
+            IFNULL(p_n_restarts, 8),
+            8,                        -- max_front cap on the returned front
+            0, 0, 'gaussian');        -- seed / use_obl / diffusion_mode
+        IF v_opt IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+                'fractal_agent_diverse_portfolios: enterprise tier not loaded (fractal_optimize_portfolio_multimodal_pareto returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md';
+        END IF;
+
+        SET v_n_found = IFNULL(JSON_VALUE(v_opt, '$.n_found'), 0);
+        SET v_reasoning = fractal_reason(v_session_id,
+            CONCAT('Explain the trade-offs across these ', v_n_found,
+                   ' diverse cardinality-constrained portfolio candidates on the non-dominated return/risk Pareto front: ', v_opt),
+            IFNULL(p_context, '{}'));
+    ELSE
+        SET v_opt = fractal_optimize_portfolio_multimodal(
+            p_mu, p_cov, p_cardinality,
+            IFNULL(p_n_restarts, 8),
+            IFNULL(p_overlap_threshold, 0.3),
+            IFNULL(p_quality_frac, 0.8),
+            0);
+
+        IF v_opt IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+                'fractal_agent_diverse_portfolios: enterprise tier not loaded (fractal_optimize_portfolio_multimodal returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md';
+        END IF;
+
+        SET v_n_found = IFNULL(JSON_VALUE(v_opt, '$.n_found'), 0);
+        SET v_reasoning = fractal_reason(v_session_id,
+            CONCAT('Explain the trade-offs across these ', v_n_found,
+                   ' diverse cardinality-constrained portfolio candidates, ranked by Sharpe: ', v_opt),
+            IFNULL(p_context, '{}'));
+    END IF;
+
+    SET v_audit = fractal_audit_log('agent_diverse_portfolios', JSON_OBJECT(
+        'objective_mode', v_mode, 'n_found', v_n_found,
+        'cardinality', p_cardinality, 'rationale', v_reasoning));
+
+    -- v_opt is the full {"n_found":..,"candidates":[..]} object, nested
+    -- under 'optimization' rather than 'candidates' to avoid a
+    -- misleading key name. Same JSON_EXTRACT(v_opt, '$') convention as
+    -- Engine B above -- see that procedure's own comment for why
+    -- CAST(v_opt AS CHAR) does not nest v_opt as a real JSON sub-object
+    -- here.
+    SET p_result = JSON_OBJECT('optimization', JSON_EXTRACT(v_opt, '$'), 'rationale', v_reasoning);
 END$$
 
 -- =====================================================================

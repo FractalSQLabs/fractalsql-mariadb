@@ -3,9 +3,9 @@
 -- This extension ships two ways to store a vector: MariaDB 11.7+'s own
 -- VECTOR(n)/VEC_FROMTEXT/VEC_TOTEXT/VEC_DISTANCE_* native type (see
 -- test_vector_type.py) alongside a portable JSON path:
---   * Portable path (works on every 10.6-12.2 major): fractal_vector
+--   * Portable path (works on every 10.6-12.3 major): fractal_vector
 --     is a JSON-array-string (sql/install_udf.sql). No custom SQL
---     type, no typmod, no operators, every vector operation is a
+--     type, no type modifiers, no operators, every vector operation is a
 --     plain function call, which Section 5 below exercises.
 --     fractal_vector_scale(vec, factor) exists too (the
 --     scalar-multiply equivalent), see sql/install_udf.sql.
@@ -15,15 +15,15 @@
 --     mismatch, see test_vector_type.py Scenario 3), or VEC_TOTEXT()
 --     a native column straight into these functions. This file sticks
 --     to the portable JSON path throughout, since it must run on the
---     full 10.6-12.2 compat floor. See docs/vectorizer-setup.md and
+--     full 10.6-12.3 compat floor. See docs/vectorizer-setup.md and
 --     sql/install_udf.sql's own comment block for the native-path
 --     worked example.
 -- Sections 1 and 3 (dimension enforcement) and 6 (storage comparison)
 -- are kept as portable-path CHECK-constraint / JSON demos below rather
--- than pretending a typmod exists, matching what's real.
+-- than pretending a type modifier exists, matching what's real.
 
 -- === Section 1: dimension enforcement, portable path ===
--- No typmod on the portable JSON path. Dimension checking is an
+-- No type modifiers on the portable JSON path. Dimension checking is an
 -- explicit CHECK constraint (MariaDB 10.2+), evaluated with
 -- JSON_LENGTH(embedding) = <expected> on every insert/update, not part
 -- of the column's declared type the way MariaDB's own native
@@ -63,7 +63,7 @@ FROM docs_fv
 ORDER BY id;
 
 -- === Section 3: the hard-fail, live (portable path, CHECK constraint) ===
--- No typmod on the portable JSON path. The equivalent guarantee is
+-- No type modifiers on the portable JSON path. The equivalent guarantee is
 -- an explicit CHECK constraint. docs_fv's own embedding column is left
 -- unconstrained deliberately: its real dimension depends on whatever
 -- embedding model the vectorizer above actually called (768 for

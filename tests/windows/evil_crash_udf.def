@@ -1,0 +1,20 @@
+; evil_crash_udf.def
+; Windows DLL export table for tests\evil_crash_udf.c, gate 06's
+; deliberately self-crashing MariaDB UDF. MariaDB's CREATE FUNCTION ...
+; SONAME resolves the UDF's entry points via GetProcAddress on the
+; plugin DLL, but MSVC exports NO plain C symbols from a /LD build by
+; default (unlike a Linux gcc -shared .so, which exports everything --
+; which is why build_test.sh's own use of this same file needs no
+; export table at all). Without this table, CREATE FUNCTION fails
+; "Can't find function 'bt_evil_crash' in library", gate 06's SELECT
+; fails ERROR 1305, no crash ever happens, and the gate's respawn/data-
+; integrity assertions pass for the wrong reason. Same .def technique
+; as tests\windows\fractalsql-test-plugin.def (the reasoning-VFS-ABI
+; fixtures); this is a separate table because that one exports the
+; plugin-ABI symbol fsql_reasoning_init, while a UDF exports the three
+; MariaDB UDF entry points below.
+
+EXPORTS
+    bt_evil_crash
+    bt_evil_crash_init
+    bt_evil_crash_deinit

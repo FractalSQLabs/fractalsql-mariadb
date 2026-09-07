@@ -12,8 +12,8 @@
  * does NOT promise NUL-termination, and the sovereign tier loads
  * out-of-tree plugins -- so a plugin exactly like this one is a
  * legitimate (if hostile) implementation of the contract. With the
- * length-bounded pnstrdup handling in fractalsql.c, this plugin drives
- * fractal_text_to_sql() to completion; without it, the backend
+ * length-bounded response handling in fractalsql.c, this plugin drives
+ * fractal_text_to_sql() to completion; without it, the server
  * crashes here.
  *
  * The SQL text to return is read from the file named by
@@ -89,8 +89,8 @@ ev_free_normal(void *opaque)
 /* GENERATE and REVIEW are two separate dispatch calls within one
  * fractal_text_to_sql() invocation, going through this same
  * generate() callback. Misbehaving on every call only ever proves the
- * FIRST call site's fix (GENERATE) -- REVIEW's own pnstrdup call site
- * (t2s_run_review, fractalsql.c) never gets reached, since a failing
+ * FIRST call site's fix (GENERATE) -- REVIEW's own length-copy call
+ * site (t2s_run_review, fractalsql.c) never gets reached, since a failing
  * GENERATE never lets the pipeline reach REVIEW. FSQL_EVIL_TRIGGER_CALL
  * (fixed file, defaults to call 1) selects which call misbehaves, so
  * the same binary can target either call site: trigger=1 tests

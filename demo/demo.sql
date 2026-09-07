@@ -6,7 +6,7 @@
 --   1. fractalsql-mariadb installed and `SOURCE sql/install_udf.sql;`
 --      already run against the target database (MariaDB has no
 --      CREATE EXTENSION mechanism, UDFs are registered directly).
---   2. Reasoning configured, see docs/COOKBOOK.md. This script assumes
+--   2. Reasoning configured, see docs/reasoning-setup.md. This script assumes
 --      the reasoning plugin + endpoint are already reachable. Any
 --      OpenAI-compatible endpoint works (Ollama, Bedrock, Azure, GCP
 --      Vertex, ...), this script doesn't care which.
@@ -51,7 +51,7 @@ INSERT INTO demo_alerts (service, message, severity, created_at) VALUES
 
 -- === 2. Sniper Search: converge to a single best point ===
 -- Vector args/results are JSON-encoded strings on this extension's UDF
--- surface (no native array type across the 10.6-12.2 compat floor, see
+-- surface (no native array type across the 10.6-12.3 compat floor, see
 -- sql/install_udf.sql's own header). fractal_search takes 4 args
 -- (vector_csv corpus, query_csv, k, params); corpus='' (empty string)
 -- means an empty corpus, and k=1 asks for just the one converged point.

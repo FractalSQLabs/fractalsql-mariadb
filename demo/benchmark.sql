@@ -3,7 +3,7 @@
 -- A quick, reproducible benchmark for FractalSQL: Sniper Search
 -- convergence, Scout Discovery's diversity advantage over plain top-K,
 -- and real vectorizer throughput. For the full large-scale evaluation,
--- see this repo's benchmark/ directory.
+-- see this repo's bench/ directory.
 --
 -- Run:
 --   mariadb -u root -p <your_database> < demo/benchmark.sql

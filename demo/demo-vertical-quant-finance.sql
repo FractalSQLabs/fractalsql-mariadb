@@ -27,7 +27,7 @@
 --   1. SOURCE sql/install_udf.sql;      (the base UDF set)
 --   2. SOURCE sql/install_agents.sql;   (fractal_agent_regime_triage,
 --      fractal_agent_rebalance_sibling -- sections 0-2 need nothing else)
---   3. Reasoning configured (see docs/COOKBOOK.md) -- Sections 3 and 4's
+--   3. Reasoning configured (see docs/reasoning-setup.md) -- Sections 3 and 4's
 --      presets call fractal_reason internally.
 --
 -- Run:

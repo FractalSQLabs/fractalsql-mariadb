@@ -48,8 +48,8 @@
 -- session ctx has a real file-backed storage VFS wired in
 -- (unconditionally, on every deployment, see fractalsql_session.c).
 -- flush/load genuinely persist and rehydrate the Truth/Shadow ledgers,
--- including across a mariadbd restart. MariaDB C UDFs have no SPI
--- equivalent to run SQL against the calling session, so the ledger
+-- including across a mariadbd restart. MariaDB C UDFs have no way to
+-- run SQL against the calling session, so the ledger
 -- persists to a local file instead (FRACTALSQL_ENTERPRISE_LEDGER_PATH,
 -- default fractalsql_ledger.dat relative to mysqld's cwd), with the
 -- same append-only hash-chain and optional HMAC tamper-evidence

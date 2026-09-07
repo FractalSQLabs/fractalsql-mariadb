@@ -46,7 +46,32 @@ CORE_ARCHIVE  := $(firstword \
     $(wildcard include/$(FSQL_PLATFORM)/libfractalsql-$(CORE_VARIANT).a) \
     include/libfractalsql-$(CORE_VARIANT).a)
 
-CFLAGS  = -Wall -Wextra -O3 -fPIC $(MDB_CFLAGS) -Iinclude
+# make COVERAGE=1: gcov-instrument every extension TU for lcov reporting
+# (build_test.sh --coverage). --coverage must be on both the compile
+# and link lines. Does not touch the vendored core archive -- only this
+# extension's own SRCS get instrumented.
+ifdef COVERAGE
+  FSQL_COV_FLAGS := --coverage
+else
+  FSQL_COV_FLAGS :=
+endif
+
+# make ASAN=1 / UBSAN=1: sanitizer-instrument every extension TU
+# (build_test.sh --asan / --ubsan). Same scoping as COVERAGE above --
+# the vendored core archive is linked in as-is, matching this repo's
+# own Windows build_test.ps1 -Asan/-Ubsan (Build-AsanExtension/
+# Build-UbsanExtension) design, just ported to gcc/clang instead of
+# MSVC/clang-cl. Mutually exclusive with each other and with COVERAGE
+# (never combined in one build_test.sh invocation).
+ifdef ASAN
+  FSQL_SAN_FLAGS := -fsanitize=address -fno-omit-frame-pointer
+else ifdef UBSAN
+  FSQL_SAN_FLAGS := -fsanitize=undefined -fno-sanitize-recover=undefined
+else
+  FSQL_SAN_FLAGS :=
+endif
+
+CFLAGS  = -Wall -Wextra -O3 -fPIC $(MDB_CFLAGS) -Iinclude $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
 # -lpthread: fractalsql_session.c's connection-scoped ctx registry
 # (for Discovery/Diversify) uses a pthread_mutex_t. A no-op stub on
 # glibc >= 2.34 (pthread merged into libc) but required on glibc 2.28
@@ -62,10 +87,10 @@ CFLAGS  = -Wall -Wextra -O3 -fPIC $(MDB_CFLAGS) -Iinclude
 # transitive dependency of mariadb-server on the Debian/Ubuntu test
 # image, called out explicitly here (and in docker/Dockerfile.test) so
 # it isn't an implicit, silently-broken assumption.
-LDFLAGS = -shared -lm -lpthread -ldl -lcrypto
+LDFLAGS = -shared -lm -lpthread -ldl -lcrypto $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
 
 TARGET = fractalsql.so
-SRCS   = src/fractalsql.c src/fractalsql_session.c src/fractalsql_vector.c src/fractalsql_cognition.c src/fractalsql_textsql.c src/fractalsql_enterprise.c
+SRCS   = src/fractalsql.c src/fractalsql_parse.c src/fractalsql_session.c src/fractalsql_vector.c src/fractalsql_cognition.c src/fractalsql_textsql.c src/fractalsql_enterprise.c
 OBJS   = $(SRCS:.c=.o)
 
 # MariaDB's plugin dir (mariadb_config --plugindir). Fall back to a
@@ -114,5 +139,24 @@ clean:
 
 install: $(TARGET)
 	cp $(TARGET) $(PLUGIN_DIR)
+
+# Native VECTOR(n) vs Scout Mode, and the portable TEXT vs native
+# VECTOR(n) storage/latency comparison. Both assume the extension is
+# installed against a reachable MariaDB server and that Python deps from
+# bench/requirements.txt are available; pass connection overrides via
+# BENCH_ARGS, e.g. `make bench BENCH_ARGS="--host 127.0.0.1 --password
+# <root password>"`. See bench/README.md.
+PYTHON ?= python3
+BENCH_ARGS ?=
+
+.PHONY: bench bench-vector
+
+bench:
+	$(PYTHON) bench/data_gen.py --with-native-vector $(BENCH_ARGS)
+	$(PYTHON) bench/head_to_head.py $(BENCH_ARGS)
+
+bench-vector:
+	$(PYTHON) bench/data_gen.py --with-native-vector $(BENCH_ARGS)
+	$(PYTHON) bench/vector_type_head_to_head.py $(BENCH_ARGS)
 
 .PHONY: all clean install verify-vendor

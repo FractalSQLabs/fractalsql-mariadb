@@ -1,6 +1,6 @@
 /* include/fractalsql_sql.h
  *
- * libfractalsql-core: Sovereign-tier C ABI (V1).
+ * libfractalsql-core — Sovereign-tier C ABI (V1).
  *
  * SPDX-License-Identifier: Apache-2.0 AND BSD-2-Clause
  * SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
@@ -10,7 +10,7 @@
  *   The sovereign tier no longer ships an inline SQLite layer. Instead
  *   it exposes a VFS-injection model: callers supply a
  *   fsql_storage_vfs_t (for persistence) and/or a fsql_reasoning_vfs_t
- *   (for inference) at construction time. Both may be NULL: sovereign
+ *   (for inference) at construction time. Both may be NULL — sovereign
  *   without storage is a search-only tier with the reasoning surface
  *   reserved for plugin attachment via fsql_load_reasoning.
  *
@@ -28,14 +28,14 @@
  *   fsql_ai_response_free  (Pattern C deallocator for ai_response_t)
  *
  * This header is unconditionally compiled into sovereign-tier .so
- * files (no #ifdef FSQL_SOVEREIGN guard; the .so either exports
+ * files (no #ifdef FSQL_SOVEREIGN guard — the .so either exports
  * these symbols or doesn't, controlled by the linker version script).
  *
  * Crypto-neutrality invariant:
  *   Like the rest of the engine, sovereign code performs zero crypto
  *   operations. The reasoning VFS, the storage VFS, and any plugin
  *   loaded through fsql_load_reasoning must respect crypto-neutrality
- *   on the caller's behalf: the engine never sees a license key,
+ *   on the caller's behalf — the engine never sees a license key,
  *   never verifies a signature, never decrypts payloads.
  *
  * Threading contract:
@@ -63,7 +63,7 @@ extern "C" {
  * passes it back to every callback unchanged. */
 typedef void *fsql_storage_user_ctx;
 
-/* Storage VFS: the engine's persistence boundary. All disk IO,
+/* Storage VFS — the engine's persistence boundary. All disk IO,
  * SQLite open/close, file locking, etc. lives in the implementation
  * the caller provides; the engine itself performs no IO.
  *
@@ -86,10 +86,10 @@ typedef void *fsql_storage_user_ctx;
  *     (e.g. HMAC over current state). Called at fsql_free time and
  *     after long search runs. Returns 0 on success.
  *
- *   user_ctx: opaque pointer passed back to every callback.
+ *   user_ctx — opaque pointer passed back to every callback.
  *
  * Pass an all-NULL struct (or a NULL pointer) to fsql_new_sovereign
- * to construct a sovereign ctx with NO storage backend, useful for
+ * to construct a sovereign ctx with NO storage backend — useful for
  * search-only deployments where ledger semantics aren't needed.
  */
 typedef struct fsql_storage_vfs {
@@ -110,7 +110,7 @@ typedef struct fsql_storage_vfs {
 /* Reasoning VFS                                                    */
 /* ---------------------------------------------------------------- */
 
-/* Reasoning VFS: engine's interface to an external inference
+/* Reasoning VFS — engine's interface to an external inference
  * backend. The engine never instantiates a model itself; callers
  * inject a populated fsql_reasoning_vfs_t (or load one from a .so
  * via fsql_load_reasoning).
@@ -151,7 +151,7 @@ typedef struct fsql_reasoning_vfs {
  * from the V1 design plan. Functionally identical. */
 typedef fsql_reasoning_vfs_t fsql_reasoning_adapter_t;
 
-/* Optional shutdown hook: a plugin MAY additionally export:
+/* Optional shutdown hook — a plugin MAY additionally export:
  *
  *   void fsql_reasoning_fini(void *user_ctx);
  *
@@ -161,7 +161,7 @@ typedef fsql_reasoning_vfs_t fsql_reasoning_adapter_t;
  * whatever header the CALLER was compiled against. A new struct field
  * would let an older-compiled caller loading a newer-compiled plugin
  * end up with the plugin writing past the end of a buffer sized for
- * the old, smaller struct. The abi_version check above only runs
+ * the old, smaller struct — the abi_version check above only runs
  * after the plugin has already written into the struct, so it can't
  * prevent that. A separately-dlsym'd, independently-named symbol has
  * no such risk: absent it, dlsym just returns NULL, identical to
@@ -170,11 +170,11 @@ typedef fsql_reasoning_vfs_t fsql_reasoning_adapter_t;
  * If exported, the host calls it with the SAME user_ctx pointer the
  * plugin's own fsql_reasoning_init populated, immediately before
  * dlclose()-ing the plugin (both on final fsql_free teardown and when
- * fsql_load_reasoning replaces an already-attached plugin), giving
+ * fsql_load_reasoning replaces an already-attached plugin) — giving
  * the plugin a chance to release resources it holds beyond what a bare
  * dlclose reclaims. Concrete motivating case: a plugin holding a
  * long-lived libcurl easy handle whose threaded DNS resolver spawns a
- * background thread. Without an explicit curl_easy_cleanup() before
+ * background thread — without an explicit curl_easy_cleanup() before
  * unload, that thread's own code can end up executing from memory
  * dlclose just unmapped. Optional and NULL-safe throughout; a plugin
  * with nothing to release, or one built before this convention
@@ -182,7 +182,7 @@ typedef fsql_reasoning_vfs_t fsql_reasoning_adapter_t;
  *
  * The host has no timeout on this call: fsql_free / fsql_load_reasoning
  * block for as long as fini takes to return. There is no safe way to
- * enforce one: running fini on a worker thread and abandoning it past a
+ * enforce one — running fini on a worker thread and abandoning it past a
  * deadline would race the caller's own dlclose()/free() against a thread
  * still executing inside soon-to-be-unmapped code, a worse failure mode
  * than blocking. Plugin authors: fini MUST NOT block indefinitely. */
@@ -192,14 +192,14 @@ typedef fsql_reasoning_vfs_t fsql_reasoning_adapter_t;
 /* ---------------------------------------------------------------- */
 
 /* Construct a sovereign-tier ctx with optional storage + reasoning
- * VFS injection. Either parameter may be NULL: a sovereign ctx
+ * VFS injection. Either parameter may be NULL — a sovereign ctx
  * with no storage is search-only; one with no reasoning provides
  * the surface for fsql_load_reasoning to attach later.
  *
  * The structs are copied by value at construction; the caller need
  * not keep them alive after fsql_new_sovereign returns. Callbacks'
  * user_ctx pointers, however, MUST remain valid for the ctx
- * lifetime; they get passed back unchanged on every callback.
+ * lifetime — they get passed back unchanged on every callback.
  *
  * Returns NULL on allocation failure. fsql_free is the destructor
  * for both minimal and sovereign ctx values.
@@ -212,7 +212,7 @@ FSQL_API fsql_ctx *fsql_new_sovereign(
 /* Reasoning ABI                                                    */
 /* ---------------------------------------------------------------- */
 
-/* AI response: Pattern C ownership. Caller must call
+/* AI response — Pattern C ownership: caller must call
  * fsql_ai_response_free(resp) to release. The plugin-supplied
  * free_fn frees the `summary` string (and any auxiliary buffers
  * the plugin allocated alongside it). The fsql_ai_response_t
@@ -221,7 +221,7 @@ FSQL_API fsql_ctx *fsql_new_sovereign(
  * plugin.
  *
  * If the plugin allocated `summary` with libc malloc, it may
- * leave free_fn == NULL; the foundry's defensive path in
+ * leave free_fn == NULL — the foundry's defensive path in
  * fsql_ai_response_free then calls libc free(resp->summary).
  * This is the easy-out for plugins that don't want a custom
  * deallocator; see fractalsql-reasoning-http for an example. */
@@ -231,7 +231,7 @@ typedef struct fsql_ai_response {
     int    rc;             /* 0 on success, non-zero implementation-defined */
     /* Frees the SUMMARY string only (and any plugin-owned auxiliary
      * buffers reachable from it). The opaque argument is the
-     * wrapping fsql_ai_response_t * cast to void *; plugins can
+     * wrapping fsql_ai_response_t * cast to void * — plugins can
      * cast it back to read resp->summary, but the wrapper struct
      * itself is caller-owned and must NOT be freed by this function.
      * The signature is void * (not fsql_ai_response_t *) to keep
@@ -260,11 +260,11 @@ FSQL_API int fsql_dispatch_ai(
  * must export `fsql_reasoning_init` returning a populated
  * fsql_reasoning_vfs_t with abi_version == FSQL_REASONING_ABI_VERSION.
  *
- * Path security: what this function checks, and what it does NOT:
+ * Path security — what this function checks, and what it does NOT:
  *
  *   Checked:   abs_path[0] == '/' (rejects "./plugin.so",
  *              "../plugin.so", and any caller-relative form). This
- *              defeats the simplest CWD-shadowing attack: an attacker
+ *              defeats the simplest CWD-shadowing attack — an attacker
  *              dropping a malicious plugin.so in the working dir and
  *              counting on naive integration code passing a bare name.
  *
@@ -289,12 +289,12 @@ FSQL_API int fsql_dispatch_ai(
  *       enforce that out-of-band (package manager, container image
  *       baking, AppArmor / SELinux policy on the plugin directory).
  *     - Sandboxing. The plugin runs in-process with full host privileges.
- *       FractalSQL deliberately does not sandbox plugins: the sovereign
+ *       FractalSQL deliberately does not sandbox plugins — the sovereign
  *       tier's contract is "you provide the trust boundary".
  *
  * Threat model: the path check protects against accidental loading of
  * the wrong file from the wrong directory. It is NOT a defense against
- * an attacker who can write to a path on the integrator's allowlist:
+ * an attacker who can write to a path on the integrator's allowlist —
  * that is the integrator's responsibility (signed plugins, immutable
  * deploy paths, syscall filters, etc.).
  *
@@ -320,13 +320,13 @@ FSQL_API void fsql_ai_response_free(fsql_ai_response_t *resp);
  * fsql_dispatch_ai. Returns the final ai_response_t in
  * *resp_out (caller-owned, free with fsql_ai_response_free).
  *
- * Per V1 plan D1 (decided April 2026), this lands in v1.0.0, not
- * v1.1, so customers can issue search+reason in one call rather
+ * Per V1 plan D1 (decided April 2026), this lands in v1.0.0 — not
+ * v1.1 — so customers can issue search+reason in one call rather
  * than threading the search result through their own glue code.
  */
 
 /* ================================================================ */
-/* v2.0.0: Discovery Diversification + Truth/Shadow Ledger          */
+/* v2.0.0 — Discovery Diversification + Truth/Shadow Ledger         */
 /* ================================================================ */
 /* All symbols below are sovereign-only and exported from the       */
 /* sovereign .so / .lib variants only (never from the minimal       */
@@ -450,8 +450,9 @@ FSQL_API int fsql_ledger_shadow_count(const fsql_ctx *ctx, size_t *out);
 /* Unpack a QTL BLOB into human-readable JSON.
  *
  * Input:  a QTL BLOB previously produced by core (typically read
- *         out-of-band by an admin via the host's storage backend,
- *         e.g. Postgres SELECT or Redis GETRANGE, and passed in
+ *         out-of-band by an admin via the host's storage backend
+ *         — a plain SELECT into a server-side file, a Redis
+ *         GETRANGE, etc — and passed in
  *         as a contiguous buffer + length).
  *
  * Output: caller-allocated JSON buffer (Pattern A per V1 plan §5.1).
@@ -466,9 +467,9 @@ FSQL_API int fsql_ledger_shadow_count(const fsql_ctx *ctx, size_t *out);
  * required size), -FSQL_ESTORAGE_INTEGRITY if the BLOB header is
  * malformed or the version magic does not match.
  *
- * Caller-allocated by design: no allocator-mismatch risk between
- * core's malloc and the host's allocator (palloc / enif_alloc /
- * JNI types / V8 heap). */
+ * Caller-allocated by design — no allocator-mismatch risk between
+ * core's malloc and the host's allocator (whatever runtime is
+ * hosting it: another language binding's heap, JNI, V8, etc.). */
 FSQL_API int fsql_audit_unpack(const void *blob, size_t blob_len,
                                char *json_out, size_t *json_cap);
 
@@ -704,9 +705,8 @@ FSQL_API int fsql_morphological_complexity(const double *points, size_t n_points
 /* ----- Vector Arithmetic --------------------------------------------
  *
  * Simple O(dim) float32 vector ops, added to serve fractal_vector's
- * float4 varlena storage format (fractalsql-postgresql) and any future
- * DB-agnostic float4 vector type (fractalsql-sqlite) directly, with no
- * float<->double conversion at the call site. Deliberately NOT used by
+ * float4 vector storage and any future DB-agnostic float4 vector type
+ * directly, with no float<->double conversion at the call site. Deliberately NOT used by
  * and NOT a replacement for the double-precision vector math already
  * private to src/index/hnsw.c, src/sfs/, src/diversify/ -- those
  * remain byte-for-byte unchanged, protected by gate 19 (shadow Lua/C
@@ -717,7 +717,7 @@ FSQL_API int fsql_morphological_complexity(const double *points, size_t n_points
  *
  * Convention: on a degenerate zero-norm input to cosine_distance/
  * cosine_similarity, returns distance=1.0f / similarity=0.0f rather
- * than NaN -- deliberate, so a Postgres float8 result column never has
+ * than NaN -- deliberate, so a FLOAT/DOUBLE result column never has
  * to special-case NaN. (Existing double-precision sites in this
  * codebase are NOT consistent with each other on this point --
  * src/fsql.c's cosine_distance returns 1.0 on zero norm,

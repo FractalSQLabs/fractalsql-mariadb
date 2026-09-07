@@ -1,14 +1,12 @@
 # syntax=docker/dockerfile:1.7
 #
 # fractalsql-mariadb Docker build: pure-C, vendored core archive,
-# zero-dependency posture (matches fractalsql-postgresql's v2.0.0
-# build, no LuaJIT anywhere in this path).
+# zero-dependency posture (no LuaJIT anywhere in this path).
 #
 # One fractalsql.so covers every supported MariaDB major (10.6 / 10.11 /
-# 11.4 LTS / 12.2 rolling). The UDF ABI (UDF_INIT / UDF_ARGS /
+# 11.4 LTS / 12.3 LTS). The UDF ABI (UDF_INIT / UDF_ARGS /
 # MYSQL_ERRMSG_SIZE, my_bool xxx_init/xxx/xxx_deinit) has been stable
-# across all of them, so unlike fractalsql-postgresql (one .so per PG
-# major, five build stages) this Dockerfile only needs one build stage
+# across all of them, so this Dockerfile only needs one build stage
 # per (arch, libc-profile) cell.
 #
 # Build artifacts (collected in the `export` stage, emitted to the host
@@ -16,11 +14,10 @@
 #   /fractalsql.so           (modern glibc, no suffix)
 #   /fractalsql-legacy.so    (legacy glibc, --build-arg OUTPUT_SUFFIX=-legacy)
 #
-# musl/Alpine is NOT a supported build target for this repo (nor for
-# fractalsql-postgresql). build.sh only drives modern/legacy glibc
+# musl/Alpine is NOT a supported build target for this repo.
+# build.sh only drives modern/legacy glibc
 # profiles, so only those two core-archive variants are vendored under
-# include/linux-<arch>/, matching what's actually vendored for
-# fractalsql-postgresql today.
+# include/linux-<arch>/.
 #
 # Usage:
 #   DOCKER_BUILDKIT=1 docker buildx build \
@@ -74,10 +71,9 @@ ARG GLIBC_CEILING
 ARG LIBC_KIND
 ARG CORE_VARIANT
 
-# Core archives are vendored per-arch under include/linux-<uname-m>/.
-# Matches fractalsql-postgresql's v2.0.0 layout (include/linux-x86_64/,
-# include/linux-aarch64/), which replaced the old v1 flat include/*.a
-# layout so a single Dockerfile works for both `docker buildx --platform
+# Core archives are vendored per-arch under include/linux-<uname-m>/
+# (include/linux-x86_64/, include/linux-aarch64/), so a single
+# Dockerfile works for both `docker buildx --platform
 # linux/amd64` and `linux/arm64` via `uname -m` inside the builder stage.
 RUN ARCH=$(uname -m) \
  && CORE_A="include/linux-${ARCH}/libfractalsql-${CORE_VARIANT}.a" \
@@ -97,6 +93,7 @@ RUN set -eux; \
         ${EXT_CFLAGS} \
         -shared -o /fractalsql${OUTPUT_SUFFIX}.so \
         src/fractalsql.c \
+        src/fractalsql_parse.c \
         src/fractalsql_session.c \
         src/fractalsql_vector.c \
         src/fractalsql_cognition.c \
@@ -121,20 +118,19 @@ COPY --from=builder /fractalsql${OUTPUT_SUFFIX}.so /fractalsql${OUTPUT_SUFFIX}.s
 # ever hands raw .so files to the host (buildx --output=local); this is
 # the first stage in this file you can actually `docker run`.
 #
-# Pinned to MariaDB 11.4 (the current LTS major, not the 12.2 rolling
-# release) since this is a fresh eval environment people will keep
-# around, not an existing cluster to version-match. This mirrors
-# fractalsql-postgresql's own reasoning for pinning its demo stage to
-# its newest supported major, adjusted here for "newest LTS" rather
-# than "newest" because 12.2 is explicitly a rolling release.
+# Pinned to MariaDB 11.4 (the oldest maintained LTS major in this
+# repo's compat matrix) since this is a fresh eval environment people
+# will keep around, not an existing cluster to version-match -- "LTS"
+# rather than "newest" so the eval image only ever tracks maintained,
+# non-rolling majors.
 #
 # Turnkey end-state for `docker compose up -d` (no flags):
 #   * MariaDB 11.4 running, DB fractalsql_demo, with the fractalsql UDF
 #     set already registered (sql/install_udf.sql run as an
 #     entrypoint-initdb script).
 #   * The `ollama` compose service is up by default with NO model
-#     pulled (model download is user-initiated, matching the postgres
-#     compose file's own `pull-model` profile).
+#     pulled (model download is user-initiated, via the `pull-model`
+#     compose profile).
 #   * Every demo is in /demo/ and runnable on demand via
 #     `mariadb -uroot -pfractalsql fractalsql_demo < /demo/<demo>.sql`.
 #
@@ -145,7 +141,7 @@ COPY --from=builder /fractalsql${OUTPUT_SUFFIX}.so /fractalsql${OUTPUT_SUFFIX}.s
 # interface version to exactly match the running server's own compiled
 # MYSQL_VERSION_ID, down to the patch level, before INSTALL SONAME will
 # accept the library. A single prebuilt fractalsql.so could never
-# satisfy that across this repo's 10.6-12.2 compat matrix (or even
+# satisfy that across this repo's 10.6-12.3 compat matrix (or even
 # across patch releases of one major), unlike every CREATE FUNCTION
 # ... SONAME UDF in this library, which the stable UDF ABI already
 # makes major/patch-independent.
@@ -156,19 +152,17 @@ COPY --from=builder /fractalsql${OUTPUT_SUFFIX}.so /fractalsql${OUTPUT_SUFFIX}.s
 # FRACTALSQL_HTTP_TOKEN / FRACTALSQL_HTTP_MODEL /
 # FRACTALSQL_HTTP_EMBED_URL / FRACTALSQL_HTTP_EMBED_MODEL, set below
 # via `environment:` in docker-compose.yml, pointing at the `ollama`
-# service. See docs/COOKBOOK.md for the full configuration walkthrough.
+# service. See docs/reasoning-setup.md for the full configuration walkthrough.
 # --------------------------------------------------------------------
 FROM mariadb:11.4 AS demo
-# python3 + python3-venv: the benchmark/ head-to-head runs in-container
-# via a venv (matches fractalsql-postgresql's bench/ treatment).
+# python3 + python3-venv: the bench/ head-to-head runs in-container
+# via a venv.
 # libcurl4: fractalsql-reasoning-http.so (bundled below) dynamically
 # links libcurl.so.4. Without it, fsql_load_reasoning's dlopen fails
 # silently from a plain UDF's perspective: MariaDB's UDF ABI has no
 # per-call custom error message path, so fractal_reason/fractal_embed/
 # fractal_t2s_generate all just return NULL with a generic error
 # instead of surfacing "libcurl.so.4: cannot open shared object file".
-# Matches fractalsql-postgresql's docker/Dockerfile demo stage, which
-# already carries this same dependency.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         python3 \
@@ -203,14 +197,14 @@ RUN set -e \
 COPY sql/install_udf.sql    /docker-entrypoint-initdb.d/10-fractalsql.sql
 COPY sql/install_agents.sql /docker-entrypoint-initdb.d/11-fractalsql-agents.sql
 
-# benchmark/ head-to-head tester. requirements-equivalent deps come from
-# benchmark/tester/package.json (Node, not Python, for this repo's
+# bench/ head-to-head tester. requirements-equivalent deps come from
+# bench/tester/package.json (Node, not Python, for this repo's
 # existing bench harness). Install at image build time so the layer
 # caches independently of source changes.
-COPY benchmark/ /benchmark/
+COPY bench/ /bench/
 
 # Every demo, runnable on demand via
 #   mariadb -uroot -pfractalsql fractalsql_demo < /demo/<demo>.sql
-# Not run at init, same rationale as postgres's compose file: reasoning
+# Not run at init: reasoning
 # demos are inert without a pulled model, and every demo is re-runnable.
 COPY demo/ /demo/

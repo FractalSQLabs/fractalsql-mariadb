@@ -3,11 +3,8 @@
 (11.7+, GA in 11.8 LTS) interop with this repo's portable fractal_vector
 JSON-array-string convention.
 
-Structurally very different from fractalsql-postgresql's own
-test_vector_type.py, which exercises a custom `fractal_vector` SQL
-type this extension itself defines (typmod dimension enforcement,
-custom binary I/O, custom `<->`/`<=>` operators). MariaDB has no
-CREATE TYPE / typmod mechanism at all -- there is no custom type here.
+MariaDB has no
+CREATE TYPE / type-modifier mechanism at all -- there is no custom type here.
 What MariaDB DOES have, from 11.7 on, is its OWN built-in VECTOR(n)
 column type + VEC_FROMTEXT()/VEC_TOTEXT()/VEC_DISTANCE_COSINE()/
 VEC_DISTANCE_EUCLIDEAN() builtins, which this repo's fractal_vector_*
@@ -29,7 +26,7 @@ Scenarios:
   3. Native dimension enforcement: MariaDB itself (not this repo's SQL)
      rejects an INSERT whose vector literal doesn't match the column's
      declared VECTOR(n) width -- no code in this repo has to detect
-     this, unlike postgres's typmod-based fractal_vector.
+     this; the server enforces the declared width itself.
   4. Vectorizer auto-detection: fractal_vectorizer_create() against a
      VECTOR(n) embedding_col sets fractal_vectorizers.embedding_is_
      vector_type, and fractal_vectorizer_process_queue() writes back

@@ -37,7 +37,44 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#  include <windows.h>  /* GetEnvironmentVariableA -- see think_env below */
+#endif
+
 static int g_embed_probe = 0;
+
+/* On POSIX, getenv() is the one live view of the process environment, so
+ * plain getenv in generate() mirrors what a real plugin reads. On Windows
+ * that is NOT true across CRT instances: this fixture is compiled with
+ * cl.exe's default /MT (private static-CRT environ, frozen at THIS DLL's
+ * load time), while the real reasoning-http plugin is dynamically linked
+ * (ucrtbase environ). A getenv() read here would therefore report the
+ * environment as of the last DLL load -- e.g. scenario (b)'s THINK values
+ * -- and gate 29's embed-tier isolation check (29c) could never observe
+ * apply_embed_env_locked's tier-scoped unsetenv running LATER in the same
+ * server process, on any swap order. GetEnvironmentVariableA reads the
+ * Win32 process environment block live -- the same view the bridge's
+ * _putenv_s writes land in (CRT->Win32 one-way sync), which is also what
+ * a real dynamically-linked plugin's ucrtbase environ is updated through
+ * by src/fractalsql_msvc_compat.h's shared-UCRT write. */
+#ifdef _WIN32
+static const char *
+think_env(const char *name)
+{
+    /* Rotating slot-per-call: generate() reads several vars into one
+     * snprintf call, whose argument pointers are all used together -- a
+     * single static buffer would make every var echo the last-read
+     * value. Eight slots is far more than the four vars read per call;
+     * this fixture is test-only and single-threaded. */
+    static char bufs[8][128];
+    static unsigned slot = 0;
+    char *buf = bufs[slot++ % 8];
+    DWORD n = GetEnvironmentVariableA(name, buf, 128);
+    return (n > 0 && n < 128) ? buf : NULL;
+}
+#else
+#define think_env getenv
+#endif
 
 static int
 think_format(void *u, const char *q, size_t ql, const char *c, size_t cl,
@@ -66,7 +103,7 @@ think_free(void *opaque)
 static const char *
 env_or_unset(const char *name)
 {
-    const char *v = getenv(name);
+    const char *v = think_env(name);
     return (v != NULL) ? v : "(unset)";
 }
 
@@ -81,10 +118,10 @@ think_generate(void *u, const char *p, size_t pl,
     int n;
     if (g_embed_probe) {
         n = snprintf(buf, sizeof buf, "%d,%d,%d,%d",
-            getenv("FSQL_REASONING_HTTP_THINK")          != NULL,
-            getenv("FSQL_REASONING_HTTP_THINK_PROVIDER")  != NULL,
-            getenv("FSQL_REASONING_HTTP_NATIVE_URL")      != NULL,
-            getenv("FSQL_REASONING_HTTP_NUM_CTX")         != NULL);
+            think_env("FSQL_REASONING_HTTP_THINK")          != NULL,
+            think_env("FSQL_REASONING_HTTP_THINK_PROVIDER") != NULL,
+            think_env("FSQL_REASONING_HTTP_NATIVE_URL")     != NULL,
+            think_env("FSQL_REASONING_HTTP_NUM_CTX")        != NULL);
     } else {
         n = snprintf(buf, sizeof buf,
             "THINK=%s\nTHINK_PROVIDER=%s\nNATIVE_URL=%s\nNUM_CTX=%s\n",

@@ -7,7 +7,7 @@
  *   exactly fractalsql.c's existing parse_vector_csv convention
  *   (used for query_csv and corpus rows), which also accepts bare CSV
  *   ("1,2,3"). This is the PORTABLE path: it works on the full
- *   10.6-12.2 compat floor this extension targets, with no server
+ *   10.6-12.3 compat floor this extension targets, with no server
  *   feature detection needed. Every function below reads/writes this
  *   representation and does the actual math via fractalsql-core's
  *   fsql_vector_* module (float32, available in every tier, see
@@ -116,8 +116,11 @@ static char *
 format_vector_json(json_out_ctx *jo, const float *v, size_t dim, unsigned long *out_len)
 {
     /* Worst case per element: sign + '.' + 9 significant digits +
-     * 'e' + sign + up to 3-digit exponent + comma ~= 17 bytes. */
-    size_t need = dim * 17 + 4;
+     * 'e' + sign + up to 3-digit exponent + comma ~= 18 bytes; budget
+     * 32 so the arithmetic stays right for any future double-range
+     * caller, not just the float[] values passed today. The bounded
+     * snprintf below is still the real guard. */
+    size_t need = dim * 32 + 8;
     size_t pos;
 
     if (!json_out_ensure(jo, need)) return NULL;

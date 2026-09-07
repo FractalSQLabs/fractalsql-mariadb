@@ -28,8 +28,8 @@ One command, no flags, gives you the bare minimum:
   `CREATE EXTENSION`/dependent-extension mechanism to hook into).
 - **Ollama** running with **no model pulled** (model download is opt-in,
   step 2).
-- Every demo + the `benchmark/` head-to-head suite inside the container
-  (`/demo/`, `/benchmark/`). Demos are **demoable on demand**: they are not
+- Every demo + the `bench/` head-to-head suite inside the container
+  (`/demo/`, `/bench/`). Demos are **demoable on demand**: they are not
   run at init, because reasoning is inert until a model is pulled and the
   demos are re-runnable.
 
@@ -137,10 +137,10 @@ does.
 ### Scout vs. native VECTOR(n) index (in-database demo)
 See how Scout Discovery captures more distinct clusters than a plain
 indexed top-K search, and how much slower it is for that diversity. It's the
-same tradeoff fractalsql-postgresql's HNSW-vs-Scout comparison makes, at a
+classic index-vs-Scout tradeoff, at a
 scale sized for `fractal_explore`'s inline-corpus-per-call architecture
 (see [`docs/features.md`](features.md#-benchmarks--scaling) for why the
-workable scale here is much smaller than postgres's 100k-row comparison):
+workable scale here is comparatively small):
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/benchmark.sql
 ```
@@ -153,18 +153,18 @@ docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/b
 ```
 
 ### Head-to-head research benchmark
-`benchmark/` (distinct from `benchmark/tester/`, the pre-existing Node.js
+`bench/` (distinct from `bench/tester/`, the pre-existing Node.js
 throughput driver) runs the real native-index-vs-Scout head-to-head,
 verified live against a real `mariadb:12.2` container. Python-based,
 run from the host or in the container:
 ```bash
-docker compose exec mariadb pip3 install --break-system-packages -r /benchmark/requirements.txt
+docker compose exec mariadb pip3 install --break-system-packages -r /bench/requirements.txt
 docker compose exec mariadb mariadb -uroot -pfractalsql -e "CREATE DATABASE IF NOT EXISTS fractalsql_bench;"
-docker compose exec mariadb python3 /benchmark/data_gen.py --host 127.0.0.1 --database fractalsql_bench
-docker compose exec mariadb python3 /benchmark/head_to_head.py --host 127.0.0.1 --database fractalsql_bench
+docker compose exec mariadb python3 /bench/data_gen.py --host 127.0.0.1 --database fractalsql_bench
+docker compose exec mariadb python3 /bench/head_to_head.py --host 127.0.0.1 --database fractalsql_bench
 ```
-See `benchmark/README.md` for the exact output shape, the chosen default
-scale (much smaller than postgres's 100k-row default, since `fractal_explore`
+See `bench/README.md` for the exact output shape, the chosen default
+scale (comparatively small, since `fractal_explore`
 has no server-side index to lean on, see [features.md](features.md)), and the
 tuning knobs.
 

@@ -8,17 +8,15 @@ computed directly in SQL -- shadowing the pipeline's own implicit
 verdict (it returned successfully = GENERATE + ALLOWLIST + EXPLAIN-
 equivalent all approved it) against ground truth, without the
 ground-truth check gating anything inside the pipeline itself.
-MariaDB port of fractalsql-postgresql's test_text_to_sql_shadow.py,
-same hard multi-constraint question (grouping + a HAVING-shaped
+Runs a hard multi-constraint question (grouping + a HAVING-shaped
 exclusion an LLM can plausibly miss).
 
-Structural difference from postgres: reasoning config (which model,
+Structural note: reasoning config (which model,
 use_review) is fixed at mariadbd startup, read once from the process
 environment, so this file tests exactly ONE model per run: whatever
 FRACTALSQL_HTTP_MODEL/FRACTALSQL_TEXT_TO_SQL_USE_REVIEW the server was
-started with, rather than looping over FRACTALSQL_MODELS and
-reconfiguring between them the
-way postgres's version does. Run it once per model/config you want to
+started with, not a per-test-case choice.
+Run it once per model/config you want to
 validate (e.g. once per mariadbd env in a matrix), not once total.
 
 Outcomes:

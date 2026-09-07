@@ -8,19 +8,17 @@ This guide takes you from a fresh checkout to a running agentic database in
 about five minutes: no MariaDB install, no compiler, no model download
 required to start. By the end you will have:
 
-- a MariaDB 11.4 server with the fractalsql UDF set **and** the 15 agent
+- a MariaDB 11.4 server with the fractalsql UDF set **and** the 16 agent
   stored procedures registered,
 - a diverse vector search that runs with **no model** connected,
 - a live reasoning call against a real LLM, and
-- all 15 agents demoable on demand (MariaDB has no `CREATE EXTENSION`
+- all 16 agents demoable on demand (MariaDB has no `CREATE EXTENSION`
   mechanism: UDFs and procedures are registered by running two plain SQL
   scripts, already done for you in the Docker image; see
   [Install without Docker](#5-install-without-docker) for the manual
-  equivalent).
-
-> **Fifteen agents.** `fractal_agent_diverse_portfolios` needs an
-> enterprise-tier primitive not available in this edition. See
-> [`docs/api-agency.md`](api-agency.md) for the full account.
+  equivalent). One of the sixteen, `fractal_agent_diverse_portfolios`, is
+  enterprise-tier and dormant without `FRACTALSQL_ENTERPRISE_LIB` set, see
+  [`docs/api-agency.md`](api-agency.md) for the full account.
 
 The fastest path is Docker. If you are putting this into a real MariaDB
 server instead, jump to [Install without Docker](#5-install-without-docker)
@@ -62,8 +60,9 @@ edition   version
 Community 2.0.0
 ```
 
-MariaDB has no `CREATE EXTENSION`/`\dx` equivalent to list: there is no
-extension-dependency system here, just two plain SQL scripts
+MariaDB has no `CREATE EXTENSION` mechanism and nothing equivalent to
+list: there is no extension-dependency system here, just two plain SQL
+scripts
 (`sql/install_udf.sql` then `sql/install_agents.sql`) run once. If both
 functions above return a value, both scripts already ran successfully.
 
@@ -86,11 +85,10 @@ two flavours that solve different problems:
   nearest neighbour.
 
 Scout is what makes FractalSQL different from a plain vector DB, and it runs
-with **no model connected**. Unlike the PostgreSQL edition's
-`fractal_search_explore(table, col, ...)`, which scans a real table via SPI,
-this repo's `fractal_explore` takes the whole corpus as one inline
-argument, since MariaDB's C UDF ABI has no SPI and no table-returning UDFs at
-all, a hard architecture constraint (see
+with **no model connected**. `fractal_explore` takes the whole corpus as one
+inline argument, since MariaDB's C UDF ABI can't run SQL against the
+calling session and has no table-returning
+UDFs at all, a hard architecture constraint (see
 [`docs/api-discovery.md`](api-discovery.md) for the full account). Try it on
 a tiny toy corpus:
 
@@ -137,8 +135,7 @@ FSQL_LIVE_OK
 ```
 
 `fractal_reason`/`fractal_embed` need `CONNECTION_ID()` as their first
-argument, a MariaDB-specific requirement not present in the PostgreSQL
-edition (MariaDB is one shared multithreaded process for every connection,
+argument (MariaDB is one shared multithreaded process for every connection,
 so Diversify/reasoning state has to be explicitly keyed per-session; see
 [`docs/api-discovery.md`](api-discovery.md#diversify--repulsion-session-scoped)).
 
@@ -159,10 +156,9 @@ env-var-only config surface, the slow-hardware timeout notes).
 ## 4. Your first agent
 
 The **Agency tier** composes Discovery + Cognition into self-correcting
-routines. The image ships a single script that exercises all **15 agents**
-end-to-end (see [above](#1-running-in-60-seconds-docker) on why 15, not 16):
-anomaly triage, portfolio allocation, hybrid recall, route planning,
-deterioration triage, regime detection, and the rest:
+routines. The image ships a single script that exercises all **16 agents**
+end-to-end: anomaly triage, portfolio allocation, hybrid recall, route
+planning, deterioration triage, regime detection, and the rest:
 
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-agents.sql
@@ -173,13 +169,15 @@ it's re-runnable) and `CALL`s one agent. With a model pulled you get real
 reasoned output for every section; without one, the retrieval/optimization
 parts still run for the three no-LLM agents (`recall_hybrid`,
 `recommend_diverse`, `feedback_audit`) and the other twelve return a clean
-`NULL`-dispatch error rather than a broken result.
+`NULL`-dispatch error rather than a broken result. `diverse_portfolios`
+(enterprise-tier, the sixteenth) probes for its own dormant state
+separately, see [`docs/api-agency.md`](api-agency.md).
 
-> **The eleven industry starter kits are here too.** fractalsql-postgresql
-> ships eleven runnable industry walkthroughs (`demo-vertical-*.sql`); all
-> eleven have MariaDB equivalents in this repo, live-verified against a
-> real MariaDB server and a real Ollama endpoint. `demo-agents.sql` above
-> is still the fastest guided tour of all 15 agents in one pass; jump to a
+> **The eleven industry starter kits are here too.** Eleven runnable
+> industry walkthroughs (`demo-vertical-*.sql`) ship with this repo,
+> live-verified against a real MariaDB server and a real Ollama endpoint.
+> `demo-agents.sql` above
+> is still the fastest guided tour of all 16 agents in one pass; jump to a
 > specific `demo-vertical-*.sql` for a domain-shaped dataset instead. See
 > [`docs/starter-kits.md`](starter-kits.md) for the full list and the
 > problem→agent mapping.
@@ -191,9 +189,48 @@ parts still run for the three no-LLM agents (`recall_hybrid`,
 
 ## 5. Install without Docker
 
-For a real MariaDB server, grab the package matching your CPU architecture
-from [GitHub Releases](https://github.com/FractalSQLabs/fractalsql-mariadb/releases)
-(one binary covers MariaDB 10.6 / 10.11 / 11.4 LTS / 12.2 rolling: the UDF
+### Option A: one command
+
+Clone the repo, then run the setup wizard for your platform. It detects
+your MariaDB install, offers to install the matching package if it's not
+there yet, registers the UDFs and agent procedures, and walks you through
+picking a reasoning provider (local Ollama, an OpenAI-compatible endpoint,
+or search only).
+
+```bash
+# Linux / macOS
+git clone https://github.com/FractalSQLabs/fractalsql-mariadb.git
+cd fractalsql-mariadb
+./scripts/easy_install.sh
+```
+
+```powershell
+# Windows
+git clone https://github.com/FractalSQLabs/fractalsql-mariadb.git
+cd fractalsql-mariadb
+pwsh -File .\scripts\windows\easy_install.ps1
+```
+
+Already installed the package yourself? Run the same script and it detects
+that, skipping straight to the wizard. Every prompt has a matching flag
+(`--provider`, `--url`, `--model`, `--yes`, `--dry-run`, `-Provider`,
+`-Url`, `-Model`, `-Yes`, `-DryRun`, ...) for non-interactive or CI use.
+Run with `--help`/`-Help` for the full list. The script never phones home:
+no telemetry, no usage reporting, all of it stays local to your box.
+
+Applying a reasoning setting here always
+needs a `mariadbd` restart, not a reload -- MariaDB has no sysvar
+surface for this at all (every `FRACTALSQL_*` value is a process
+environment variable read once at startup). The wizard walks you through
+that restart; see **[docs/reasoning-setup.md](reasoning-setup.md)** for why.
+
+### Option B: manual / air-gapped
+
+For anything that can't run a cloned script directly, such as a compliance
+environment, an air-gapped box, or just wanting to see every step, grab
+the package matching your CPU architecture from
+[GitHub Releases](https://github.com/FractalSQLabs/fractalsql-mariadb/releases)
+(one binary covers MariaDB 10.6 / 10.11 / 11.4 LTS / 12.3 LTS: the UDF
 ABI is stable across those majors, no per-major package needed).
 
 ```bash
@@ -220,8 +257,8 @@ mariadb -u root -p mydb < sql/install_agents.sql
 ```
 
 Both scripts are plain, idempotent SQL (`DROP ... IF EXISTS` then
-`CREATE`); there is no extension/dependency-resolution mechanism to hook
-into the way `CREATE EXTENSION` provides on PostgreSQL.
+`CREATE`); MariaDB has no extension/dependency-resolution mechanism to hook
+into.
 
 On **macOS** there is no `.deb`/`.rpm` equivalent, so releases ship a
 per-arch `.zip` with a `fractalsql.dylib` + `README.txt` walking you through

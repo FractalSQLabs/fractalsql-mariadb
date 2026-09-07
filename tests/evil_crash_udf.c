@@ -4,13 +4,13 @@
  *
  * Deliberately self-crashing MariaDB UDF. Its main function writes
  * through a NULL pointer -- an unrecoverable SIGSEGV, not a bug we can
- * guard against. Mirrors fractalsql-postgresql's tests/evil_crash_
- * plugin.c, adapted for MariaDB's architecture: unlike PostgreSQL
- * (fork-per-backend, so a crashing backend's postmaster tears down and
- * reinitializes shared memory automatically, restart_after_crash=on by
- * default), a single-threaded UDF call crashing mariadbd crashes the
+ * guard against. This matters because of MariaDB's architecture: MariaDB
+ * serves every connection from one shared multithreaded server process,
+ * so a single UDF call crashing mariadbd crashes the
  * WHOLE server process -- mariadbd has no built-in self-restart. The
- * platform-level "crash recovery contract" being tested here is
+ * goal here is to verify the server survives and comes back cleanly
+ * after a UDF crash: the
+ * platform-level "crash recovery contract" being tested is
  * InnoDB's own crash recovery (redo-log replay on next startup, so
  * committed data survives) PLUS whatever outer supervisor actually
  * restarts the process (mysqld_safe, systemd Restart=on-failure, or a

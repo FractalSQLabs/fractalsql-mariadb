@@ -35,7 +35,7 @@
 --   2. SOURCE sql/install_agents.sql;   (fractal_agent_recommend_diverse,
 --      fractal_agent_feedback_audit -- both pure retrieval/analytics, no
 --      LLM -- sections 0-5 need nothing else)
---   3. Reasoning configured (see docs/COOKBOOK.md) -- Section 6 calls
+--   3. Reasoning configured (see docs/reasoning-setup.md) -- Section 6 calls
 --      fractal_reason directly.
 --
 -- Run:

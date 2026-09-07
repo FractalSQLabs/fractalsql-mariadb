@@ -7,7 +7,7 @@
 -- archetype) and Scout Discovery (find + name real customer segments).
 --
 -- Prerequisites: UDFs registered, reasoning configured, see
--- docs/COOKBOOK.md and confirm with:
+-- docs/reasoning-setup.md and confirm with:
 --   SELECT fractal_reason(CONNECTION_ID(), 'reply with a short confirmation that this connection works');
 --
 -- Safe to re-run: the schema is dropped and recreated at the top.

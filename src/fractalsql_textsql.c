@@ -92,6 +92,7 @@
 #include "fractalsql.h"          /* FSQL_OK, fsql_last_error */
 #include "fractalsql_sql.h"      /* fsql_ctx, fsql_dispatch_ai, fsql_load_reasoning */
 #include "fractalsql_session.h"  /* fractal_session_acquire_reason/_t2s, ... */
+#include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #  include <windows.h>
@@ -493,7 +494,21 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
         context_json = "{}";
         context_len  = 2;
     }
-    system_tag = args->args[3];   /* may be NULL; ensure_generate_loaded tolerates it */
+    /* Copy with the ABI-given length and NUL-terminate: the UDF ABI does
+     * not terminate string arguments (the same fact the session/ctx
+     * comment below concedes for args[1]/[2]), and a raw pointer here
+     * would let setenv()'s strlen run off the end of the record buffer. */
+    char system_tag_buf[64];
+    if (args->args[3] != NULL && args->lengths[3] > 0) {
+        if (args->lengths[3] >= sizeof system_tag_buf) {
+            *error = 1; return NULL;
+        }
+        memcpy(system_tag_buf, args->args[3], args->lengths[3]);
+        system_tag_buf[args->lengths[3]] = '\0';
+        system_tag = system_tag_buf;
+    } else {
+        system_tag = NULL;   /* ensure_generate_loaded tolerates it */
+    }
 
     sid = (unsigned long long) *(long long *) args->args[0];
 
@@ -855,6 +870,41 @@ t2s_has_into_outfile(const char *sql, size_t len)
     return false;
 }
 
+/* MariaDB executes the contents of a versioned comment (slash-star-
+ * bang-star) and an optimizer-hint comment (slash-star-plus) as
+ * statement text, so neither is inert here the way a plain block
+ * comment is. Any such comment in candidate SQL is rejected outright
+ * (over-rejection is this gate's stated failure direction): splicing
+ * tokens into one would otherwise defeat both the statement counter
+ * and the INTO OUTFILE scan -- e.g.
+ *   SELECT 1 INTO <slash-star-bang> OUTFILE star-slash '/tmp/x'
+ * passes both scanners as written while the server executes the
+ * outfile write. The scan is quote- and plain-comment-aware, so a
+ * literal inside a string value does not false-positive. */
+static bool
+t2s_has_exec_comment(const char *sql, size_t len)
+{
+    t2s_scan sc = { sql, len, 0 };
+    while (sc.pos < sc.len) {
+        char c = sc.s[sc.pos];
+        if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(&sc); continue; }
+        if (c == '/' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '*') {
+            if (sc.pos + 2 < sc.len &&
+                (sc.s[sc.pos + 2] == '!' || sc.s[sc.pos + 2] == '+'))
+                return true;
+            /* plain comment: skip to its close, same loop shape as
+             * t2s_skip_ws_comments */
+            sc.pos += 2;
+            while (sc.pos + 1 < sc.len && !(sc.s[sc.pos] == '*' && sc.s[sc.pos + 1] == '/'))
+                sc.pos++;
+            sc.pos = (sc.pos + 1 < sc.len) ? sc.pos + 2 : sc.len;
+            continue;
+        }
+        sc.pos++;
+    }
+    return false;
+}
+
 FRACTAL_EXPORT bool
 fractal_t2s_check_allowlist_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
@@ -892,6 +942,13 @@ fractal_t2s_check_allowlist(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     ensure_env_config();
     select_only = (strcmp(g_cfg.allowed_statements, "select_insert_update") != 0);
+
+    if (t2s_has_exec_comment(sql, sqllen)) {
+        n = snprintf(buf, sizeof buf,
+            "versioned (slash-star-bang) and optimizer-hint (slash-star-plus) "
+            "comments are not allowed: the server executes their contents");
+        goto reject;
+    }
 
     n_stmts = t2s_count_statements(sql, sqllen);
     if (n_stmts == 0) {

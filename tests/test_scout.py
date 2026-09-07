@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """tests/test_scout.py: Scout Mode (fractal_explore) e2e gate.
 
-MariaDB port of fractalsql-postgresql's test_scout.py. That version
-builds a table + column and calls fractal_search_explore(table, col,
-...) as an SPI table/column scan (a set-returning function). This repo
-has no SPI and no table-returning UDFs, so fractal_explore(corpus,
-query, params) takes the corpus as an inline argument instead, the same
+This repo
+has no server-side table access and no table-returning UDFs (MariaDB's
+C UDF ABI can't run SQL against the calling session), so
+fractal_explore(corpus, query, params) takes the corpus as an inline
+argument instead, the same
 convention as fractal_search itself. So this test builds the 3-island
 corpus as a JSON string client-side and passes it directly, rather than
 via a table.
 
-Asserts the same Scout enablement properties as the postgres original:
+Asserts the Scout enablement properties:
   (1)+(2) returns the population: population_size particles, each of
           the corpus dim (not a single best-point stub);
   (3)     discovery: the particles disperse across more than one island.

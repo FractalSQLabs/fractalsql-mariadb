@@ -26,7 +26,7 @@
 --   1. SOURCE sql/install_udf.sql;      (the base UDF set)
 --   2. SOURCE sql/install_agents.sql;   (fractal_agent_track_anomaly,
 --      fractal_agent_recommend_diverse -- sections 0-4 need nothing else)
---   3. Reasoning configured (see docs/COOKBOOK.md) -- Section 4's
+--   3. Reasoning configured (see docs/reasoning-setup.md) -- Section 4's
 --      fractal_agent_track_anomaly preset calls fractal_reason internally.
 --
 -- Run:

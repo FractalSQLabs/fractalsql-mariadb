@@ -41,7 +41,7 @@
 --      target database (sections 0-4 need nothing else).
 --   2. Section 6 narrates that its reasoning step is folded into the
 --      Section 5 fractal_agent_detour_classify preset rationale, which
---      calls fractal_reason() internally -- see docs/COOKBOOK.md for
+--      calls fractal_reason() internally -- see docs/reasoning-setup.md for
 --      reasoning setup.
 --
 -- Run:

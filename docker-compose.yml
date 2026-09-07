@@ -11,8 +11,8 @@ services:
       # from mysqld's process environment. See src/fractalsql_cognition.c's
       # file header for why this is env vars rather than my.cnf system
       # variables: mariadbd has no live-reloadable config mechanism a
-      # dlopen'd UDF library can hook into the way postgres's GUC system
-      # allows.
+      # dlopen'd UDF library can hook into, and no server system
+      # variable surface a UDF can read.
       # Points at the "ollama" service below, which is up by default
       # with NO model pulled: setting these unconditionally is
       # harmless (nothing calls fractal_reason()/fractal_embed() unless
@@ -25,8 +25,8 @@ services:
       FRACTALSQL_HTTP_MODEL: gpt-oss:20b
       FRACTALSQL_HTTP_EMBED_URL: http://ollama:11434/v1/embeddings
       FRACTALSQL_HTTP_EMBED_MODEL: nomic-embed-text
-      # Matches fractalsql-postgresql's docker-compose.yml "Slow or
-      # constrained hardware" guidance verbatim. The reasoning-http
+      # "Slow or
+      # constrained hardware" guidance. The reasoning-http
       # plugin's request is non-streaming, so a cold-loading local
       # model on CPU-only hardware shows no partial progress. These are
       # FSQL_REASONING_HTTP_* (the reasoning plugin's own env vars, not
@@ -43,8 +43,7 @@ services:
       retries: 10
 
   # Ollama is up by DEFAULT (no profile) with NO model pulled, the bare
-  # minimum turnkey state, matching fractalsql-postgresql's
-  # docker-compose.yml. Model download is user-initiated: run the
+  # minimum turnkey state. Model download is user-initiated: run the
   # `pull-model` one-shot below (or
   # `docker compose exec ollama ollama pull <model>`). See
   # docs/reasoning-setup.md for model choice rationale (gpt-oss:20b

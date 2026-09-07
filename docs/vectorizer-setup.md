@@ -16,7 +16,7 @@ To enable automated embeddings, the following configuration is required (Communi
 
 1. **Reasoning Plugin**: `FRACTALSQL_REASONING_PLUGIN` must point at a compiled `fractalsql-reasoning-http.so` (see the reasoning-setup guide).
 2. **Embeddings Endpoint**: `FRACTALSQL_HTTP_EMBED_URL` must be set to your provider's **embeddings** endpoint, a distinct path from the chat endpoint (e.g. `/v1/embeddings` vs `/v1/chat/completions`).
-3. **Embedding Model**: `FRACTALSQL_HTTP_MODEL` specifies the purpose-trained model. **Important**: never reuse a chat model for embeddings; they are mathematically distinct tasks.
+3. **Embedding Model**: `FRACTALSQL_HTTP_EMBED_MODEL` specifies the purpose-trained model. **Important**: never reuse a chat model for embeddings; they are mathematically distinct tasks.
 4. `FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1` if your endpoint is plain `http://` rather than `https://` (e.g. a local Ollama instance).
 
 **Connectivity Check**:
@@ -32,7 +32,7 @@ SELECT fractal_embed(CONNECTION_ID(), 'hello world');
 ## Quick Start: Automated Sync
 
 ### 1. Define your table
-A plain `TEXT` column storing a JSON-array-string works on every supported MariaDB major (10.6-12.2). On MariaDB 11.7+, you can instead declare a native `VECTOR(n)` column, see **Native VECTOR(n) support** below.
+A plain `TEXT` column storing a JSON-array-string works on every supported MariaDB major (10.6-12.3). On MariaDB 11.7+, you can instead declare a native `VECTOR(n)` column, see **Native VECTOR(n) support** below.
 
 ```sql
 CREATE TABLE docs (
@@ -55,7 +55,7 @@ SELECT @vectorizer_id;
 Requires a single-column primary key on the source table.
 
 ### 3. Process the Queue
-FractalSQL runs no background worker (`mariadbd` has no equivalent to `pg_cron`, and this repo deliberately avoids one for the same portability reasons the PostgreSQL edition documents). You trigger the embedding process on your own schedule: a `cron` entry, a systemd timer, an application-level scheduler.
+FractalSQL runs no background worker (`mariadbd` has no built-in equivalent of a background-scheduler extension, and this repo deliberately avoids adding one, keeping the extension portable). You trigger the embedding process on your own schedule: a `cron` entry, a systemd timer, an application-level scheduler.
 
 ```sql
 CALL fractal_vectorizer_process_queue(100, 600);
@@ -76,7 +76,7 @@ SELECT * FROM fractal_vectorizer_status WHERE vectorizer_id = @vectorizer_id;
 
 ## Storage: TEXT/JSON vs. native `VECTOR(n)`
 
-FractalSQL stores and searches embeddings as a **JSON-array-string** (`'[0.1,0.2,0.3]'`), the same convention `fractal_search`/`fractal_vector_*` use everywhere. There is no native array type across the 10.6-12.2 compat floor this repo targets, so this is the portable baseline on every supported major.
+FractalSQL stores and searches embeddings as a **JSON-array-string** (`'[0.1,0.2,0.3]'`), the same convention `fractal_search`/`fractal_vector_*` use everywhere. There is no native array type across the 10.6-12.3 compat floor this repo targets, so this is the portable baseline on every supported major.
 
 ### Native `VECTOR(n)` support (MariaDB 11.7+, GA in 11.8 LTS)
 
@@ -176,7 +176,7 @@ export FRACTALSQL_HTTP_EMBED_URL='https://{LOCATION}-aiplatform.googleapis.com/v
 export FRACTALSQL_HTTP_EMBED_MODEL='text-embedding-005'
 ```
 
-Export these into `mariadbd`'s environment before it starts: via `docker run -e ...` (see `docker/Dockerfile` and `build_test.sh`'s `mdb_setup` for this repo's own real wiring), a systemd unit's `EnvironmentFile`, or an equivalent process-manager mechanism. There is no `postgresql.conf`-style config file for this; it's always the process environment.
+Export these into `mariadbd`'s environment before it starts: via `docker run -e ...` (see `docker/Dockerfile` and `build_test.sh`'s `mdb_setup` for this repo's own real wiring), a systemd unit's `EnvironmentFile`, or an equivalent process-manager mechanism. There is no server config file for this; it's always the process environment.
 
 ---
 
@@ -192,7 +192,7 @@ Toggles the `enabled` state. When paused, new writes are not queued (the trigger
 Permanently deregisters the vectorizer: drops its `_fsql_vec_<id>_ins`/`_fsql_vec_<id>_upd` triggers (if the source table still exists) and deletes its row from `fractal_vectorizers` (the `queue`/`rate_window` rows cascade via the existing foreign key). Irreversible: for a temporary stop, use `fractal_vectorizer_pause()` instead. `SIGNAL`s a clean error on a nonexistent id. Needed before re-creating a vectorizer on the same `(source_table, text_col, embedding_col)`, since that triple is unique.
 
 ### `fractal_vectorizer_process_queue(batch_size, stale_after_secs)`
-The engine that drives synchronization. Ends in a plain `SELECT n_processed` result set: call it and fetch the result like any other query, there is no `OUT` parameter here. Concurrency-safe against another simultaneous call via an atomic claim-`UPDATE` (MariaDB has no `SKIP LOCKED` semantics that persist correctly across the statement boundaries this repo needs under autocommit; see `sql/install_udf.sql`'s own comment on why this repo uses a different concurrency mechanism than the PostgreSQL edition's `SKIP LOCKED`).
+The engine that drives synchronization. Ends in a plain `SELECT n_processed` result set: call it and fetch the result like any other query, there is no `OUT` parameter here. Concurrency-safe against another simultaneous call via an atomic claim-`UPDATE` (MariaDB has no `SKIP LOCKED` semantics that persist correctly across the statement boundaries this repo needs under autocommit; see `sql/install_udf.sql`'s own comment on the chosen concurrency mechanism).
 
 ### Rate Capping
 To prevent provider throttling, set `options.max_embeds_per_window` (int) and `options.rate_window_secs` (default `3600`) during creation:

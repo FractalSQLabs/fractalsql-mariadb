@@ -37,7 +37,7 @@ response modes, see [Response modes](#response-modes) below.
    (or any other reasoning/text-to-sql/vectorizer/agent demo) to do
    more than error cleanly. Config is a set of `FRACTALSQL_*` process
    environment variables read ONCE by `mariadbd` at startup. There is
-   **no** `postgresql.conf`/GUC/`SET GLOBAL` equivalent; see
+   **no** server config file, sysvar, or `SET GLOBAL` equivalent; see
    **[docs/reasoning-setup.md](../docs/reasoning-setup.md)** for the
    full config reference. `docker compose up -d` sets these for you,
    pointed at the bundled `ollama` service. Confirm reasoning works
@@ -53,7 +53,7 @@ response modes, see [Response modes](#response-modes) below.
 mariadb -u root -p <your_database> < demo/demo.sql
 ```
 
-There's no direct MariaDB-CLI equivalent of psql's `\timing on`.
+There's no direct MariaDB-CLI per-statement timing toggle.
 Wrap a call in `SET profiling = 1; ... SHOW PROFILES;` if you want
 per-statement timing.
 
@@ -145,6 +145,10 @@ and **[docs/vectorizer-setup.md](../docs/vectorizer-setup.md)**'s
 native-type section). These four verticals pick one of those two
 paths per column, not a 1:1 type substitution.
 
+Per-kit descriptive detail (which problem each vertical solves, its
+data shape, and which productized agent composes it) lives in
+**[docs/starter-kits.md](../docs/starter-kits.md)**, not repeated here.
+
 One genuine architectural constraint applies here: MariaDB's
 `information_schema` has zero visibility into `TEMPORARY` tables.
 `demo-vertical-fleet-logistics.sql` and
@@ -153,14 +157,15 @@ permanent `CREATE TABLE` for their cohort tables
 (`vfl_route3_cohort`/`vcy_dmz_cohort`) rather than `CREATE TEMPORARY
 TABLE`, since a temporary table can't be introspected this way.
 
-## The fifteen agents
+## The sixteen agents
 
 `demo-agents.sql` exercises the full agent surface. MariaDB has no
 extension-dependency system, so the agents live in
 `sql/install_agents.sql` as plain stored procedures. This edition
-ships **15** agents; the portfolio-diversity agent
-(`fractal_agent_diverse_portfolios`) needs an enterprise-tier
-portfolio-optimization primitive not available here. See
+ships **16** agents; one of them, the portfolio-diversity agent
+(`fractal_agent_diverse_portfolios`), calls an enterprise-tier
+portfolio-optimization primitive and is dormant without
+`FRACTALSQL_ENTERPRISE_LIB` set. See
 **[docs/api-agency.md](../docs/api-agency.md)** for the full
 reference, including exactly which agent maps to which real
 `CALL fractal_agent_<name>(..., @result)` signature (every one
@@ -177,7 +182,7 @@ mariadb -u root -p <your_database> < demo/demo-agents.sql
 `benchmark-api-reference.sql` is a coverage pass over the full UDF
 surface, distinct from [`benchmark.sql`](benchmark.sql)'s narrower
 Sniper/Scout/vectorizer comparison. Neither of these is the same thing
-as **[../benchmark/](../benchmark/)**'s research-grade head-to-head
+as **[../bench/](../bench/)**'s research-grade head-to-head
 suite (native `VECTOR(n)` index vs. Scout Mode, storage comparison);
 these two demo files are quick coverage/smoke checks, not
 latency/recall research.
@@ -244,12 +249,12 @@ real signature/argument bugs found by actually running each one.
 | demo-text-to-sql.sql | verified |
 | demo-vectorizer.sql | verified |
 | demo-fractal-vector.sql | verified |
-| demo-agents.sql | verified (15 agents; the portfolio-diversity agent is not available, see above) |
+| demo-agents.sql | verified (16 agents; the portfolio-diversity agent is enterprise-tier and probes for its own dormant state, see above) |
 | demo-business-intelligence.sql | verified |
 | benchmark.sql | verified |
 | benchmark-api-reference.sql | verified |
 | enterprise-qtl-audit.sql | verified in both states: dormant (no enterprise library) and active, against a real `libfractalsql-enterprise-sovereign-c.so`, including the optional CONNECT mirror's CISO audit decode |
-| enterprise-stress.sql | rewritten as an honest notice covering a deeper ledger-storage surface than this demo exercises elsewhere |
+| enterprise-stress.sql | verified in both states: dormant and active, including structural-truncation, entry-hash, and HMAC tamper detection (Phase D recipes, out-of-band against the ledger file) |
 | text-to-sql-spike-1..4 | verified against a real Ollama endpoint |
 | demo-workload.sh | verified |
 | demo-vertical-*.sql (11 files) | verified, see [Industry vertical demos](#industry-vertical-demos) above |

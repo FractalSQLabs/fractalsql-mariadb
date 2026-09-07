@@ -14,7 +14,7 @@ Homepage: https://github.com/FractalSQLabs/fractalsql-mariadb
 # and documented in scripts/package.sh's own header -- it emits a
 # single generic fractalsql-mariadb_<version>_<arch>.deb, not a
 # per-major package, since the UDF ABI is stable across MariaDB
-# 10.6/10.11/11.4 LTS/12.2 rolling. This file is kept for maintainers
+# 10.6/10.11/11.4 LTS/12.3 LTS. This file is kept for maintainers
 # who prefer a native dpkg-buildpackage flow instead of fpm -- it is
 # not exercised by any workflow in this repo.
 Package: fractalsql-mariadb
@@ -31,8 +31,8 @@ Description: Stochastic Fractal Search UDF for MariaDB
  vector against an inline corpus, plus the full Discovery/Vector/
  Cognition/Text-to-SQL/Agency/Enterprise-activation tier surface (see
  docs/features.md). Pure-C vendored core, no LuaJIT runtime
- dependency. Compatible with MariaDB 10.6 / 10.11 / 11.4 LTS / 12.2
- rolling -- the UDF ABI has been stable across these majors. The
+ dependency. Compatible with MariaDB 10.6 / 10.11 / 11.4 LTS / 12.3
+ LTS -- the UDF ABI has been stable across these majors. The
  bundled fractalsql-reasoning-http.so plugin (Cognition/Text-to-SQL/
  Vectorizer/Agency tiers) dynamically links libcurl at runtime, hence
  the libcurl4 dependency above.

@@ -12,7 +12,7 @@
 --   SOURCE /usr/share/fractalsql-mariadb/install_udf.sql;
 --
 -- A single fractalsql.so covers all supported MariaDB majors
--- (10.6 / 10.11 / 11.4 LTS, 12.2 rolling): the UDF ABI is stable
+-- (10.6 / 10.11 / 11.4 LTS, 12.3 LTS): the UDF ABI is stable
 -- across them.
 
 DROP FUNCTION IF EXISTS fractal_search;
@@ -23,6 +23,9 @@ DROP FUNCTION IF EXISTS fractal_dimension_dfa;
 DROP FUNCTION IF EXISTS fractal_dimension_boxcount;
 DROP FUNCTION IF EXISTS fractal_dimension_drift;
 DROP FUNCTION IF EXISTS fractal_optimize_portfolio;
+DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal;
+DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal_ex;
+DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal_pareto;
 DROP FUNCTION IF EXISTS fractal_vascular_network;
 DROP FUNCTION IF EXISTS fractal_cortical_folding;
 DROP FUNCTION IF EXISTS fractal_nerve_plexus_metric;
@@ -137,6 +140,58 @@ CREATE FUNCTION fractal_dimension_drift RETURNS STRING SONAME 'fractalsql.so';
 -- Pass '{}' for defaults. mu: n_assets expected returns. cov: flat,
 -- row-major n_assets x n_assets covariance matrix.
 CREATE FUNCTION fractal_optimize_portfolio RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_optimize_portfolio_multimodal(mu_csv, cov_csv, k, n_restarts,
+--   overlap_threshold, quality_frac, seed) -> JSON STRING
+-- {"n_found":N,"candidates":[{"sharpe":..,"weights":[..]},...]}, Sharpe
+-- descending. Enterprise-tier: runs fractal_optimize_portfolio's search
+-- n_restarts times (1-64) with different derived seeds, then greedy
+-- diverse-selects the results by asset-overlap (overlap_threshold,
+-- 0.0-1.0 Jaccard-style) and a quality_frac floor (0.0 exclusive-1.0,
+-- relative to the best Sharpe found). Returns NULL, cleanly, when no
+-- enterprise library is loaded via FRACTALSQL_ENTERPRISE_LIB -- see
+-- docs/enterprise.md. All 7 arguments are required and positional
+-- (MariaDB UDFs have no default-argument syntax and this file has no
+-- trailing params-JSON convention here, unlike fractal_optimize_portfolio
+-- above). Also logs a best-effort audit-chain entry (kind=2) with the
+-- full candidate set, same as fractal_optimize_portfolio does for its
+-- one result, see docs/enterprise.md.
+CREATE FUNCTION fractal_optimize_portfolio_multimodal RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_optimize_portfolio_multimodal_ex(mu_csv, cov_csv, k, n_restarts,
+--   overlap_threshold, quality_frac, seed, use_obl, diffusion_mode)
+--   -> JSON STRING
+-- {"n_found":N,"candidates":[{"sharpe":..,"weights":[..]},...]}, Sharpe
+-- descending. OBL/Levy-flight-capable sibling of the function above:
+-- same n_restarts search and diverse selection, with the two extra knobs
+-- applied uniformly to every restart's search. use_obl is 0/1 (evaluate
+-- each SFS trial candidate's bound-reflected opposite, keep whichever
+-- fits better); diffusion_mode is 'gaussian' (default) or 'levy', a
+-- heavy-tailed step that can help escape local optima on highly
+-- multimodal problems. All 9 arguments are required and positional
+-- (MariaDB UDFs have no default-argument syntax), same NULL-dormant and
+-- audit-chain behavior as the function above. When the enterprise
+-- library predates the _ex symbol, passing the default knobs (use_obl=0,
+-- diffusion_mode='gaussian') falls back to the base function's identical
+-- search; requesting either knob on such a library returns NULL.
+-- See docs/enterprise.md.
+CREATE FUNCTION fractal_optimize_portfolio_multimodal_ex RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_optimize_portfolio_multimodal_pareto(mu_csv, cov_csv, k,
+--   n_restarts, max_front, seed, use_obl, diffusion_mode) -> JSON STRING
+-- {"n_found":N,"candidates":[{"return":..,"risk":..,"sharpe":..,
+-- "weights":[..]},...]}, Sharpe descending. Pareto-front sibling of the
+-- function above: same n_restarts independent searches, but each
+-- candidate is scored by decomposed (return, risk) instead of scalar
+-- Sharpe and the results are reduced to a genuine non-dominated Pareto
+-- front (NSGA-II crowding-distance truncation past max_front) instead
+-- of the sharpe-threshold + asset-overlap selection. Purely additive:
+-- does not change that sibling's semantics or output shape.
+-- 1 <= max_front <= n_restarts. All 8 arguments are required and
+-- positional, same NULL-dormant and audit-chain behavior as above; this
+-- one has no fallback to the base symbol (there is no non-Pareto shape
+-- of this result to fall back to). See docs/enterprise.md.
+CREATE FUNCTION fractal_optimize_portfolio_multimodal_pareto RETURNS STRING SONAME 'fractalsql.so';
 
 -- fractal_vascular_network(node_coords_csv, edges_csv, edge_arc_length_csv)
 --   -> JSON STRING {"mean_tortuosity":.., "branch_density":..,
@@ -269,7 +324,7 @@ CREATE FUNCTION fractal_isolate_background RETURNS INTEGER SONAME 'fractalsql.so
 -- e.g. '[1,2,3]', the same convention fractalsql.c's parse_vector_csv
 -- already uses for query_csv/corpus rows, which also accepts bare CSV
 -- ('1,2,3'). This is the PORTABLE path: every function below works on
--- the full 10.6-12.2 compatibility floor. The math itself is
+-- the full 10.6-12.3 compatibility floor. The math itself is
 -- fractalsql-core's fsql_vector_* module (float32 storage width, so
 -- precision behaves consistently wherever a vector value travels).
 --
@@ -429,7 +484,7 @@ CREATE FUNCTION fractal_t2s_review RETURNS STRING SONAME 'fractalsql.so';
 --   statement-shape allowlist (see src/fractalsql_textsql.c for the
 --   full rationale: MariaDB CTEs can't embed DML, but MariaDB has its
 --   own "SELECT ... INTO OUTFILE" filesystem-write hazard to guard
---   against instead). Exposed directly, with no SPI-style reason to
+--   against instead). Exposed directly, with no reason to
 --   hide it: callers building their own text-to-sql flow around the
 --   raw fractal_t2s_generate output can reuse this gate standalone.
 CREATE FUNCTION fractal_t2s_check_allowlist RETURNS STRING SONAME 'fractalsql.so';
@@ -586,6 +641,7 @@ BEGIN
     DECLARE v_attempt      INT DEFAULT 1;
     DECLARE v_prep_ok      BOOLEAN DEFAULT TRUE;
     DECLARE v_done         BOOLEAN DEFAULT FALSE;
+    DECLARE v_audit        BIGINT DEFAULT 0;
 
     SET out_sql   = NULL;
     SET out_error = NULL;
@@ -699,6 +755,13 @@ BEGIN
         END IF;
 
         -- ---- RETURN. Never auto-executed. ----
+        -- Best-effort audit-chain provenance for this successful
+        -- generation (only the winning attempt is logged, not the failed
+        -- ones). Harmless NULL on a Community deployment: fractal_audit_
+        -- log is enterprise-tier (see docs/enterprise.md).
+        SET v_audit = fractal_audit_log('text_to_sql',
+            JSON_OBJECT('question', p_question, 'generated_sql', v_candidate,
+                        'attempt', v_attempt, 'allowed_statements', v_allowed));
         SET out_sql = v_candidate;
         SET v_done  = TRUE;
     END WHILE;
@@ -994,7 +1057,7 @@ DELIMITER ;
 -- vectorizer_process_queue() then wraps the write-back in VEC_FROMTEXT()
 -- only when that flag is set, so this works unchanged whether
 -- embedding_col is a portable TEXT/JSON column (works on every
--- supported major, 10.6-12.2) or a native VECTOR(n) column
+-- supported major, 10.6-12.3) or a native VECTOR(n) column
 -- (MariaDB 11.7.1+, matching the Vector group's own documented
 -- dual-path convention above).
 -- ---------------------------------------------------------------------

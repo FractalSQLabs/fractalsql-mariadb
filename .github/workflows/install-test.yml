@@ -2,15 +2,14 @@ name: Install test (packaging)
 
 # End-to-end validation of the shipped .deb and .rpm packages, across
 # every MariaDB major in the compat matrix (10.6 / 10.11 / 11.4 LTS /
-# 12.2 rolling), not just whatever major each distro's own default
+# 12.3 LTS), not just whatever major each distro's own default
 # repo happens to carry. Builds the artifacts, installs them into a
 # clean per-major MariaDB (via the MariaDB Foundation's own repo setup
-# script, the mariadb.org/mariadb.com equivalent of PGDG, auto-
-# detecting apt vs. yum), loads the UDFs, exercises fractal_search and
+# script, which auto-detects apt vs. yum), loads the UDFs, exercises
+# fractal_search and
 # its params-bounds caps, then a reasoning round-trip against a
-# mock OpenAI-compatible endpoint (one gated major per family, the same
-# "don't run the same fixed-reply mock N times" reasoning as
-# fractalsql-postgresql's own install-test.yml). Also covers the
+# mock OpenAI-compatible endpoint (one gated major per family, so the
+# same fixed-reply mock is never run N times redundantly). Also covers the
 # Rocky 8 legacy-glibc .rpm channel and a native macOS (Homebrew)
 # build+install, neither of which fit the per-major matrix model.
 #
@@ -42,8 +41,8 @@ jobs:
     name: Build .so + .deb + .rpm (amd64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       - name: Build fractalsql.so
         run: |
           chmod +x build.sh
@@ -67,7 +66,7 @@ jobs:
         run: PROFILE=legacy scripts/package.sh amd64
 
       - run: ls -l dist/packages
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: packages-amd64
           path: dist/packages/*
@@ -81,10 +80,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mdb: ['10.6', '10.11', '11.4', '12.2']
+        mdb: ['10.6', '10.11', '11.4', '12.3']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: packages-amd64
           path: dist/packages
@@ -100,7 +99,7 @@ jobs:
 
           # MariaDB Foundation's repo setup pins one specific major
           # (Ubuntu's own repos only ship one MariaDB major per
-          # release, the same problem PGDG solves for postgres).
+          # release, hence the pinned-version repo setup).
           curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
           chmod +x mariadb_repo_setup
           ./mariadb_repo_setup --mariadb-server-version="mariadb-\${MDB_VER}" --skip-maxscale
@@ -157,7 +156,7 @@ jobs:
           echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
           echo "ok: fractal_search returned canonical JSON"
 
-          # Params bounds aligned to postgres (iterations<=10000,
+          # Params caps match the documented bounds (iterations<=10000,
           # pop_size<=100000, diff_factor<=32). Verify each just-over-cap
           # value is rejected (UDF sets *error=1, non-zero client exit).
           for over_params in \
@@ -172,11 +171,10 @@ jobs:
           echo "ok: Debian install + UDF exec (mdb\${MDB_VER})"
 
           # --- Reasoning + text-to-sql round-trip against a mock LLM --
-          # One major carries this (same reasoning as postgres's
-          # install-test.yml gating its tests/*.py block to pg16 --
-          # every major runs the identical mock, so N-major redundancy
-          # buys nothing beyond proving the plugin loads/links, which
-          # the ldd check above already covers on every cell).
+          # One major carries this: every major runs the identical
+          # mock, so N-major redundancy buys nothing beyond proving the
+          # plugin loads/links, which the ldd check above already
+          # covers on every cell.
           if [ "\${MDB_VER}" = "11.4" ]; then
               apt-get install -qq -y python3
               python3 /work/scripts/ci/mock_llm.py 18080 &
@@ -207,6 +205,89 @@ jobs:
               -v "${{ github.workspace }}:/work" -w /work \
               ubuntu:24.04 bash /work/test-deb.sh
 
+  # Runs inside a bare ubuntu:24.04 container with no systemd (mariadbd
+  # started directly, same as debian-install above) -- this deliberately
+  # exercises scripts/easy_install.sh's non-systemd restart fallback
+  # (restart_mariadbd_direct), not just the systemctl path a real Debian
+  # host would take. See easy_install.sh's own header comment for why
+  # that fallback exists at all.
+  easy-install-linux:
+    name: "easy_install.sh: Debian wizard, non-interactive (mdb11.4)"
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install package, then run easy_install.sh against a mock LLM
+        run: |
+          cat > test-easy-install.sh <<'SCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y curl gnupg lsb-release ca-certificates python3
+
+          curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+          chmod +x mariadb_repo_setup
+          ./mariadb_repo_setup --mariadb-server-version="mariadb-11.4" --skip-maxscale
+          apt-get update -qq
+          apt-get install -qq -y mariadb-server mariadb-client
+
+          mkdir -p /var/run/mysqld /var/log/mysql
+          chown mysql:mysql /var/run/mysqld /var/log/mysql
+          mariadbd --user=mysql >/var/log/mysql/boot.log 2>&1 &
+          for i in $(seq 1 60); do mariadb-admin ping >/dev/null 2>&1 && break; sleep 1; done
+          mariadb-admin ping
+          mariadb -u root -e "CREATE DATABASE fractalsql_ci;"
+
+          # Package already installed manually here (mirrors debian-install)
+          # so is_installed() detects it and Phase B (--no-install) is
+          # never exercised, same as anyone who ran apt install first.
+          apt-get install -qq -y ./dist/packages/fractalsql-mariadb-amd64.deb
+
+          python3 scripts/ci/mock_llm.py 18080 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          # ollama mode sets FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1; openai-compatible doesn't.
+          chmod +x scripts/easy_install.sh
+          ./scripts/easy_install.sh \
+              --no-install --yes --database fractalsql_ci \
+              --provider ollama \
+              --url http://127.0.0.1:18080/v1/chat/completions \
+              --model mock-model \
+              --embed-url http://127.0.0.1:18080/v1/embeddings \
+              --embed-model mock-embed --think off | tee /tmp/easy-install.log
+
+          kill ${MOCK_PID} 2>/dev/null || true
+
+          # scripts/ci/mock_llm.py's canned chat reply is a fenced
+          # ```sql SELECT 1``` block (shared with build_test.sh's
+          # reasoning-tier gates -- see that script's own header
+          # comment).
+          grep -qi 'select 1' /tmp/easy-install.log \
+              || { echo "FAIL: reasoning round-trip via easy_install.sh didn't reach the mock reply"; exit 1; }
+
+          EDITION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractalsql_edition();")
+          VERSION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractalsql_version();")
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+
+          # Re-run to exercise the "already registered" pause + --force-reinstall.
+          ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --force-reinstall --provider skip
+
+          echo "ok: easy_install.sh end-to-end (Debian, non-systemd container)"
+          SCRIPT
+          chmod +x test-easy-install.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" -w /work \
+              ubuntu:24.04 bash /work/test-easy-install.sh
+
   rpm-install:
     name: RHEL (Rocky 9), install + UDF exec (mdb${{ matrix.mdb }})
     needs: build-artifacts
@@ -214,10 +295,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mdb: ['10.6', '10.11', '11.4', '12.2']
+        mdb: ['10.6', '10.11', '11.4', '12.3']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: packages-amd64
           path: dist/packages
@@ -319,8 +400,8 @@ jobs:
     needs: build-artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: packages-amd64
           path: dist/packages
@@ -385,7 +466,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install MariaDB (Homebrew) + client headers
         run: |
@@ -414,6 +495,7 @@ jobs:
               -Wl,-dead_strip \
               -o dist/darwin/fractalsql.dylib \
               src/fractalsql.c \
+              src/fractalsql_parse.c \
               src/fractalsql_session.c \
               src/fractalsql_vector.c \
               src/fractalsql_cognition.c \
@@ -482,3 +564,197 @@ jobs:
           echo "$REPLY" | grep -qi sql \
               || { echo "FAIL: reasoning round-trip returned '${REPLY}'"; exit 1; }
           echo "ok: macOS reasoning round-trip via mock endpoint"
+
+  # -Provider skip only: scripts/easy_install.sh's own darwin branch of
+  # apply_env_and_restart deliberately doesn't automate a reasoning
+  # restart (launchd plist edits vary per Homebrew version -- see that
+  # function's own comment). This job exercises what CAN be
+  # automated on macOS: package detection, idempotent UDF/procedure
+  # registration, and the "already registered" pause + -ForceReinstall.
+  # The mock-LLM round-trip is covered by easy-install-linux instead.
+  easy-install-macos:
+    name: "easy_install.sh: macOS wizard, non-interactive (arm64)"
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB (Homebrew) and start it
+        run: |
+          set -euo pipefail
+          brew install mariadb mariadb-connector-c pkg-config
+          brew services start mariadb
+          for i in $(seq 1 30); do
+              mariadb -uroot -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb -uroot -e 'SELECT 1'
+
+      - name: Build + install via scripts/macos/install.sh manually first
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
+          MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
+          mkdir -p /tmp/fsql-stage
+          clang -Wall -Wextra -O3 -fPIC -arch arm64 ${MDB_CFLAGS} -Iinclude \
+              -ffunction-sections -fdata-sections -fvisibility=default \
+              -dynamiclib -Wl,-dead_strip \
+              -o /tmp/fsql-stage/fractalsql.dylib \
+              src/fractalsql.c src/fractalsql_parse.c src/fractalsql_session.c src/fractalsql_vector.c \
+              src/fractalsql_cognition.c src/fractalsql_textsql.c src/fractalsql_enterprise.c \
+              "${CORE_A}" -lm -lpthread
+          cp include/darwin-arm64/fractalsql-reasoning-http.so /tmp/fsql-stage/
+          chmod +x scripts/macos/install.sh
+          cp scripts/macos/install.sh /tmp/fsql-stage/
+          MARIADB_BIN="$(brew --prefix mariadb)/bin/mariadb" /tmp/fsql-stage/install.sh
+          test -f "$(mariadb -uroot -N -B -e 'SELECT @@plugin_dir;')/fractalsql.so"
+
+      - name: Run easy_install.sh wizard (provider skip)
+        run: |
+          set -euo pipefail
+          mariadb -uroot -e 'CREATE DATABASE fractalsql_ci;'
+          chmod +x scripts/easy_install.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" \
+            ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --provider skip | tee /tmp/easy-install.log
+
+          EDITION=$(mariadb -uroot -D fractalsql_ci -N -B -e 'SELECT fractalsql_edition();')
+          VERSION=$(mariadb -uroot -D fractalsql_ci -N -B -e 'SELECT fractalsql_version();')
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+
+          # Re-run to exercise the "already registered" pause + --force-reinstall.
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" \
+            ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --force-reinstall --provider skip
+
+          echo "ok: easy_install.sh end-to-end (macOS, provider skip)"
+
+  # Unlike release.yml's build-windows-msi job, this one also installs a
+  # real MariaDB server through the official winx64.msi's own
+  # silent-install properties, not just the headers-only winx64.zip.
+  # That's because easy_install.ps1 detects the server through the
+  # "MariaDB" Windows Service the real installer registers (the default
+  # service name since MariaDB 10.4), which the zip alone never creates.
+  easy-install-windows:
+    name: "easy_install.ps1: Windows wizard, non-interactive (mdb11.4)"
+    runs-on: windows-latest
+    env:
+      MDB_VER: "11.4"
+      MARIADB_VER: "11.4.4"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+
+      - name: Install a real MariaDB server (official .msi, unattended)
+        shell: pwsh
+        run: |
+          $url = "https://archive.mariadb.org/mariadb-$env:MARIADB_VER/winx64-packages/mariadb-$env:MARIADB_VER-winx64.msi"
+          Write-Host "Fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile mariadb.msi -UseBasicParsing
+          $p = Start-Process msiexec.exe -ArgumentList @(
+              '/i', 'mariadb.msi',
+              'SERVICENAME=MariaDB', 'PASSWORD=fractalsql-ci', 'PORT=3306',
+              'ALLOWREMOTEROOTACCESS=1', '/qn'
+          ) -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Host "FATAL: msiexec exited $($p.ExitCode)"; exit 1 }
+          Get-Service MariaDB
+
+      - name: Download + unpack MariaDB binaries (headers for building)
+        shell: pwsh
+        run: |
+          $zipName = "mariadb-$env:MARIADB_VER-winx64.zip"
+          $url = "https://archive.mariadb.org/mariadb-$env:MARIADB_VER/winx64-packages/$zipName"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mdb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mdb.zip" -DestinationPath "deps\mariadb" -Force
+          Rename-Item -Path "deps\mariadb\mariadb-$env:MARIADB_VER-winx64" -NewName "root"
+
+      - name: Build fractalsql.dll (scripts\windows\build.bat)
+        shell: cmd
+        env:
+          MARIADB_MAJOR: ${{ env.MDB_VER }}
+        run: |
+          set MARIADB_DIR=%CD%\deps\mariadb\root
+          set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%
+          if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          REM OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+          REM check, not vendored by fractalsql-core. Same vcpkg tool and
+          REM install path fractalsql-reasoning-http's own Windows build
+          REM already uses for libcurl (pre-installed on this runner image).
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+          call scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          copy /Y "%OUT_DIR%\fractalsql.dll" fractalsql.dll
+          if not exist "fractalsql.dll" (
+              echo FATAL: fractalsql.dll not found after build.bat
+              exit /b 1
+          )
+
+      - name: Install our plugin into the running MariaDB server
+        shell: pwsh
+        run: |
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MariaDB'"
+          $exePath = ($svc.PathName -replace '^"?([^"]+mariadbd\.exe)".*$', '$1')
+          $mdbDir = Split-Path (Split-Path $exePath -Parent) -Parent
+          $env:MYSQL_PWD = 'fractalsql-ci'
+          $mdbExe = Join-Path $mdbDir 'bin\mariadb.exe'
+          & $mdbExe -u root -e "SELECT 1;"
+          & $mdbExe -u root -e "CREATE DATABASE fractalsql_ci;"
+          # Live @@plugin_dir, not a 'lib\plugin' guess under the install
+          # root, same approach as easy_install.ps1's own
+          # Resolve-PluginDir: a static guess for a MariaDB plugin
+          # directory can differ from the server's own live value.
+          $pluginDir = (& $mdbExe -u root -N -B -e "SELECT @@plugin_dir;").Trim().TrimEnd('\')
+          if (-not $pluginDir) { Write-Host "FATAL: SELECT @@plugin_dir returned nothing"; exit 1 }
+          Write-Host "plugin_dir: $pluginDir"
+          Copy-Item "fractalsql.dll" (Join-Path $pluginDir 'fractalsql.dll')
+
+      - name: Run easy_install.ps1 against a mock LLM
+        shell: pwsh
+        run: |
+          Start-Process python -ArgumentList 'scripts\ci\mock_llm.py','18080' -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+
+          # Deliberately no -MdbDir: this exercises the script's own
+          # Win32_Service-based auto-detection (Get-MariaDbTarget)
+          # against the real install above, not a manual override.
+          #
+          # -Provider ollama, not openai-compatible: ollama mode sets
+          # FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1 automatically, which this
+          # plaintext local mock needs.
+          & pwsh -File .\scripts\windows\easy_install.ps1 `
+              -RootPassword 'fractalsql-ci' -Database 'fractalsql_ci' `
+              -Provider ollama `
+              -Url 'http://127.0.0.1:18080/v1/chat/completions' `
+              -Model 'mock-model' `
+              -EmbedUrl 'http://127.0.0.1:18080/v1/embeddings' `
+              -EmbedModel 'mock-embed' -Think off `
+              -NoInstall -Yes 2>&1 | Tee-Object -FilePath easy-install.log
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "FATAL: easy_install.ps1 exited $LASTEXITCODE"
+              exit 1
+          }
+
+          # scripts/ci/mock_llm.py's canned chat reply is a fenced
+          # ```sql SELECT 1``` block (shared with build_test.ps1's
+          # reasoning-tier gates).
+          $hit = Select-String -Path easy-install.log -Pattern 'select 1' -Quiet
+          if (-not $hit) {
+              Write-Host "FAIL: reasoning round-trip via easy_install.ps1 didn't reach the mock reply"
+              exit 1
+          }
+
+          $edition = Select-String -Path easy-install.log -Pattern 'fractalsql_edition\(\) = (\S+),' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
+          Write-Host "edition=$edition"
+          if ($edition -ne 'Community') {
+              Write-Host "FAIL: fractalsql_edition() line not found or unexpected in easy-install.log"
+              exit 1
+          }
+          Write-Host "ok: easy_install.ps1 end-to-end (Windows, mdb11.4)"

@@ -8,7 +8,7 @@ The Cognition tier provides the provider bridge that connects the SFS core to La
 
 ## Configuration is process environment variables, not SQL
 
-Unlike fractalsql-postgresql, where `fractalsql.reasoning_plugin`/`fractalsql.http_url`/etc. are GUCs settable with `ALTER SYSTEM SET`, MariaDB has no equivalent config-registration mechanism reachable from a plain C UDF. Every reasoning/embedding/text-to-sql knob here is a **process environment variable**, read **once** by `mariadbd` at first use and cached for that process's entire lifetime. There is no SQL statement that changes it. Set these **before mariadbd starts** (`docker run -e ...`, a systemd `EnvironmentFile`, or equivalent):
+Every reasoning/embedding/text-to-sql knob here is a **process environment variable**: MariaDB has no config-registration mechanism reachable from a plain C UDF, so none of these can be a server system variable. Each is read **once** by `mariadbd` at first use and cached for that process's entire lifetime. There is no SQL statement that changes it. Set these **before mariadbd starts** (`docker run -e ...`, a systemd `EnvironmentFile`, or equivalent):
 
 | Variable | Purpose |
 | --- | --- |
@@ -42,7 +42,7 @@ fractal_reason(
     context    TEXT               -- optional, JSON payload, defaults to '{}'
 ) RETURNS TEXT
 ```
-2 or 3 arguments; `context` may be omitted. `session_id` is required and first: every reasoning-tier function in this repo takes it, because MariaDB is one shared multithreaded process for every connection (unlike postgres's one-process-per-connection), so the dispatch ctx has to be per-session rather than a single file-static (see `src/fractalsql_session.c`).
+2 or 3 arguments; `context` may be omitted. `session_id` is required and first: every reasoning-tier function in this repo takes it, because MariaDB is one shared multithreaded process for every connection, so the dispatch ctx has to be per-session rather than a single file-static (see `src/fractalsql_session.c`).
 
 ```sql
 SELECT fractal_reason(CONNECTION_ID(), 'reply with a one-word confirmation');
@@ -67,7 +67,7 @@ fractal_embed(
 ) RETURNS TEXT   -- fractal_vector JSON-array-string, e.g. "[0.1,0.2,0.3]"
 ```
 
-Returns the same JSON-array-string grammar every `fractal_vector_*` function and MariaDB's own `VEC_FROMTEXT()` accept, feeding straight into either with no conversion step (no `float8[]` here; MariaDB has no native array type across the 10.6-12.2 compat floor this repo targets, see the Vector tier docs). Requires `FRACTALSQL_HTTP_EMBED_URL` and `FRACTALSQL_HTTP_EMBED_MODEL` to be configured.
+Returns the same JSON-array-string grammar every `fractal_vector_*` function and MariaDB's own `VEC_FROMTEXT()` accept, feeding straight into either with no conversion step (MariaDB has no native array type across the 10.6-12.3 compat floor this repo targets, see the Vector tier docs). Requires `FRACTALSQL_HTTP_EMBED_URL` and `FRACTALSQL_HTTP_EMBED_MODEL` to be configured.
 
 ---
 
@@ -76,7 +76,7 @@ Returns the same JSON-array-string grammar every `fractal_vector_*` function and
 
 Builds a plain-text description of the database schema (columns, PK/NOT NULL, comments, foreign keys) for use as `fractal_reason()`/text-to-sql prompt context.
 
-Plain UDFs have no SPI equivalent in MariaDB: a C UDF cannot run SQL against the calling session at all, so this is a **stored procedure**, not a function, unlike postgres's `fractal_schema_context()`.
+Plain UDFs cannot run SQL against the calling session at all in MariaDB: a C UDF has no path back to the caller's tables, so this is a **stored procedure**, not a function.
 
 ### Signature
 ```sql
@@ -87,9 +87,9 @@ CALL fractal_schema_context(
 SELECT out_context;
 ```
 
-Two arguments, not postgres's three: this repo has no `query_hint` parameter. Postgres accepts one for forward compatibility with a future ranking pass that doesn't exist there yet either; it was left out here rather than added unused.
+Two arguments: there is no `query_hint` parameter — it was left out rather than added unused, ahead of a future ranking pass that doesn't exist yet.
 
-`SQL SECURITY INVOKER`: `information_schema` rows are already filtered to what the calling user can see, so no separate privilege check is needed the way postgres's `has_table_privilege()` joins require.
+`SQL SECURITY INVOKER`: `information_schema` rows are already filtered to what the calling user can see, so no separate privilege check is needed.
 
 ```sql
 CALL fractal_schema_context(NULL, @ctx);
@@ -101,7 +101,7 @@ SELECT @ctx;
 ## `fractal_text_to_sql`
 **Safe SQL Generation**
 
-Turns a natural-language question into a single, validated SQL statement. Same SPI limitation as `fractal_schema_context` above: a **stored procedure**, orchestrating the GENERATE -> ALLOWLIST -> EXPLAIN-equivalent (+ optional REVIEW) pipeline internally by calling `fractal_t2s_generate`/`fractal_t2s_check_allowlist`/`fractal_t2s_review` (see [`text-to-sql-setup.md`](text-to-sql-setup.md) for those and the full pipeline walkthrough).
+Turns a natural-language question into a single, validated SQL statement. Same limitation as `fractal_schema_context` above (a C UDF cannot run SQL against the calling session): a **stored procedure**, orchestrating the GENERATE -> ALLOWLIST -> EXPLAIN-equivalent (+ optional REVIEW) pipeline internally by calling `fractal_t2s_generate`/`fractal_t2s_check_allowlist`/`fractal_t2s_review` (see [`text-to-sql-setup.md`](text-to-sql-setup.md) for those and the full pipeline walkthrough).
 
 ### Signature
 ```sql
@@ -116,7 +116,7 @@ SELECT out_sql, out_error;
 
 Exactly one of `out_sql`/`out_error` is set on return (both NULL is not a possible outcome). A hard failure like a missing reasoning plugin raises a real SQL error instead of setting `out_error`. Never auto-executed. Retries up to `FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS` times, feeding each rejection back into the next GENERATE attempt as feedback.
 
-The EXPLAIN-equivalent check is `PREPARE`-only (immediately `DEALLOCATE`d on success, never `EXECUTE`d). `PREPARE` already performs the same parse and catalog-resolution postgres's plain `EXPLAIN` relies on (unknown table/column, basic type mismatches all surface as a `PREPARE`-time error), while sidestepping a dynamic `EXPLAIN`'s own result set leaking out of this procedure's `CALL` as a spurious extra result set. This is a best-effort quality gate, not a complete semantic validator; real security still rests on the execution role's own grants, not on this check.
+The EXPLAIN-equivalent check is `PREPARE`-only (immediately `DEALLOCATE`d on success, never `EXECUTE`d). `PREPARE` already performs the same parse and catalog-resolution a plain `EXPLAIN` relies on (unknown table/column, basic type mismatches all surface as a `PREPARE`-time error), while sidestepping a dynamic `EXPLAIN`'s own result set leaking out of this procedure's `CALL` as a spurious extra result set. This is a best-effort quality gate, not a complete semantic validator; real security still rests on the execution role's own grants, not on this check.
 
 ```sql
 CALL fractal_text_to_sql('How many orders does customer ''acme'' have?', '["orders"]', @sql, @err);

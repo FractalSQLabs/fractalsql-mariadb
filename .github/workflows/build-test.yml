@@ -1,10 +1,9 @@
 name: build-test
 
 # Public CI wrapper around run_build_test.sh / build_test.sh: the same
-# scripts a dev runs locally, so local == CI (a convention shared with
-# fractalsql-core's foundry-tests.yml and fractalsql-postgresql's own
-# build-test.yml). Compiles fractalsql.so once (one .so covers every
-# MariaDB major, unlike postgres's per-major rebuild) and exercises the
+# scripts a dev runs locally, so local == CI. Compiles fractalsql.so
+# once (one .so covers every MariaDB major; no per-major rebuild
+# needed) and exercises the
 # behavioral gate suite (see build_test.sh's header for exactly which
 # gates exist and which are still pending) against a throwaway cluster
 # for every supported MariaDB major on every push/PR.
@@ -16,7 +15,7 @@ name: build-test
 # Extra jobs alongside the Linux/Docker gate matrix:
 #   windows-gate-matrix: build_test.ps1 (a PowerShell port of
 #              build_test.sh) against archive.mariadb.org's per-major
-#              winx64 zip, MariaDB 10.6/10.11/11.4/12.2 on
+#              winx64 zip, MariaDB 10.6/10.11/11.4/12.3 on
 #              windows-latest. Unverified as of this writing: written
 #              by direct translation from the verified-working
 #              build_test.sh but never run against a real Windows box,
@@ -24,28 +23,33 @@ name: build-test
 #              confirm or break it. See build_test.ps1's own
 #              .DESCRIPTION.
 #   darwin-gate-matrix: build_test.sh (the same script, unmodified) on
-#              macos-14 via Homebrew's `mariadb` formula. A single
-#              cell, not a 4-major matrix, since Homebrew's mariadb
-#              formula is not per-major the way fractalsql-postgresql's
-#              CI can rely on postgresql@<N> being: there is no
-#              mariadb@10.6 / mariadb@11.4 formula to select a specific
-#              major with. Whatever major Homebrew currently tracks is
-#              what this job tests.
+#              macos-14, matrixed across the same 4 majors as
+#              gate-matrix/windows-gate-matrix. Homebrew ships versioned
+#              formulae for 3 of the 4 (mariadb@10.6, mariadb@10.11,
+#              mariadb@11.4); the 12.3 cell installs the unversioned
+#              `mariadb` formula, which tracks 12.3.x -- matching this
+#              pin exactly today, though it is still not an exact-
+#              version pin and will drift once a newer major hits the
+#              formula -- see that matrix entry's own comment.
 #   linux-asan / linux-ubsan: build_test.sh --asan / --ubsan, MariaDB
 #              11.4 LTS only (the recommended ASan/UBSan
 #              representative), weekly/workflow_dispatch-only cadence.
 #              Installs 11.4 directly via MariaDB's official apt repo
-#              on ubuntu-latest, not Docker, mirroring postgres's own
-#              linux-asan job's reasoning for avoiding a Debian-
-#              Bookworm-base Docker image: LD_PRELOADing a sanitizer
-#              runtime into a full-featured official image can hang
-#              the dynamic linker on some glibc builds. It's untested
-#              whether the mariadb:11.4 Docker image has the same
-#              problem postgres's postgres:16-bookworm image did, so
-#              this job sidesteps it the same way rather than assuming
-#              it's fine.
+#              on ubuntu-latest, not Docker, for a reason worth spelling
+#              out: LD_PRELOADing a sanitizer runtime into a
+#              full-featured official image can hang the dynamic linker
+#              on some glibc builds. It's untested whether the
+#              mariadb:11.4 Docker image has that problem, so this job
+#              sidesteps it rather than assuming it's fine.
 #   windows-asan/windows-ubsan, darwin-asan/darwin-ubsan: same 11.4-
 #              only, weekly-cadence pattern as linux-asan/ubsan above.
+#              Windows note: -Asan/-Ubsan only widen build_test.ps1's
+#              own timeout budget -- there is no actual MSVC sanitizer
+#              instrumentation wired into scripts\windows\build.bat's
+#              cl.exe invocation, so these two cells currently build
+#              and run the identical DLL windows-gate-matrix's mdb11.4
+#              cell does, just on a longer clock. Real Windows
+#              sanitizer coverage is a separate, not-yet-done follow-up.
 #   coverage: weekly/on-demand only. A gcov-instrumented build_test.sh
 #              --coverage run, with the lcov/genhtml report uploaded as
 #              a workflow artifact. Note that the Makefile does not
@@ -80,14 +84,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mdb: ["10.6", "10.11", "11.4", "12.2"]
+        mdb: ["10.6", "10.11", "11.4", "12.3"]
 
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: docker build (runs build_test.sh --mdb ${{ matrix.mdb }})
         run: |
@@ -110,8 +114,8 @@ jobs:
             mariadb_ver: "10.11.10"
           - mdb: "11.4"
             mariadb_ver: "11.4.4"
-          - mdb: "12.2"
-            mariadb_ver: "12.2.2"
+          - mdb: "12.3"
+            mariadb_ver: "12.3.3"
     # Same version pins as release.yml's build-windows-msi matrix:
     # single source of truth, don't let these drift independently.
     steps:
@@ -119,7 +123,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up MSVC dev cmd (x64)
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
         with:
           arch: x64
 
@@ -142,19 +146,18 @@ jobs:
             exit 1
           }
 
-      - name: Build fractalsql.dll (release.yml's build-windows-msi path)
-        shell: pwsh
+      # OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+      # check, not vendored by fractalsql-core. Same vcpkg tool and
+      # install path fractalsql-reasoning-http's own Windows build
+      # already uses for libcurl (pre-installed on this runner image).
+      # build_test.ps1's own Gate-01-Build (scripts\windows\build.bat
+      # under the hood) does the actual compile -- this step only needs
+      # to make sure vcpkg has the package installed first.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
         run: |
-          .\scripts\windows\build-windows.ps1 -MariaDbDir "deps\mariadb\root" -MariaDbMajor ${{ matrix.mdb }}
-          # NOTE: scripts\windows\build-windows.ps1 does not exist yet
-          # in this repo (only build.bat and build-msi.bat do, both
-          # pure-C with no LuaJIT dependency). release.yml's own
-          # windows job still builds via scripts\windows\build.bat.
-          # This step is left wired here, pointing at the PowerShell
-          # script this job wants, rather than omitted, so the workflow
-          # shape is ready once that script is written; it will need
-          # adjusting to match its actual parameter names at that time.
-          Copy-Item "dist\windows\mdb${{ matrix.mdb }}\fractalsql.dll" "fractalsql.dll"
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
 
       - name: build_test.ps1 -MdbDir deps\mariadb\root -MdbMajor ${{ matrix.mdb }}
         shell: pwsh
@@ -163,25 +166,41 @@ jobs:
           exit $LASTEXITCODE
 
   darwin-gate-matrix:
-    name: build_test.sh (macOS, Homebrew mariadb)
+    name: build_test.sh mdb${{ matrix.mdb }} (macOS)
     if: github.event_name != 'schedule'
     runs-on: macos-14
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mdb: "10.6"
+            formula: "mariadb@10.6"
+          - mdb: "10.11"
+            formula: "mariadb@10.11"
+          - mdb: "11.4"
+            formula: "mariadb@11.4"
+          - mdb: "12.3"
+            # No mariadb@12.3 Homebrew formula -- the unversioned
+            # `mariadb` formula tracks 12.3.x, matching this pin today.
+            # Still not a Linux/Windows-style exact-version pin: it
+            # drifts to a newer major when Homebrew updates the
+            # formula; revisit then.
+            formula: "mariadb"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - name: Install MariaDB (Homebrew)
+      - name: "Install MariaDB ${{ matrix.mdb }} (Homebrew: ${{ matrix.formula }})"
         run: |
           set -euo pipefail
-          brew install mariadb jq
-          echo "$(brew --prefix mariadb)/bin" >> "$GITHUB_PATH"
+          brew install jq "${{ matrix.formula }}"
 
-      - name: build_test.sh (whatever major Homebrew currently tracks)
+      - name: build_test.sh --mdb ${{ matrix.mdb }}
         run: |
           set -euo pipefail
           chmod +x build_test.sh
-          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh
+          MDB_BINDIR="$(brew --prefix ${{ matrix.formula }})/bin" ./build_test.sh --mdb ${{ matrix.mdb }}
 
   linux-asan:
     name: build_test.sh --asan mdb11.4
@@ -248,7 +267,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Set up MSVC dev cmd (x64)
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
         with:
           arch: x64
       - name: Download + unpack MariaDB 11.4.4 x64 binaries
@@ -259,6 +278,15 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
           Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
           Rename-Item -Path "deps\mariadb\mariadb-11.4.4-winx64" -NewName "root"
+      # build_test.ps1's Gate-01-Build calls Build-AsanExtension itself
+      # (a real MSVC /fsanitize=address compile+link into its own
+      # dist\windows-asan\ tree, see that function's own comment) --
+      # this step only needs vcpkg to already have OpenSSL installed.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
       - name: build_test.ps1 -Asan mdb11.4
         shell: pwsh
         run: |
@@ -274,7 +302,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: Set up MSVC dev cmd (x64)
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
         with:
           arch: x64
       - name: Download + unpack MariaDB 11.4.4 x64 binaries
@@ -285,6 +313,17 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
           Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
           Rename-Item -Path "deps\mariadb\mariadb-11.4.4-winx64" -NewName "root"
+      # build_test.ps1's Gate-01-Build calls Build-UbsanExtension itself
+      # (clang-cl + -fsanitize=undefined into its own dist\windows-ubsan\
+      # tree, see that function's own comment) -- clang-cl comes from
+      # windows-latest's bundled VS "C++ Clang tools for Windows"
+      # component, resolved via Find-ClangCl's vswhere lookup. This step
+      # only needs vcpkg to already have OpenSSL installed.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
       - name: build_test.ps1 -Ubsan mdb11.4
         shell: pwsh
         run: |

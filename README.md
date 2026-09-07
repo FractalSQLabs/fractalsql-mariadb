@@ -36,8 +36,8 @@ and hands off to the next. You don't need to read everything; follow the path.
 
 1. **What is this and why do I care?**: you are here. Sovereign Data Intelligence, in one page.
 2. **How do I get the UDFs running in 5 minutes?** → [Getting Started](docs/getting-started.md) (`docker compose up -d`, or the native `.deb`/`.rpm`/`.msi`, then your first Scout search).
-3. **How do I apply this to my industry?** → [Starter Kits](docs/starter-kits.md): a problem → agent map using the 15 shipped agents, plus all eleven industry-vertical demo *scripts*, verified end to end (see [demo/README.md](demo/README.md#industry-vertical-demos)).
-4. **How does a specific agent work and what are its inputs?** → [Agent Reference](docs/api-agency.md): the fifteen installable agents, each with a real `CALL` example.
+3. **How do I apply this to my industry?** → [Starter Kits](docs/starter-kits.md): a problem → agent map using the 16 shipped agents, plus all eleven industry-vertical demo *scripts*, verified end to end (see [demo/README.md](demo/README.md#industry-vertical-demos)).
+4. **How does a specific agent work and what are its inputs?** → [Agent Reference](docs/api-agency.md): the sixteen installable agents, each with a real `CALL` example.
 5. **How do I build a proprietary agent that isn't in the box?** → [Composition Guide](docs/composition-guide.md): the design patterns behind the shipped agents.
 
 > New here? Step 2 is a one-command demo. Step 4 is the reference you'll keep
@@ -65,7 +65,7 @@ MariaDB stored procedures.
 
 - **Discovery**: diverse, mode-collapse-free retrieval: `fractal_search` (Sniper), `fractal_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`).
 - **Cognition**: in-database LLM integration: `fractal_reason` (Bedrock, Azure OpenAI, Vertex, Ollama), `fractal_embed`, `fractal_text_to_sql`, plus an automatic **Vectorizer** pipeline (trigger-driven, MariaDB 11.7+ native `VECTOR(n)` aware).
-- **Agency**: self-correcting stored procedures: **fifteen installable agents** spanning anomaly triage, portfolio allocation, hybrid recall, route planning, deterioration triage, regime detection, and more. See the [Agent Reference](docs/api-agency.md).
+- **Agency**: self-correcting stored procedures: **sixteen installable agents** spanning anomaly triage, portfolio allocation, hybrid recall, route planning, deterioration triage, regime detection, and more. See the [Agent Reference](docs/api-agency.md).
 - **Analytics**: fractal/dimension primitives: `fractal_dimension_dfa`, `fractal_dimension_boxcount`, `fractal_optimize_portfolio`, and more.
 
 Every primitive is an ordinary SQL function or stored procedure, no
@@ -74,7 +74,7 @@ Every primitive is an ordinary SQL function or stored procedure, no
 your own agent, the [Composition Guide](docs/composition-guide.md) walks
 through the patterns the shipped agents use.
 
-MariaDB has no SPI (a C UDF can't run SQL against the calling session) and no
+A MariaDB C UDF can't run SQL against the calling session, and MariaDB has no
 table-returning UDFs. Every primitive that would otherwise be a
 table-scanning or set-returning C function is re-architected instead:
 inline-corpus arguments for Discovery, `CALL`-with-`OUT`-JSON-param
@@ -94,48 +94,46 @@ for the 5-minute Docker run and the native installers:
 docker compose up -d   # then connect and run your first Scout search
 ```
 
-Native installers (MariaDB 10.6 / 10.11 / 11.4 LTS / 12.2 rolling): `.deb` /
-`.rpm` for Linux amd64/arm64, an unsigned `.zip` for macOS (arm64/x86_64, copy
-into your Homebrew MariaDB's `plugin_dir` by hand, since MariaDB has no
-extension-install mechanism to script against there), and a per-major `.msi`
-for Windows x64. See the compatibility table below.
+```bash
+# Or, on a real MariaDB install (Linux/macOS):
+git clone https://github.com/FractalSQLabs/fractalsql-mariadb.git && cd fractalsql-mariadb
+./scripts/easy_install.sh   # detects your MariaDB install, offers to install the package, walks you through reasoning setup
+```
+
+Native installers (MariaDB 10.6 / 10.11 / 11.4 LTS / 12.3 LTS): `.deb` /
+`.rpm` for Linux amd64/arm64, an unsigned `.zip` for macOS (arm64/x86_64),
+and a per-major `.msi` for Windows x64. See the compatibility table below.
+`easy_install.sh` (Linux/macOS) and `scripts/windows/easy_install.ps1`
+(Windows) wrap all of these behind one interactive wizard; no telemetry,
+everything stays local.
 
 ---
 
 ## 🏛️ Enterprise Tier
 
 Everything above is Community edition and fully functional on its own.
-Discovery, Cognition, and Agency don't depend on anything in this section.
-The Enterprise tier adds a tamper-evident, hash-chained decision ledger
-and CISO audit trail: a `FRACTALSQL_ENTERPRISE_LIB` environment
-variable names a separately-built library, dlopen'd lazily, backing
-ten thin `fractal_ledger_*`/`fractal_audit_*` UDFs that return a clean
-`NULL` (never an error or a crash) while the library isn't loaded, and
-a genuine, file-backed persistent chain once it is. See
-**[Enterprise Tier](docs/enterprise.md)** for the full reference.
+Discovery, Cognition, and Agency don't depend on anything in this section. For regulated
+environments that need to **prove, not just
+claim**, what an autonomous agent decided and why, an optional drop-in
+library adds a tamper-evident, hash-chained decision ledger: no rebuild, no
+extension reload, activated by a single environment variable. See
+**[Enterprise Tier](docs/enterprise.md)** for the full mechanism, including
+what the hash chain can and can't prove.
 
 ---
 
 ## 📊 Compatibility & License
 
-| MariaDB | Linux amd64 | Linux arm64 | Windows x64 | macOS (Homebrew) |
-| --- | :---: | :---: | :---: | :---: |
-| 10.6 | ✓ | ✓ | ✓ | ✓ |
-| 10.11 | ✓ | ✓ | ✓ | ✓ |
-| 11.4 LTS | ✓ | ✓ | ✓ | ✓ |
-| 12.2 rolling | ✓ | ✓ | ✓ | ✓ |
-
-One `fractalsql.so`/`.dll`/`.dylib` per (platform, arch) covers every major
-above. The UDF ABI is stable across the whole range, no per-major fan-in on
-Linux/macOS (Windows ships one `.msi` per major purely because the install
-path is major-specific: `C:\Program Files\MariaDB <VER>\lib\plugin\`).
-MariaDB 11.7+ additionally exposes a native `VECTOR(n)` column type this
-repo's vector functions transparently interoperate with. See
-[docs/vectorizer-setup.md](docs/vectorizer-setup.md).
+| MariaDB | Linux | Windows x64  | macOS |
+| --- | :---: |:------------:|:-----:|
+| 10.6 | ✓ |      ✓       | ✓ |   ✓   |
+| 10.11 | ✓ |      ✓       | ✓ |   ✓   |
+| 11.4 LTS | ✓ |      ✓       | ✓ |   ✓   |
+| 12.3 LTS | ✓ |      ✓       | ✓ |   ✓   |
 
 **License**: Apache-2.0. See `LICENSE`. Third-party components are under
-their own permissive licenses (BSD-2-Clause, MIT, and others).
-See `THIRD-PARTY-NOTICES.md`.
+their own permissive licenses (BSD-2-Clause, MIT, and others) --
+see `THIRD-PARTY-NOTICES.md`.
 
 For enterprise editions, licensing, and support, contact
 **enterprise@fractalsqlabs.com**.
@@ -146,21 +144,15 @@ For enterprise editions, licensing, and support, contact
 
 *Follow the path above; the links below are the same steps, expanded.*
 
-- **[Getting Started](docs/getting-started.md)**: 5-minute Docker / native install.
-- **[Starter Kits](docs/starter-kits.md)**: problem → agent mapping for common use cases.
-- **[Agent Reference](docs/api-agency.md)**: the fifteen installable agents, each with a real `CALL` example.
+- **[Getting Started](docs/getting-started.md)**: 60-second Docker / native install.
+- **[Starter Kits](docs/starter-kits.md)**: industry-specific runnable SQL scripts.
+- **[Agent Recipes](docs/api-agency.md)**: the sixteen installable agents, each as a recipe.
 - **[Composition Guide](docs/composition-guide.md)**: build your own agent.
-- **[Features](docs/features.md)**: the full capability map and API reference.
-- **[Discovery API](docs/api-discovery.md)** · **[Cognition API](docs/api-cognition.md)** · **[Analytics API](docs/api-analytics.md)**: per-tier function reference.
+- **[Features](docs/features.md)**: the full Capability Map and API reference.
 - **[Reasoning Setup](docs/reasoning-setup.md)**: LLM provider configuration (Ollama, OpenAI, Bedrock, Azure, Vertex).
 - **[Text-to-SQL Setup](docs/text-to-sql-setup.md)**: pipeline details and the security model.
-- **[Vectorizer Setup](docs/vectorizer-setup.md)**: automatic embedding pipelines, including the native `VECTOR(n)` path.
+- **[Vectorizer Setup](docs/vectorizer-setup.md)**: automatic embedding pipelines.
 - **[Docker Demo](docs/docker-demo.md)**: a one-command end-to-end demo.
-- **[Demo Index](demo/README.md)**: every runnable demo script in this repo.
-- **[Enterprise Tier](docs/enterprise.md)**: what's real (activation gating) and what isn't (ledger storage) today.
-- **[COOKBOOK](docs/COOKBOOK.md)**: worked example wiring the [fractalsql-reasoning-http](https://github.com/FractalSQLabs/fractalsql-reasoning-http) plugin into a live MariaDB instance.
+- **[Agent Blueprint Gallery](demo/README.md)**: the vertical demos and reference agents.
+- **[Enterprise Tier](docs/enterprise.md)**: the tamper-evident decision ledger (CISO/audit).
 
----
-
-[github.com/FractalSQLabs](https://github.com/FractalSQLabs) · Issues and
-PRs welcome.

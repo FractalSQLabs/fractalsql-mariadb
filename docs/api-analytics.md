@@ -6,7 +6,7 @@
 
 The Analytics tier provides mathematical primitives for analyzing the "shape" of data and state, turning raw vectors into structural insights.
 
-MariaDB has no `float8[]`/`int4[]` array types and no `DEFAULT`-argument syntax for `CREATE FUNCTION`. Every argument that would be a postgres array here is a CSV-or-bracketed-JSON-array **string** instead (the same convention `fractal_search`'s own `vector_csv`/`query_csv` arguments already use: `'1,2,3'` or `'[1,2,3]'`), and every postgres trailing-`DEFAULT` scalar argument is bundled into one trailing JSON `params` string instead. `jsonb` return types become JSON-valid `STRING` results.
+MariaDB has no array types and no `DEFAULT`-argument syntax for `CREATE FUNCTION`. Every array argument is therefore a CSV-or-bracketed-JSON-array **string** (the same convention `fractal_search`'s own `vector_csv`/`query_csv` arguments already use: `'1,2,3'` or `'[1,2,3]'`), and every optional trailing scalar argument is bundled into one trailing JSON `params` string instead. Functions that return structured results return them as JSON-valid `STRING` values.
 
 ---
 

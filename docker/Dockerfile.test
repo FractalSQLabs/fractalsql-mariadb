@@ -4,10 +4,8 @@
 # ONE MariaDB major inside the official mariadb:<major> image. A
 # successful `docker build` IS the test result: gates run as a RUN
 # step, so a gate failure fails the build with a non-zero exit and the
-# log in the build output. Mirrors fractalsql-postgresql's
-# docker/Dockerfile.test structure exactly; the difference is only the
-# base image family and the majors in the matrix (10.6 / 10.11 / 11.4 /
-# 12.2 instead of PG 14-18).
+# log in the build output. Base image family and majors in the matrix
+# (10.6 / 10.11 / 11.4 / 12.3).
 #
 # Usage (single major):
 #   docker build -f docker/Dockerfile.test --build-arg MDB_MAJOR=11.4 \
@@ -52,9 +50,9 @@ COPY . /build
 RUN chown -R mysql:mysql /build
 
 # build_test.sh's setup runs mariadb-install-db / mariadbd, which
-# refuses to run as root the same way postgres's initdb does. Matches
-# fractalsql-postgresql's Dockerfile.test running its gates as the
-# `postgres` user.
+# refuses to run as root (the server's datadir-init and daemon both
+# require a non-root user), so the
+# gates run as the `mysql` user.
 USER mysql
 ENV MDB_MAJOR=${MDB_MAJOR}
 ENV FSQL_TEST_TIMEOUT_MULT=${FSQL_TEST_TIMEOUT_MULT}

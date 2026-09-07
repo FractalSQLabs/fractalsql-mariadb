@@ -5,13 +5,12 @@
 # run_build_test.sh: containerized wrapper around build_test.sh.
 # build_test.sh runs INSIDE docker/Dockerfile.test as a RUN step, so
 # `docker build` succeeding IS the test passing, no separate
-# `docker run` / cleanup dance needed. Mirrors fractalsql-postgresql's
-# run_build_test.sh, with MDB_MAJOR instead of PG_MAJOR.
+# `docker run` / cleanup dance needed.
 #
 # Usage:
-#   ./run_build_test.sh                    # 10.6, 10.11, 11.4, 12.2, sequential
+#   ./run_build_test.sh                    # 10.6, 10.11, 11.4, 12.3, sequential
 #   ./run_build_test.sh --mdb 11.4         # one major only
-#   ./run_build_test.sh 10.6 12.2          # explicit majors
+#   ./run_build_test.sh 10.6 12.3          # explicit majors
 #   ./run_build_test.sh --mdb 11.4 --asan  # ASan-instrumented (see
 #   ./run_build_test.sh --mdb 11.4 --ubsan # docker/Dockerfile.test's
 #                                           # FSQL_SAN_MODE build-arg)
@@ -42,7 +41,7 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 2
 fi
 
-MAJORS=(10.6 10.11 11.4 12.2)
+MAJORS=(10.6 10.11 11.4 12.3)
 if [ "${1:-}" = "--mdb" ]; then
   MAJORS=("$2")
 elif [ $# -gt 0 ]; then

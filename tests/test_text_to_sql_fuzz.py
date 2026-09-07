@@ -3,21 +3,21 @@
 text-to-sql allowlist (fractal_t2s_check_allowlist) and the GENERATE
 round trip (fractal_t2s_generate + fractal_text_to_sql).
 
-MariaDB port of fractalsql-postgresql's test_text_to_sql_fuzz.py.
-Differs in two structural ways, both already noted by mock_llm.py's
+Two structural notes, both already noted by mock_llm.py's
 own docstring and this repo's src/fractalsql_textsql.c:
 
   1. fractal_t2s_check_allowlist(sql) is a standalone, deterministic,
-     no-LLM-needed function (unlike postgres, where the allowlist is
-     folded into fractal_text_to_sql() itself and can only be reached
-     by getting a "model" to emit a specific string). Most of this
+     no-LLM-needed function (the allowlist check is deliberately
+     factored out of fractal_text_to_sql() itself, so it can be
+     exercised directly without getting a "model" to emit a specific
+     string). Most of this
      suite exercises it directly: more scenarios, faster, no mock
      server needed for them at all.
 
   2. fractal_text_to_sql's reasoning config (which plugin/endpoint) is
      fixed at mariadbd startup, read once from the process environment,
-     so this suite can't configure_reasoning() a fresh mock per scenario
-     the way postgres does. The small GENERATE-path integration section
+     so this suite can't point the pipeline at a fresh mock per
+     scenario. The small GENERATE-path integration section
      instead uses
      _t2s_common.MutableMockLLMServer, bound to the SAME fixed port
      FRACTALSQL_HTTP_URL already names, and swaps its canned reply
@@ -25,8 +25,8 @@ own docstring and this repo's src/fractalsql_textsql.c:
 
   3. MariaDB's WITH clause is SELECT-only at the CTE-body level (no
      "WITH d AS (DELETE ...) SELECT ..." syntax exists in MariaDB) --
-     see fractalsql_textsql.c's own header comment. The postgres
-     suite's "data-modifying CTE hidden under a top-level SELECT"
+     see fractalsql_textsql.c's own header comment. A "data-modifying
+     CTE hidden under a top-level SELECT"
      scenario is structurally impossible here; the equivalent hazard
      ("WITH cte AS (SELECT ...) DELETE FROM t WHERE id IN (SELECT ..
      FROM cte)", a CTE feeding a top-level DELETE) is covered instead

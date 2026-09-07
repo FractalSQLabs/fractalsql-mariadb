@@ -13,18 +13,17 @@
 --     search primitives (sql/install_udf.sql) resolve and return real
 --     primary-key values directly. Pass real `id` values straight
 --     through.
---   - fractal_agent_diverse_portfolios (Engine P) is not available: it
---     needs fractal_optimize_portfolio_multimodal, an Enterprise-tier
---     primitive this extension doesn't implement (see
---     sql/install_agents.sql's own header). Section 13b below reports
---     that plainly instead of guarding a call that would never exist.
+--   - fractal_agent_diverse_portfolios (Engine P) calls fractal_optimize_
+--     portfolio_multimodal, an Enterprise-tier primitive. Section 13b
+--     below probes it directly first (same dormant/active dual-path
+--     pattern demo/enterprise-qtl-audit.sql uses) rather than assuming
+--     an enterprise library is loaded.
 -- See sql/install_agents.sql's header comment for the full account of
 -- these design choices.
 --
--- End-to-end validation of the fifteen installed agents (A-O; Engine P
--- not available, see above), folded into sql/install_agents.sql as
--- plain stored procedures since MariaDB has no extension-dependency
--- system to hook agents into.
+-- End-to-end validation of the sixteen installed agents (A-P), folded
+-- into sql/install_agents.sql as plain stored procedures since MariaDB
+-- has no extension-dependency system to hook agents into.
 --
 -- Agents exercised: 12 cognition agents call fractal_reason internally,
 -- 3 are pure retrieval/analytics with no LLM call (fractal_dimension_
@@ -36,7 +35,7 @@
 --
 -- Prerequisites:
 --   1. SOURCE sql/install_udf.sql;      (the base UDF set)
---   2. SOURCE sql/install_agents.sql;   (the fifteen agents)
+--   2. SOURCE sql/install_agents.sql;   (the sixteen agents)
 --   3. Reasoning configured (FRACTALSQL_REASONING_PLUGIN/HTTP_URL/
 --      HTTP_MODEL/HTTP_ALLOW_PLAINTEXT in mariadbd's environment).
 --      The twelve cognition agents call fractal_reason internally;
@@ -51,8 +50,8 @@
 SELECT ROUTINE_NAME FROM information_schema.ROUTINES
 WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_NAME LIKE 'fractal_agent_%'
 ORDER BY ROUTINE_NAME;
--- Expect fifteen rows (fractal_agent_anomaly_triage .. fractal_agent_regime_triage,
--- NOT including fractal_agent_diverse_portfolios, see header above).
+-- Expect sixteen rows (fractal_agent_anomaly_triage .. fractal_agent_regime_triage,
+-- plus fractal_agent_diverse_portfolios).
 -- If empty: SOURCE sql/install_agents.sql; first.
 
 -- 1. Setup: a drifting metric time series for one host.
@@ -264,14 +263,33 @@ SELECT JSON_VALUE(@r, '$.sharpe') AS sharpe,
        JSON_VALUE(@r, '$.nearest_distance') AS nearest_distance,
        JSON_VALUE(@r, '$.rationale') AS rationale;
 
--- 13b. fractal_agent_diverse_portfolios (Engine P): not available (see
--- this file's own header, and sql/install_agents.sql's header). It
--- needs fractal_optimize_portfolio_multimodal, an Enterprise-tier
--- primitive this extension doesn't implement. Unlike the enterprise
--- ledger functions (fractal_ledger_*, dormant but callable via dlopen
--- gating), this engine was never built for MariaDB at all, so there is
--- no guarded CALL to attempt here.
-SELECT 'fractal_agent_diverse_portfolios (Engine P): not available, needs fractal_optimize_portfolio_multimodal (an Enterprise-tier primitive this extension does not implement). See sql/install_agents.sql header.' AS notice;
+-- 13b. fractal_agent_diverse_portfolios (Engine P). Probes fractal_
+-- optimize_portfolio_multimodal directly first, the same dormant/active
+-- dual-path pattern demo/enterprise-qtl-audit.sql uses: a NULL result
+-- means no enterprise library is loaded. The agent procedure itself
+-- SIGNALs SQLSTATE '45000' on that NULL rather than passing it through
+-- as if it were real data (see sql/install_agents.sql's own comment),
+-- so this probes first rather than relying on a HANDLER.
+DROP PROCEDURE IF EXISTS demo_diverse_portfolios_probe;
+DELIMITER $$
+CREATE PROCEDURE demo_diverse_portfolios_probe()
+BEGIN
+    DECLARE v_probe TEXT;
+    SET v_probe = fractal_optimize_portfolio_multimodal(
+        '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.3, 0.8, 0);
+    IF v_probe IS NULL THEN
+        SELECT 'fractal_agent_diverse_portfolios (Engine P): enterprise tier not loaded (fractal_optimize_portfolio_multimodal returned NULL). Set FRACTALSQL_ENTERPRISE_LIB and restart to activate. See docs/enterprise.md.' AS notice;
+    ELSE
+        CALL fractal_agent_diverse_portfolios(
+            '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.3, 0.8,
+            '{"portfolio": "agents-demo-diverse"}', 'sharpe', @r);
+        SELECT JSON_EXTRACT(@r, '$.optimization') AS optimization,
+               JSON_VALUE(@r, '$.rationale') AS rationale;
+    END IF;
+END$$
+DELIMITER ;
+CALL demo_diverse_portfolios_probe();
+DROP PROCEDURE demo_diverse_portfolios_probe;
 
 -- 14. fractal_agent_detour_classify (fleet-logistics). Vehicle 1 has a
 -- deliberate detour. Trailing arg is boxcount_dim only, no k or
@@ -397,7 +415,7 @@ SELECT JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,
 -- needs an explicit session key to tell connections apart.
 SELECT fractal_reason(
     CONNECTION_ID(),
-    'Synthesize a one-paragraph ops brief across the fifteen agents run above and what each implies for the on-call engineer.',
+    'Synthesize a one-paragraph ops brief across the agents run above and what each implies for the on-call engineer.',
     JSON_OBJECT('source', 'demo-agents.sql',
                 'engines', JSON_ARRAY(
                     'fractal_agent_anomaly_triage','fractal_agent_allocate',

@@ -6,14 +6,14 @@
 
 The Discovery tier provides high-precision and diverse retrieval mechanisms. Unlike traditional vector search, it treats the embedding space as a continuous optimization problem.
 
-fractalsql-postgresql exposes `fractal_search` (converge to a single best point, no corpus) and `fractal_search_debug` (same, plus a trajectory trace) as two separate functions. This repo folds both into **one** function, `fractal_search`: pass an empty corpus (`''`) for postgres's pure-convergence mode, and set `"debug":true` in `params` for a trace. There is no separate `fractal_search_debug` function here.
+`fractal_search` covers two modes in **one** function: pass a non-empty corpus for top-k search, or pass an empty corpus (`''`) for pure Sniper-mode convergence, and set `"debug":true` in `params` for a trajectory trace. There is no separate `fractal_search_debug` function.
 
 ---
 
 ## `fractal_search`
 **Corpus top-k search, or pure Sniper-Mode convergence**
 
-Runs Stochastic Fractal Search against an inline corpus and returns the top-`k` closest points by cosine distance, alongside the raw converged best point. Pass an empty corpus to get postgres's "converge to the single best point in `[-1,1]^d`" behavior: `fractal_search('', '[1,0]', 1, '{}')` returns a synthetic one-row result whose `top_k[0]` **is** the converged point.
+Runs Stochastic Fractal Search against an inline corpus and returns the top-`k` closest points by cosine distance, alongside the raw converged best point. Pass an empty corpus for the pure-convergence behavior — converge to the single best point in `[-1,1]^d`: `fractal_search('', '[1,0]', 1, '{}')` returns a synthetic one-row result whose `top_k[0]` **is** the converged point.
 
 ### Signature
 ```sql
@@ -36,7 +36,7 @@ fractal_search(
 | `population_size` | `50` | 1–100,000 | Number of particles per generation. |
 | `diffusion_factor` | `2` | 1–32 | SFS MDN (walk-per-particle count). |
 | `walk` | `0.5` | n/a | Diffusion walk parameter. |
-| `debug` | `false` | n/a | Adds a `"trace"` object to the result (see below). Much thinner than fractalsql-postgresql's `fractal_search_debug` (`best_fit_per_gen`/`paths` arrays): `{"trace":{"best_point":[...],"best_fit":..,"edition":"Community"}}`, no per-generation history. |
+| `debug` | `false` | n/a | Adds a `"trace"` object to the result (see below): `{"trace":{"best_point":[...],"best_fit":..,"edition":"Community"}}`, no per-generation history. |
 | `session_id` | `0` (none) | n/a | Pass `CONNECTION_ID()` to run this search on your session's persistent, Diversify-aware ctx instead of a fresh throwaway one. Required for `fractal_diversify_*` settings (below) to actually affect this call, and for D_q/overhead stats to accumulate across calls. Omit for the default, stateless behavior. |
 
 A value outside its documented range makes the whole call return `NULL` (verified: `iterations=10001` → `NULL`), not a clamped or partial result.
@@ -63,7 +63,7 @@ This is different from the table-backed procedures below: `fractal_search` takes
 
 ## Table-backed search: `fractal_search_telemetry` and its siblings
 
-`fractal_search`/`fractal_explore` take their corpus as an inline argument. The four procedures below instead scan a real table directly, matching fractalsql-postgresql's own `fractal_search_telemetry` family. They are stored procedures, not functions, because a MariaDB C UDF has no SPI: it cannot run a query against the calling session's tables. Each takes `table_name` (a bare, non-schema-qualified name in the current database, with exactly one single-column `PRIMARY KEY`) and `vector_col` (a `TEXT` column holding a JSON-array-string vector such as `'[0.1,0.2,...]'`, or a MariaDB 11.7+ native `VECTOR(n)` column, auto-detected via `INFORMATION_SCHEMA` and read through `VEC_TOTEXT()` transparently). Call one, then read its `OUT` parameter:
+`fractal_search`/`fractal_explore` take their corpus as an inline argument. The four procedures below instead scan a real table directly. They are stored procedures, not functions, because a MariaDB C UDF cannot run a query against the calling session's tables. Each takes `table_name` (a bare, non-schema-qualified name in the current database, with exactly one single-column `PRIMARY KEY`) and `vector_col` (a `TEXT` column holding a JSON-array-string vector such as `'[0.1,0.2,...]'`, or a MariaDB 11.7+ native `VECTOR(n)` column, auto-detected via `INFORMATION_SCHEMA` and read through `VEC_TOTEXT()` transparently). Call one, then read its `OUT` parameter:
 
 ```sql
 CALL fractal_search_telemetry('documents', 'embedding', '[0.1,0.2,0.3]', 5, @result);
@@ -154,7 +154,7 @@ fractal_cross_modal_search(
 ## `fractal_explore`
 **Scout Mode: population dispersion**
 
-There is no table/column-scanning set-returning function here: MariaDB's C UDF ABI has no SPI (a UDF cannot query the calling session's tables) and no table-returning UDFs. `fractal_explore` takes the corpus inline instead, the same convention `fractal_search` uses.
+There is no table/column-scanning set-returning function here: MariaDB's C UDF ABI cannot query the calling session's tables, and there are no table-returning UDFs. `fractal_explore` takes the corpus inline instead, the same convention `fractal_search` uses.
 
 ### Signature
 ```sql
@@ -175,7 +175,7 @@ fractal_explore(
 
 ## Diversify / Repulsion (session-scoped)
 
-fractalsql-postgresql's `fractal_diversify_*` calls operate on a single file-static ctx, safe there only because postgres is one OS process per connection. MariaDB is one shared multithreaded process for *every* connection, so the same static would leak one session's Diversify tuning (and its rolling D_q/overhead stats) into every other concurrent session's queries. Every function below instead takes an explicit `session_id BIGINT` as its first argument, backed by a connection-scoped ctx registry (`src/fractalsql_session.c`). Convention: pass `CONNECTION_ID()`.
+MariaDB is one shared multithreaded process for *every* connection, so a single file-static ctx would leak one session's Diversify tuning (and its rolling D_q/overhead stats) into every other concurrent session's queries. Every function below instead takes an explicit `session_id BIGINT` as its first argument, backed by a connection-scoped ctx registry (`src/fractalsql_session.c`). Convention: pass `CONNECTION_ID()`.
 
 `fractal_search`/`fractal_explore` pick up that same session's ctx via the optional `"session_id"` key in their own `params` JSON. Diversify settings only affect a search that opts in that way:
 

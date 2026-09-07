@@ -3,26 +3,25 @@
 # SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
 #
 # build_test.sh: post-build validation gate runner for
-# fractalsql-mariadb. Mirrors what CI runs, so local == CI. Modeled
-# directly on fractalsql-postgresql's build_test.sh (same gate-numbering
-# convention, same PASS/FAIL/SKIP harness shape). Gates 03/04/10/12/13/
+# fractalsql-mariadb. Mirrors what CI runs, so local == CI. Numbered
+# gates with a shared PASS/FAIL/SKIP harness shape. Gates 03/04/10/12/13/
 # 20-25 below cover the full UDF/procedure surface: Discovery, Text-to-
 # SQL, the Vectorizer, Analytics, Diversify, the Vector tier, Cognition,
 # Agency, and Enterprise activation gating. Gates 05/07/08/14-18 (the
 # reasoning-VFS-ABI-level "evil plugin" gates and their embed/authz/
 # soak/crash siblings) are ALSO ported now -- see the reasoning-tier
-# bullet below for how. Deliberately still NOT ported: the guc_superuser
-# gate (09) and a real (non-mock) enterprise-.so gate (26 in postgres's
-# numbering; this repo's own 26/27/28 cover related but different real-
-# .so ground), each with its own documented reason, not a placeholder.
+# bullet below for how. Deliberately still NOT ported: a superuser-only
+# config gate (09) and a real (non-mock) enterprise-.so gate (this
+# repo's own 26/27/28 cover related but different real-.so ground),
+# each with its own documented reason, not a placeholder.
 #
-# Architecture differences from the postgres template (read before
-# assuming a gate ported 1:1):
+# Architecture differences that shape what each gate can claim (read
+# before assuming a gate maps 1:1 from other database ecosystems):
 #   * ONE fractalsql.so covers every supported MariaDB major (10.6 /
-#     10.11 / 11.4 LTS / 12.2 rolling): the UDF ABI (UDF_INIT/UDF_ARGS/
-#     MYSQL_ERRMSG_SIZE) has been stable across all of them. So unlike
-#     postgres's build_test.sh (PGXS rebuild + reinstall PER major),
-#     gate_01_build here compiles ONCE; --mdb <major> only selects which
+#     10.11 / 11.4 LTS / 12.3 LTS): the UDF ABI (UDF_INIT/UDF_ARGS/
+#     MYSQL_ERRMSG_SIZE) has been stable across all of them. So
+#     gate_01_build here compiles ONCE, with no per-major rebuild +
+#     reinstall of the extension; --mdb <major> only selects which
 #     mariadbd binary the live-cluster gates start against.
 #   * No CREATE EXTENSION. "Install" = point mariadbd at a scratch
 #     --plugin-dir containing fractalsql.so, then run
@@ -30,40 +29,38 @@
 #   * Reasoning-tier gates (03/04/13/20-24) dispatch through the REAL
 #     fractalsql-reasoning-http.so plugin against a deterministic local
 #     mock (scripts/ci/mock_llm.py, started in mdb_setup before
-#     mariadbd) rather than postgres's fake in-process reasoning-VFS
-#     plugin approach, exercising the actual dlopen/curl/HTTP path,
+#     mariadbd) rather than a fake in-process reasoning-VFS plugin
+#     approach, exercising the actual dlopen/curl/HTTP path,
 #     just with a canned server on the other end. Gates 05/07/14/15/18
 #     instead swap FRACTALSQL_REASONING_PLUGIN to a reasoning-VFS-ABI-
 #     level test fixture (tests/evil_*.c, tests/retry_reasoning_plugin.c
-#     -- pure C against the shared vendored fractalsql_sql.h, copied
-#     verbatim from fractalsql-postgresql's own tests/, which reference
-#     no postgres- or mariadb-specific API at all) via
+#     -- pure C against the shared vendored fractalsql_sql.h, with no
+#     server-specific API reference at all) via
 #     mdb_swap_reasoning_plugin(), a restart-based swap (see that
 #     function's own comment: FRACTALSQL_REASONING_PLUGIN is a process
 #     environment variable read once at mysqld startup, no live-reload
-#     the way postgres's fractalsql.reasoning_plugin GUC has). A real,
+#     -- it is not a server system variable). A real,
 #     MariaDB-specific wrinkle these gates had to account for: the evil
-#     plugins' call_count statics are process-wide, and unlike postgres
-#     (fork-per-backend, so a fresh psql -c connection gets a freshly
-#     dlopen'd plugin with call_count=0 again) MariaDB is one shared
-#     process for every connection -- call_count keeps incrementing
+#     plugins' call_count statics are process-wide, and (unlike a
+#     per-connection process model, where a fresh connection gets a
+#     freshly dlopen'd plugin with call_count=0 again) MariaDB is one
+#     shared process for every connection -- call_count keeps incrementing
 #     across every call for the process's whole lifetime. So gates
 #     05/07 restart before EACH of their three call sites (GENERATE/
 #     bare fractal_reason/fractal_t2s_review), not once for the whole
 #     gate; see gate_05_evil_overread's own header comment for the full
-#     account. mock_reasoning_plugin.c and mock_embed_plugin.c (the
-#     postgres files providing a well-behaved fallback plugin) were NOT
+#     account. A well-behaved fallback mock plugin was NOT
 #     needed here: mariadb's own baseline (the real HTTP wrapper against
 #     scripts/ci/mock_llm.py) already serves that role, restored via
 #     mdb_restore_reasoning_plugin() at the end of every evil-plugin
-#     gate. Also NOT needed: mock_embed_plugin.c specifically, since
-#     mock_llm.py's embeddings route already returns the same canned
-#     [0.1,0.2,0.3] vector postgres's mock_embed_plugin.c hardcodes.
+#     gate. Also NOT needed: a hardcoded-vector embed mock specifically,
+#     since mock_llm.py's embeddings route already returns the same
+#     canned [0.1,0.2,0.3] vector such a fixture would hardcode.
 #   * 06 still uses a standalone evil UDF (tests/evil_crash_udf.c) that
 #     segfaults when called. This is a genuinely different, simpler
 #     claim than the reasoning-plugin crash gates above (see gate 06's
 #     own header comment), not a stand-in for them.
-#   * 09 guc_superuser has NO MariaDB equivalent to port, permanently:
+#   * 09 superuser-only config has NO MariaDB equivalent to port, permanently:
 #     not "blocked," genuinely not applicable. Cognition-tier config
 #     lives in mysqld process environment variables
 #     (FRACTALSQL_REASONING_PLUGIN etc.), not sysvars, specifically
@@ -78,14 +75,13 @@
 #     dlopen/dlsym activation-gating wiring itself, which would need a
 #     purpose-built stub .so to exercise against a loaded library
 #     (scripts/ci has no fixture for it yet, a reasonable follow-up).
-#   * MariaDB's mariadbd has NO Postgres-postmaster-style built-in
-#     auto-restart-after-crash. Postgres's fork-per-backend model means
-#     ANY backend crashing makes the postmaster tear down and reinit
-#     shared memory and come back up on its own (restart_after_crash=on
-#     by default): that is a real architectural guarantee this harness
-#     can just observe. mariadbd has no equivalent: a UDF call
-#     segfaulting takes down the WHOLE (single, mostly-threaded) mysqld
-#     process, and nothing built into mariadbd brings it back. The
+#   * MariaDB's mariadbd has NO built-in auto-restart-after-crash.
+#     A multi-process server with an outer supervising daemon can
+#     tear down and reinit shared memory after any child crash and
+#     come back up on its own: that is a real architectural guarantee
+#     such a platform can just observe. mariadbd has no equivalent: a
+#     UDF call segfaulting takes down the WHOLE (single, mostly-threaded)
+#     mysqld process, and nothing built into mariadbd brings it back. The
 #     platform-level guarantee actually worth testing is narrower:
 #     InnoDB's own crash recovery (redo-log replay on next startup, so
 #     committed data survives); getting the PROCESS itself to come
@@ -96,8 +92,8 @@
 #     available and falls back to a small manual respawn loop if
 #     neither is found. Gate 06 verifies BOTH halves separately: (a) the
 #     supervisor actually respawns mariadbd, (b) InnoDB crash recovery
-#     leaves prior committed data intact. Do not conflate this with
-#     postgres's gate 06 claim: it is a different, weaker platform
+#     leaves prior committed data intact. Do not overstate what this
+#     gate proves: it is a different, weaker platform
 #     guarantee, tested honestly rather than assumed equivalent.
 #
 # Gates (see the header of each gate_* function below for full detail):
@@ -160,22 +156,40 @@
 #                        _NATIVE_URL/_NUM_CTX bridge into FSQL_REASONING_
 #                        HTTP_* reaches the plugin (unset, configured,
 #                        and never leaking into fractal_embed)
+#   30  fuzz_smoke       FUZZ ONLY (--fuzz, not in DEFAULT/QUICK). Builds  ~90s
+#                        + briefly runs (FSQL_FUZZ_TIME seconds each,
+#                        default 30) libFuzzer drivers against the 3
+#                        hand-rolled parsers in src/fractalsql_parse.c
+#                        (factored out of fractalsql.c specifically so
+#                        they can link standalone, no mariadbd needed):
+#                        parse_vector_csv (highest priority -- parses
+#                        fractal_embed()'s raw response from whatever
+#                        embedding endpoint FRACTALSQL_HTTP_EMBED_URL
+#                        points at, genuinely externally-adversarial
+#                        input), parse_corpus and parse_index_csv (SQL-
+#                        caller-supplied text, lower external-adversary
+#                        risk, included as defense-in-depth for the same
+#                        hand-rolled-strtod-scan class of bug). No live
+#                        cluster needed. Requires a libFuzzer-capable
+#                        clang (set FSQL_FUZZ_CC to override
+#                        auto-detection); skips cleanly if none is found.
 #
 # NOT ported, each for its own documented reason (see the architecture-
 # differences block above, not a TODO backlog):
-#   09  guc_superuser     (permanently N/A, no sysvar surface exists
+#   09  superuser-only     (permanently N/A, no sysvar surface exists
 #                          by design)
-#   postgres's 26 (a real, non-mock enterprise .so) has no 1:1 match
+#   26 (a real, non-mock enterprise .so) has no 1:1 match
 #   here in this numbering -- this repo's OWN 26/27/28 below already
 #   cover real-.so ground (activation gating, the CONNECT-queryable
-#   ledger mirror, Ed25519 signature verification), just not postgres's
-#   exact assertions, since the two Enterprise-tier implementations
-#   have genuinely diverged (see src/fractalsql_enterprise.c's header).
+#   ledger mirror, Ed25519 signature verification), just with this
+#   repo's own assertion set, since its Enterprise-tier implementation
+#   stands on its own (see src/fractalsql_enterprise.c's header).
 #
 # Gate sets:
 #   QUICK   = 01 02
 #   DEFAULT = 01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20
 #             21 22 23 24 25 29
+#   FUZZ    = 30                                       --fuzz, not part of DEFAULT (adds real wall-time)
 #   (26/27/28 stay opt-in: each needs a real, licensed enterprise .so
 #   this public repo doesn't ship -- see gate_26_enterprise_active's own
 #   header comment.)
@@ -185,10 +199,13 @@
 #   ./build_test.sh --quick
 #   ./build_test.sh --mdb 10.6
 #   ./build_test.sh --cross          # DEFAULT against every installed major
+#   ./build_test.sh --fuzz           # gate 30 only -- libFuzzer smoke, no cluster
 #   ./build_test.sh --gate 06
 #   ./build_test.sh --list
-#   ./build_test.sh --coverage       # gcov-instrumented build; DEFAULT gates
-#   ./build_test.sh --asan           # ASan-instrumented (see docker/Dockerfile.test)
+#   ./build_test.sh --coverage       # gcov-instrumented build; DEFAULT gates;
+#                                    # lcov/genhtml report after (needs lcov+genhtml on PATH)
+#   ./build_test.sh --asan           # ASan-instrumented fractalsql.so, LD_PRELOADed
+#                                    # into mariadbd (see docker/Dockerfile.test)
 #   ./build_test.sh --ubsan
 #
 # Environment:
@@ -196,10 +213,20 @@
 #   MDB_BINDIR              override mariadbd/mariadb-install-db location
 #   FSQL_TEST_TIMEOUT_MULT  scales gate 06's respawn-poll budget
 #                           (default 1; auto-defaults to 3 under
-#                           --asan/--ubsan, same rationale as postgres's
-#                           build_test.sh; unverified locally, since this
-#                           has not yet been run against real ASan/UBSan
-#                           hardware)
+#                           --asan/--ubsan; the 3x default itself is
+#                           unverified against real ASan/UBSan hardware
+#                           in this session -- bump it explicitly if
+#                           gate 06 times out on a real run)
+#   FSQL_FUZZ_CC            libFuzzer-capable clang for gate 30 (default:
+#                           auto-detect clang-18/17/16/15/clang on PATH,
+#                           probed for -fsanitize=fuzzer support before
+#                           use -- a bare `clang` shadowed by an
+#                           unrelated toolchain is a real failure mode,
+#                           not hypothetical).
+#   FSQL_FUZZ_TIME          seconds per fuzz target in gate 30 (default
+#                           30). This is a pre-push SMOKE run, not a
+#                           campaign -- bump it locally for real
+#                           crash-finding, same binaries either way.
 
 set -uo pipefail
 
@@ -210,6 +237,7 @@ TMPROOT="$(cd /tmp && pwd -P)"
 
 DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 29)
 QUICK_GATES=(01 02)
+FUZZ_GATES=(30)
 
 MDB_MAJOR="${MDB_MAJOR:-11.4}"
 MODE="default"
@@ -218,20 +246,103 @@ COVERAGE=0
 ASAN=0
 UBSAN=0
 
-if [ -n "${FSQL_TEST_TIMEOUT_MULT:-}" ]; then
-  TIMEOUT_MULT="$FSQL_TEST_TIMEOUT_MULT"
-elif [ "$ASAN" -eq 1 ] || [ "$UBSAN" -eq 1 ]; then
-  TIMEOUT_MULT=3
-else
-  TIMEOUT_MULT=1
-fi
-
 if [ -t 1 ]; then G="\033[32m"; R="\033[31m"; Y="\033[33m"; Z="\033[0m"; else G=""; R=""; Y=""; Z=""; fi
 pass() { printf "  [${G}PASS${Z}] %s\n" "$1"; }
 fail() { printf "  [${R}FAIL${Z}] %s\n" "$1"; FAILED=1; }
 skip() { printf "  [${Y}SKIP${Z}] %s\n" "$1"; }
 
 usage() { sed -n '4,160p' "$0"; exit 0; }
+
+# Copy the redirected .gcda files back next to their .gcno (one plain
+# file copy per instrumented TU, not the hot-path gcov flushing) and
+# generate an lcov report. Called once after the gate matrix finishes.
+run_coverage_report() {
+  local f found=0
+  for f in fractalsql fractalsql_parse fractalsql_session fractalsql_vector fractalsql_cognition fractalsql_textsql fractalsql_enterprise; do
+    local gcda_src
+    gcda_src="$(find "$GCOV_PREFIX" -name "${f}.gcda" 2>/dev/null | head -1)"
+    [ -n "$gcda_src" ] && { cp "$gcda_src" "src/${f}.gcda"; found=1; }
+  done
+  if [ "$found" -eq 0 ]; then
+    fail "coverage: no .gcda produced (was --coverage gate 01 build ok?)"
+    return
+  fi
+
+  if ! command -v lcov >/dev/null 2>&1; then
+    skip "coverage: lcov not installed, skipping report"
+    return
+  fi
+  lcov --capture --directory src --output-file /tmp/fractalsql_bt_coverage_raw.info \
+       --rc branch_coverage=1 >/tmp/fractalsql_bt_lcov.log 2>&1 \
+    || { fail "coverage: lcov capture failed, see /tmp/fractalsql_bt_lcov.log"; return; }
+
+  # Extract just this extension's own sources: the capture also picks up
+  # the handful of lines pulled in from system headers like mysql.h,
+  # which aren't our code and nobody's asking about their coverage.
+  lcov --extract /tmp/fractalsql_bt_coverage_raw.info '*/src/*.c' \
+       --output-file /tmp/fractalsql_bt_coverage.info \
+       --rc branch_coverage=1 >>/tmp/fractalsql_bt_lcov.log 2>&1
+
+  echo ""
+  echo "=== coverage (src/*.c) ==="
+  awk -F: '
+    /^LF:/ { lf += $2 } /^LH:/ { lh += $2 }
+    /^FNF:/ { fnf += $2 } /^FNH:/ { fnh += $2 }
+    /^BRF:/ { brf += $2 } /^BRH:/ { brh += $2 }
+    END {
+      printf "  lines:     %d/%d", lh, lf
+      if (lf > 0) printf " (%.1f%%)", 100*lh/lf
+      print ""
+      printf "  functions: %d/%d", fnh, fnf
+      if (fnf > 0) printf " (%.1f%%)", 100*fnh/fnf
+      print ""
+      printf "  branches:  %d/%d", brh, brf
+      if (brf > 0) printf " (%.1f%%)", 100*brh/brf
+      print ""
+    }' /tmp/fractalsql_bt_coverage.info
+
+  if command -v genhtml >/dev/null 2>&1; then
+    genhtml /tmp/fractalsql_bt_coverage.info --output-directory coverage_html \
+            --rc branch_coverage=1 >/tmp/fractalsql_bt_genhtml.log 2>&1 \
+      && pass "coverage: report at coverage_html/index.html" \
+      || fail "coverage: genhtml failed, see /tmp/fractalsql_bt_genhtml.log"
+  fi
+  rm -rf "$GCOV_PREFIX"
+}
+
+# Resolves a sanitizer runtime's real .so path for LD_PRELOAD (--asan /
+# --ubsan): `cc -print-file-name=libasan.so` on EL/RHEL-family distros
+# often returns a LINKER SCRIPT (ASCII text with INPUT(...) directives),
+# not an ELF -- LD_PRELOAD rejects those with "file too short". Falls
+# back to the versioned ELF resolved via ldconfig when that happens (a
+# generic gcc/clang toolchain concern, not MariaDB-specific).
+resolve_san_rt() {
+  local libname="$1"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # Best-effort, same caveat as this file's fsql_ent_platform_dir:
+    # never exercised on real Darwin hardware in this session. Apple
+    # clang has no libasan.so/libubsan.so -- compiler-rt ships a unified
+    # dylib under the active toolchain's resource dir instead.
+    local resdir; resdir="$(${CC:-cc} -print-resource-dir 2>/dev/null)"
+    [ -n "$resdir" ] || { printf ''; return; }
+    case "$libname" in
+      libasan.so)  printf '%s' "$resdir/lib/darwin/libclang_rt.asan_osx_dynamic.dylib" ;;
+      libubsan.so) printf '%s' "$resdir/lib/darwin/libclang_rt.ubsan_osx_dynamic.dylib" ;;
+      *)           printf '' ;;
+    esac
+    return
+  fi
+  local rt
+  rt="$(${CC:-cc} -print-file-name="$libname" 2>/dev/null)"
+  if [ -f "$rt" ] && ! file -b "$rt" | grep -qE 'ELF|shared object'; then
+    local stem="${libname%.so}"
+    local cand
+    cand="$(ldconfig -p 2>/dev/null \
+            | awk -v s="$stem" '$1 ~ "^"s"\\.so\\.[0-9]+$" {print $NF; exit}')"
+    [ -n "$cand" ] && [ -f "$cand" ] && rt="$cand"
+  fi
+  printf '%s' "$rt"
+}
 
 # Platform-correct include/<dir>/ subdir + shared-library extension for
 # the vendored enterprise artifact, used by gates 26/27/28. Mirrors this
@@ -265,26 +376,57 @@ while [ $# -gt 0 ]; do
     --cross)   MODE="cross" ;;
     --mdb)     MDB_MAJOR="$2"; shift ;;
     --gate)    ONE_GATE="$2"; shift ;;
+    --fuzz)    MODE="fuzz" ;;
     --coverage) COVERAGE=1 ;;
     --asan)    ASAN=1 ;;
     --ubsan)   UBSAN=1 ;;
-    --list)    printf "gates: %s\n" "${DEFAULT_GATES[*]}"; exit 0 ;;
+    --list)    printf "gates: %s\nfuzz gates: %s\n" "${DEFAULT_GATES[*]}" "${FUZZ_GATES[*]}"; exit 0 ;;
     -h|--help) usage ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
+# Must run AFTER the arg-parsing loop above -- ASAN/UBSAN/COVERAGE are
+# still 0 at the point this file declares them, so checking them any
+# earlier (as a prior version of this block did) always took the
+# unset-flags branch even when --asan/--ubsan/--coverage was actually
+# passed on the command line. Caught via a real Docker run: --coverage
+# hit "GCOV_PREFIX: unbound variable" in run_coverage_report because
+# this export never fired, and --asan's TIMEOUT_MULT never actually
+# auto-bumped to 3 either.
+if [ -n "${FSQL_TEST_TIMEOUT_MULT:-}" ]; then
+  TIMEOUT_MULT="$FSQL_TEST_TIMEOUT_MULT"
+elif [ "$ASAN" -eq 1 ] || [ "$UBSAN" -eq 1 ]; then
+  TIMEOUT_MULT=3
+else
+  TIMEOUT_MULT=1
+fi
+
+# --coverage: redirect gcov's live .gcda writes to /tmp for the run, so
+# mariadbd (which loads the instrumented fractalsql.so and every other
+# instrumented .o linked into it) writes there instead of next to the
+# checkout. GCOV_PREFIX_STRIP counts path components to drop from the
+# .gcno-embedded absolute path before prefixing with GCOV_PREFIX --
+# computed from $HERE's own depth so this isn't hardcoded to one
+# checkout location. Exported unconditionally (harmless no-op without a
+# --coverage build); mdb_setup's mariadbd/mysqld_safe launch inherits it
+# since it forks from this same shell.
+if [ "$COVERAGE" -eq 1 ]; then
+  export GCOV_PREFIX="/tmp/fractalsql_bt_gcov_$$"
+  export GCOV_PREFIX_STRIP=$(( $(echo "$HERE" | tr -cd '/' | wc -c) ))
+  mkdir -p "$GCOV_PREFIX"
+fi
+
 FAILED=0
 BIN=""; DATADIR=""; SOCK=""; PORT=""; PIDFILE=""; PLUGDIR=""; SUPERVISOR_PID=""; MOCK_LLM_PID=""
 CRASH_SO=""
 
 # mdb_bindir <major> -- locates mariadbd + mariadb-install-db +
-# mariadb-admin + mysqld_safe for the requested major. Mirrors
-# postgres's build_test.sh's pg_bindir() shape (env override, then
-# Darwin/Homebrew, then Linux system paths) but MariaDB's own packaging
-# does NOT install per-major binaries side-by-side the way Postgres's
-# postgresql-<N> packages do: one system normally has exactly one
+# mariadb-admin + mysqld_safe for the requested major. Resolution
+# order: env override, then Darwin/Homebrew, then Linux system paths.
+# MariaDB's own packaging
+# does NOT install per-major binaries side-by-side: one system normally has exactly one
 # mariadbd on PATH at a time (matching MDB_MAJOR is the caller's/CI's
 # job: run this against a matching official Docker image, or a host
 # with only that major's packages installed, see
@@ -295,8 +437,8 @@ mdb_bindir() {
     return
   fi
   if [ "$(uname -s)" = "Darwin" ]; then
-    # Homebrew's mariadb formula is NOT per-major the way postgresql@<N>
-    # is (confirmed: no mariadb@10.6/mariadb@11.4 formulae exist as of
+    # Homebrew's mariadb formula is NOT versioned by major
+    # (confirmed: no mariadb@10.6/mariadb@11.4 formulae exist as of
     # this writing) -- `brew install mariadb` gives whatever major
     # Homebrew currently tracks. This means macOS CI cannot enforce the
     # same per-major matrix Linux/Windows get; see build-test.yml's
@@ -413,9 +555,8 @@ mdb_setup() {
 
   # Reasoning-VFS-ABI-level test fixtures for gates 05/07/14/15/18 (see
   # tests/*.c's own file headers): pure C against the shared vendored
-  # fractalsql_sql.h, portably copied from fractalsql-postgresql's own
-  # tests/ (that repo's evil/retry plugins reference no postgres- or
-  # mariadb-specific API at all). -Iinclude/<platform> gives
+  # fractalsql_sql.h (the evil/retry fixtures reference no
+  # server-specific API at all). -Iinclude/<platform> gives
   # fractalsql_sql.h/fractalsql.h; $mdb_cflags is NOT needed for these
   # (they never include mysql.h), unlike CRASH_SO above. Recompiled
   # every mdb_setup call since mdb_teardown wipes the whole $PLUGDIR.
@@ -443,6 +584,29 @@ mdb_setup() {
   "$installdb_bin" --datadir="$DATADIR" --auth-root-authentication-method=normal \
     >/tmp/fractalsql_bt_setup_${v//./_}.log 2>&1 \
     || { tail -30 /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
+
+  # --asan/--ubsan: fractalsql.so was just built with -fsanitize=... by
+  # gate_01_build, but mariadbd itself (a plain, non-instrumented binary
+  # from the target major's own package/image) has to be told to load
+  # the matching sanitizer runtime BEFORE it starts, or the dlopen'd
+  # instrumented code fails with undefined __asan_*/__ubsan_* symbols.
+  # LD_PRELOAD, exported here (function-scoped, not global -- so the
+  # fixture `cc` compiles just above are never preloaded with it),
+  # reaches mariadbd through mysqld_safe's own exec chain below.
+  if [ "$ASAN" -eq 1 ]; then
+    local asan_rt; asan_rt="$(resolve_san_rt libasan.so)"
+    [ -n "$asan_rt" ] && [ -f "$asan_rt" ] || { echo "ERROR: could not resolve libasan.so runtime" >&2; return 2; }
+    export LD_PRELOAD="$asan_rt"
+    export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
+  elif [ "$UBSAN" -eq 1 ]; then
+    local ubsan_rt; ubsan_rt="$(resolve_san_rt libubsan.so)"
+    if [ -n "$ubsan_rt" ] && [ -f "$ubsan_rt" ]; then
+      export LD_PRELOAD="$ubsan_rt"
+    elif [ "$(uname -s)" != "Darwin" ]; then
+      echo "ERROR: could not resolve libubsan.so runtime" >&2; return 2
+    fi
+    export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+  fi
 
   # Modern MariaDB packaging (confirmed directly: mariadb:11.4 official
   # image) renamed mysqld_safe -> mariadbd-safe; check both names since
@@ -526,8 +690,8 @@ cleanup() {
 trap cleanup EXIT
 
 # Restart mariadbd with FRACTALSQL_REASONING_PLUGIN pointed at $1
-# instead of the real HTTP wrapper -- mirrors postgres's pg_swap_plugin,
-# restart-based (not a live SET) since FRACTALSQL_REASONING_PLUGIN is a
+# instead of the real HTTP wrapper -- a restart-based swap
+# (not a live SET) since FRACTALSQL_REASONING_PLUGIN is a
 # process environment variable read once at mysqld startup, the same
 # constraint gates 26/27/28 already work around for
 # FRACTALSQL_ENTERPRISE_LIB. Extra env assignments (e.g.
@@ -612,15 +776,9 @@ gate_01_build() {
   [ "$COVERAGE" -eq 1 ] && cov_arg="COVERAGE=1"
   [ "$ASAN" -eq 1 ]  && san_arg="ASAN=1"
   [ "$UBSAN" -eq 1 ] && san_arg="UBSAN=1"
-  # NOTE: Makefile does not currently define COVERAGE=1/ASAN=1/UBSAN=1
-  # targets (unlike postgres's PGXS-driven Makefile, which passes these
-  # straight through to PG_CPPFLAGS/SHLIB_LINK). A follow-up should
-  # extend Makefile's CFLAGS/LDFLAGS to honor these the same way
-  # docker/Dockerfile.test's FSQL_SAN_MODE build-arg expects. Until
-  # then, --coverage/--asan/--ubsan build the SAME unsanitized binary
-  # as a plain `make`, so gate 06's supervisor-respawn assertion still
-  # runs, but it is not actually exercising instrumented code. Flagged
-  # here rather than silently no-op'd.
+  # Makefile's own ifdef COVERAGE/ASAN/UBSAN blocks (CFLAGS/LDFLAGS)
+  # honor these -- see its own comment for what gets instrumented
+  # (every extension TU; the vendored core archive is linked in as-is).
   if make $cov_arg $san_arg >/tmp/fractalsql_bt_build.log 2>&1 && [ -f "$HERE/fractalsql.so" ]; then
     pass "01 build"
   else
@@ -638,7 +796,7 @@ gate_02_smoke() {
   [ -n "$ed" ] && ! grep <<< "$ed" -q "ERROR" && pass "02 smoke: edition=$ed" || fail "02 smoke: edition='$ed'"
 
   # fractal_search(vector_csv, query_csv, k, params) -> JSON string.
-  # Convergence check mirrors postgres's gate 02: cosine similarity of
+  # Convergence check: cosine similarity of
   # best_point to the query should be ~1 (best_point lies on the ray
   # through the origin and the query for a cosine-distance objective).
   local r; r=$("${MARIADB[@]}" -N -e "
@@ -654,11 +812,10 @@ gate_02_smoke() {
 }
 
 # Deliberately-segfaulting UDF. See this script's top-of-file
-# architecture-differences comment for why this is NOT the same claim
-# as postgres's gate 06: it tests (a) the supervisor respawns
+# architecture-differences comment for the platform claim this gate
+# makes: (a) the supervisor respawns
 # mariadbd, (b) InnoDB crash recovery leaves prior committed data
-# intact. Uses a plain InnoDB table + row as the "canary", same
-# technique as postgres's gate 06.
+# intact. Uses a plain InnoDB table + row as the "canary".
 gate_06_crash_recovery() {
   "${MARIADB[@]}" -e "
     CREATE DATABASE IF NOT EXISTS bt;
@@ -673,12 +830,13 @@ gate_06_crash_recovery() {
   " >/dev/null 2>&1
 
   local r; r=$("${MARIADB[@]}" -N -e "SELECT bt_evil_crash();" 2>&1)
-  # MariaDB 12.2's client reports an abrupt mid-query disconnect as a
+  # The 12.x client reports an abrupt mid-query disconnect as a
   # TLS/SSL error ("unexpected eof while reading") rather than the
   # classic "Lost connection to MySQL server" text 10.6-11.4 use --
-  # caught live (a real, version-specific error-message difference, not
-  # a functional regression: the respawn + data-integrity assertions
-  # right after this one still passed on 12.2 unchanged).
+  # caught live on 12.2 (a real, version-specific error-message
+  # difference, not a functional regression: the respawn +
+  # data-integrity assertions right after this one still passed on
+  # 12.x unchanged).
   if echo "$r" | grep -qiE "lost connection|server has gone away|can't connect|tls/ssl error|unexpected eof"; then
     pass "06 crash_recovery: triggering connection dropped as expected"
   else
@@ -710,11 +868,10 @@ gate_06_crash_recovery() {
 }
 
 gate_11_scout() {
-  # 3-cluster inline corpus (mirrors postgres's gate 11 shape, adapted
-  # to fractal_explore's inline-CSV-corpus signature rather than a
+  # 3-cluster inline corpus, shaped for fractal_explore's
+  # inline-CSV-corpus signature rather than a
   # table+column scan. fractal_explore(corpus_csv, query_csv, params)
-  # has no table-scan mode in this repo's architecture, unlike
-  # postgres's fractal_search_explore(table_name, vector_col, ...)).
+  # has no table-scan mode in this repo's architecture by design.
   local corpus="["
   local i
   for i in $(seq 1 20); do corpus+="[1,0,0],"; done
@@ -749,8 +906,8 @@ gate_11_scout() {
 }
 
 # fractal_search's k bounds (1..1000000, checked at UDF init time) and
-# MAX_QUERY_BYTES (4 MiB) rejection. Mirrors postgres's gate 19
-# validate_sfs_params() bounds check, scoped to what fractal_search
+# MAX_QUERY_BYTES (4 MiB) rejection -- a bounds-check gate, scoped to
+# what fractal_search
 # actually validates today (see the bounds check in
 # fractal_search()/fractal_explore() in src/fractalsql.c).
 gate_19_sfs_bounds() {
@@ -849,25 +1006,24 @@ gate_04_text_to_sql() {
 }
 
 # Adversarial reasoning plugin returning a non-NUL-terminated response
-# flush against a guard page (tests/evil_nonterminating_plugin.c,
-# copied verbatim from fractalsql-postgresql's tests/ -- pure C against
-# the shared vendored fractalsql_sql.h, no postgres/mariadb-specific
-# API). Proves fractal_t2s_generate/fractal_reason/fractal_t2s_review
+# flush against a guard page (tests/evil_nonterminating_plugin.c --
+# pure C against the shared vendored fractalsql_sql.h, no
+# server-specific API). Proves fractal_t2s_generate/fractal_reason/fractal_t2s_review
 # all honor response_len_out and never treat `summary` as a NUL-
 # terminated C string, at all three call sites that dispatch through
 # fsql_dispatch_ai.
 #
 # IMPORTANT MariaDB-specific design note: the evil plugin's call_count
-# is a process-wide static (matches postgres's plugin file verbatim),
-# but unlike postgres (one fresh forked backend process per connection,
-# so a fresh psql -c invocation gets call_count=0 again) MariaDB is ONE
-# shared process for every connection -- call_count keeps incrementing
+# is a process-wide static, but MariaDB is ONE
+# shared process for every connection (a per-connection process model
+# would dlopen the plugin fresh for each new connection, resetting
+# call_count to 0) -- call_count keeps incrementing
 # across every UDF call in the process's lifetime, connection or not.
 # So this gate restarts mariadbd (via mdb_swap_reasoning_plugin) before
 # EACH of the three call sites, not once for the whole gate: only that
 # guarantees call_count=0 (matching FSQL_EVIL_TRIGGER_CALL's default,
-# trigger=1) at every site actually under test, the same guarantee
-# postgres gets for free from fork-per-backend. Slower (3 restarts
+# trigger=1) at every site actually under test, the guarantee a
+# per-connection process model gets for free. Slower (3 restarts
 # instead of 1) but the only way this is correct here.
 gate_05_evil_overread() {
   mdb_swap_reasoning_plugin "$EVIL_REASONING_SO" \
@@ -896,12 +1052,11 @@ gate_05_evil_overread() {
 
 # Same three call sites as gate 05, but the adversarial claim is a
 # lying response_len_out (32 MiB, over a real 8-byte buffer) instead of
-# a missing NUL terminator (tests/evil_lying_length_plugin.c, verbatim
-# from postgres) -- proves the length-bound check (FRACTAL_MAX_AI_
+# a missing NUL terminator (tests/evil_lying_length_plugin.c) --
+# proves the length-bound check (FRACTAL_MAX_AI_
 # RESPONSE_BYTES, src/fractalsql_cognition.c / fractalsql_textsql.c)
 # rejects BEFORE any read past the real 8-byte buffer, not just that
-# nothing crashes. Unlike postgres's grep for "implausible response
-# length" (a live error message), MariaDB's UDF ABI has no SQL-visible
+# nothing crashes. MariaDB's UDF ABI has no SQL-visible
 # error text for this class of rejection (see this file's own header
 # comment on *error=1 collapsing to a silent NULL) -- so the assertion
 # here is "result IS NULL, mariadbd still up", the same two-part check
@@ -950,17 +1105,14 @@ gate_07_evil_lying_length() {
 
 # fractal_schema_context's privilege boundary: a role with no grant on
 # a table must not see its column/comment/FK structure via schema
-# introspection, and a grant must restore visibility. Same regression
-# CLASS postgres's gate 08 proves for its own has_table_privilege
-# bypass bug -- ported here as a confirmatory test (not assumed safe
+# introspection, and a grant must restore visibility. A confirmatory
+# test for the privilege-bypass regression class (not assumed safe
 # from reading the code), since this file's own header previously only
 # asserted, not verified, that MariaDB's information_schema-backed
 # INVOKER security handles this: information_schema.columns/tables
 # themselves already filter by the CONNECTED user's privileges (a
 # property of the catalog, not of fractal_schema_context's own SQL),
-# unlike postgres's pg_attribute/pg_constraint, which are globally
-# readable catalogs postgres's fractal_schema_context had to add an
-# explicit has_table_privilege() check for.
+# so no extra explicit privilege check is needed inside the routine.
 gate_08_authz() {
   "${MARIADB[@]}" -e "
     DROP TABLE IF EXISTS bt_secret;
@@ -1009,9 +1161,8 @@ gate_08_authz() {
 
 # Retry-with-feedback: fractal_text_to_sql's own internal attempt_loop
 # (sql/install_udf.sql), driven by FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS
-# (env var, this port's equivalent of postgres's fractalsql.text_to_
-# sql_max_attempts GUC). tests/retry_reasoning_plugin.c (verbatim from
-# postgres) returns a rejected DDL statement on GENERATE call 1, then
+# (env var). tests/retry_reasoning_plugin.c returns a rejected DDL
+# statement on GENERATE call 1, then
 # "SELECT 1" on call 2 -- exercising the loop's v_feedback-into-v_prompt
 # rebuild branch, which every other gate leaves untouched (they all run
 # at the default max_attempts, but never hit a REJECTED first attempt
@@ -1115,7 +1266,7 @@ gate_10_dos_and_injection() {
 }
 
 # 30x fractal_search in a row. No crash, no leak-driven slowdown.
-# Lightweight stand-in for postgres's soak gate (same idea: repeated
+# Same soak idea (repeated
 # calls hold up), scoped to what's cheap to run in CI (no LLM).
 gate_12_soak() {
   local i ok=1
@@ -1155,10 +1306,9 @@ gate_13_vectorizer_embed() {
 # path against the real HTTP mock) plus the vectorizer's injection/
 # double-create rejections. NULL input and a nonexistent plugin path
 # both collapse to a silent NULL under MariaDB's UDF ABI (no SQL-visible
-# error text the way postgres's psql output greps for "must not be
-# NULL"/"failed to load reasoning plugin") -- the assertions here are
+# error text for this class of rejection) -- the assertions here are
 # "result IS NULL, mariadbd still up", matching gate 07's posture.
-# tests/evil_embed_plugin.c (verbatim from postgres) returns
+# tests/evil_embed_plugin.c returns
 # MAX_EMBED_DIM+1 (16385) floats as a bracketed JSON array straight
 # through the reasoning-VFS-ABI generate() callback (no HTTP-wrapper
 # JSON-unwrapping in between, unlike the real plugin) -- proves
@@ -1312,7 +1462,7 @@ gate_16_embed_authz() {
 # queue -- mirrors gate 12's soak pattern (background subshells, one
 # process per worker). Proves the atomic claim-UPDATE (sql/install_udf
 # .sql's own header comment, divergence 4: an UPDATE...JOIN...LIMIT
-# claim instead of postgres's SELECT...FOR UPDATE SKIP LOCKED) actually
+# claim rather than a row-locking SELECT claim) actually
 # gives each row to exactly one worker under real concurrent callers,
 # not just in isolation.
 EMBED_SOAK_ROWS=60
@@ -1382,17 +1532,17 @@ gate_17_embed_soak() {
 # gate 06 already uses, which has nothing to do with the reasoning
 # path). MariaDB-specific finding, verified against sql/install_udf
 # .sql's actual fractal_vectorizer_process_queue body (not assumed from
-# postgres's equivalent claim): unlike postgres, where the WHOLE PL/
-# pgSQL function body is one implicit transaction so a mid-call crash
-# reverts every row it touched back to 'pending', a MariaDB stored
-# PROCEDURE has no such wrapping -- each UPDATE inside the per-row loop
+# reading it): a MariaDB stored
+# PROCEDURE body is not wrapped in one implicit transaction the way
+# some engines wrap a whole procedure call -- each UPDATE inside the
+# per-row loop
 # autocommits on its own. So a crash mid-batch leaves the CURRENT row
 # genuinely stuck in 'processing' (not reverted), exactly the case
 # stale_after_secs exists to reclaim -- the correct, MariaDB-real
 # recovery path is "the next process_queue call (with a short
 # stale_after) reclaims and reprocesses it," not "the row reverted on
-# its own." This gate proves THAT claim, not postgres's, since they are
-# genuinely different guarantees on the two platforms.
+# its own." This gate proves THAT claim, since it is the guarantee
+# this platform actually gives.
 gate_18_embed_crash() {
   # Swap plugin BEFORE creating the fixture table: mdb_swap_reasoning_
   # plugin restarts via mdb_teardown+mdb_setup, which brings up a FRESH
@@ -1870,7 +2020,7 @@ gate_28_enterprise_signature() {
                       || fail "28 enterprise_signature: expected NULL (refused), got: $r3"
 
   # Phase 4: missing .sig + REQUIRE_SIGNATURE unset -- loads unverified
-  # (backward-compatible default, matching postgres's own default).
+  # (backward-compatible default).
   mdb_teardown
   unset FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE
   mdb_setup "$MDB_MAJOR" >/dev/null 2>&1
@@ -1884,6 +2034,95 @@ gate_28_enterprise_signature() {
   mdb_setup "$MDB_MAJOR" >/dev/null 2>&1
 }
 
+# FUZZ only -- not in DEFAULT or QUICK, run via --fuzz. No live cluster
+# needed: builds + briefly runs libFuzzer drivers against the three
+# hand-rolled parsers this repo has that read externally-influenceable
+# text into a fixed-size buffer (src/fractalsql_parse.c -- factored out
+# of src/fractalsql.c specifically so these can be linked standalone,
+# without mysql.h/a running mariadbd; see that file's own header
+# comment). parse_vector_csv is the highest-priority target: it parses
+# fractal_embed()'s raw response from whatever embedding endpoint
+# FRACTALSQL_HTTP_EMBED_URL points at, i.e. genuinely attacker-
+# controlled bytes if that endpoint is malicious or merely buggy. The
+# other two (parse_corpus, parse_index_csv) parse SQL-caller-supplied
+# text (fractal_search's corpus argument, the Analytics-tier edge/face
+# index arguments) -- lower external-adversary risk, included as
+# defense-in-depth for the same hand-rolled-strtod-scan class of bug.
+#
+# This is a SMOKE run (FSQL_FUZZ_TIME seconds per target, default 30),
+# not a real fuzzing campaign -- it exists to catch a regression before
+# push. Run a real multi-hour campaign locally (same binaries, higher
+# -max_total_time) before relying on this gate to have found everything.
+gate_30_fuzz_smoke() {
+  local cc="${FSQL_FUZZ_CC:-}"
+  if [ -z "$cc" ]; then
+    local candidate
+    for candidate in clang-18 clang-17 clang-16 clang-15 clang; do
+      if command -v "$candidate" >/dev/null 2>&1; then cc="$candidate"; break; fi
+    done
+  fi
+  if [ -z "$cc" ] || ! command -v "$cc" >/dev/null 2>&1; then
+    skip "30 fuzz_smoke (no clang found -- set FSQL_FUZZ_CC to a libFuzzer-capable clang)"
+    return
+  fi
+  # The clang resolved above might not actually have libFuzzer support
+  # (e.g. a bare `clang` shadowed by an unrelated toolchain's shim) --
+  # verify with a trivial compile before trusting it for the real
+  # targets, rather than failing confusingly three functions down.
+  local probe_src probe_bin
+  probe_src="$(mktemp /tmp/fractalsql_bt_fuzzprobe_XXXXXX.c)"
+  probe_bin="${probe_src%.c}"
+  printf 'int LLVMFuzzerTestOneInput(const unsigned char*d,unsigned long n){(void)d;(void)n;return 0;}\n' > "$probe_src"
+  if ! "$cc" -fsanitize=fuzzer "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    rm -f "$probe_src" "$probe_bin"
+    skip "30 fuzz_smoke ($cc lacks -fsanitize=fuzzer support -- set FSQL_FUZZ_CC)"
+    return
+  fi
+  rm -f "$probe_src" "$probe_bin"
+
+  local fuzz_time="${FSQL_FUZZ_TIME:-30}"
+  mkdir -p /tmp/fractalsql_bt_fuzz
+
+  local target
+  for target in parse_vector_csv parse_corpus parse_index_csv; do
+    local bin="/tmp/fractalsql_bt_fuzz/fuzz_$target"
+    local buildlog="/tmp/fractalsql_bt_fuzz_${target}_build.log"
+    if ! "$cc" -std=c99 -O1 -g -fsanitize=fuzzer,address -fno-sanitize-recover=address \
+        -Isrc \
+        src/fractalsql_parse.c "tests/fuzz/fuzz_${target}.c" \
+        -o "$bin" >"$buildlog" 2>&1; then
+      fail "30 fuzz_smoke: $target -- build failed, see $buildlog"
+      continue
+    fi
+
+    local runlog="/tmp/fractalsql_bt_fuzz_${target}_run.log"
+    # symbolize=0: this is a pre-push smoke run, not a crash-triage
+    # session -- a crash still saves its input to disk for offline
+    # repro (with full symbolization) via `$bin <crash-file>` (see the
+    # fail message below). Without this, the FIRST new-coverage event
+    # (libFuzzer's "NEW_FUNC" print) makes the sanitizer runtime spawn
+    # an external llvm-symbolizer subprocess to resolve the address --
+    # confirmed hanging indefinitely under this repo's own sandboxed
+    # dev environment (near-zero CPU usage while blocked, reproduced
+    # identically with and without -fsanitize=address, and NOT
+    # reproducible as a real infinite loop in parse_vector_csv/
+    # parse_corpus/parse_index_csv themselves via 5M+ direct fuzz-style
+    # calls against each function with a wall-clock alarm(); confirmed
+    # fixed by this exact env var). Cheap, safe insurance against the
+    # same class of subprocess-spawn restriction on a locked-down CI
+    # runner, not just this one sandbox.
+    if ASAN_OPTIONS=detect_leaks=0:symbolize=0 UBSAN_OPTIONS=symbolize=0 \
+        "$bin" -max_total_time="$fuzz_time" -print_final_stats=1 \
+        "tests/fuzz/corpus_${target}/" >"$runlog" 2>&1; then
+      local execs; execs=$(grep -o "number_of_executed_units: [0-9]*" "$runlog" | grep -o "[0-9]*")
+      pass "30 fuzz_smoke: $target -- ${fuzz_time}s clean (${execs:-?} execs, no crash)"
+    else
+      fail "30 fuzz_smoke: $target -- crash/hang found, see $runlog (repro: $bin <crash-file>)"
+    fi
+    rm -f "$bin"
+  done
+}
+
 # --- run ------------------------------------------------------------
 
 run_major() {
@@ -1892,6 +2131,10 @@ run_major() {
   printf "== MariaDB %s ==\n" "$v"
 
   for g in "${gates[@]}"; do [ "$g" = "01" ] && gate_01_build; done
+  # Gate 30 (fuzz smoke) is standalone like gate 01 -- links only
+  # src/fractalsql_parse.c directly, no extension .so, no mariadbd,
+  # no cluster at all.
+  for g in "${gates[@]}"; do [ "$g" = "30" ] && gate_30_fuzz_smoke; done
 
   local need_db=0
   for g in "${gates[@]}"; do
@@ -1941,10 +2184,14 @@ if [ -n "$ONE_GATE" ]; then
 elif [ "$MODE" = "quick" ]; then
   run_major "$MDB_MAJOR" "${QUICK_GATES[@]}"
 elif [ "$MODE" = "cross" ]; then
-  for v in 10.6 10.11 11.4 12.2; do run_major "$v" "${DEFAULT_GATES[@]}"; done
+  for v in 10.6 10.11 11.4 12.3; do run_major "$v" "${DEFAULT_GATES[@]}"; done
+elif [ "$MODE" = "fuzz" ]; then
+  run_major "$MDB_MAJOR" "${FUZZ_GATES[@]}"
 else
   run_major "$MDB_MAJOR" "${DEFAULT_GATES[@]}"
 fi
+
+[ "$COVERAGE" -eq 1 ] && run_coverage_report
 
 echo ""
 if [ "$FAILED" -eq 0 ]; then printf "${G}build_test: PASS${Z}\n"; exit 0

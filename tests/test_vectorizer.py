@@ -13,7 +13,7 @@ malformed-response handling, pause/resume gating, the rate-window cap,
 and SQL-injection-safety of the dynamic per-table trigger/backfill SQL
 fractal_vectorizer_create()/_process_queue() build.
 
-MariaDB port of fractalsql-postgresql's test_vectorizer.py. Structural
+Structural
 differences:
   - No native float8[] column type: embeddings are TEXT holding a
     fractal_vector JSON-array-string, so results are json.loads()'d

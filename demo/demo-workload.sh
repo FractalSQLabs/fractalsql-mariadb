@@ -235,7 +235,7 @@ worker() {
                         1, '{\"iterations\":30,\"population_size\":30}');" 2>&1) ;;
             scout)
                 # fractal_explore(corpus, query, params) takes the whole
-                # corpus inline (no SPI/table-scanning UDF in MariaDB's
+                # corpus inline (no table-scanning UDF exists in MariaDB's
                 # C ABI). Aggregate wl_vectors into that shape first,
                 # same pattern benchmark.sql's @bench_corpus uses. Both
                 # SET statements and the SELECT must share one client

@@ -14,7 +14,7 @@
  *   exactly match the running server's own compiled MYSQL_VERSION_ID,
  *   down to the patch level, before INSTALL SONAME will accept the
  *   library. A single prebuilt fractalsql.so could never be installed
- *   this way across this repo's 10.6 to 12.2 compatibility matrix, or
+ *   this way across this repo's 10.6 to 12.3 compatibility matrix, or
  *   even across patch releases of one major, the way every CREATE
  *   FUNCTION ... SONAME UDF in this library already is: it would need a
  *   rebuild per exact target MariaDB version, breaking the
@@ -111,6 +111,8 @@
 #  define FRACTAL_EXPORT
 #endif
 
+#include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
+
 #define SFS_INIT_ERROR(msg, ...) \
     (snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__))
 
@@ -183,7 +185,7 @@ str_out_generic_deinit(UDF_INIT *initid)
 static char *
 format_vector_json(str_out_ctx *so, const float *v, size_t dim, unsigned long *out_len)
 {
-    size_t need = dim * 17 + 4;
+    size_t need = dim * 32 + 8;
     size_t pos;
 
     if (!str_out_ensure(so, need)) return NULL;

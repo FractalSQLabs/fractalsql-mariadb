@@ -13,6 +13,7 @@
 
 #include "fractalsql_session.h"
 #include "fractalsql_enterprise.h"
+#include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -53,6 +54,13 @@ typedef struct fsql_session_entry {
     fsql_ctx                   *t2s_ctx;
     bool                         t2s_loaded;
     int                          refcount;
+    /* Exclusive-use pin for the main `ctx` slot (see
+     * fractal_session_acquire_exclusive). The core's fsql_search_ptr is
+     * not safe for concurrent searches on the SAME ctx, so an entry
+     * running a search under a shared/misused session_id is marked busy;
+     * a second exclusive acquire of that id then fails fast instead of
+     * racing the core. Checked alongside refcount by every destroy path. */
+    int                          busy;
     time_t                       last_used;
     struct fsql_session_entry  *bucket_next;
     struct fsql_session_entry  *lru_prev;  /* toward most-recently-used */
@@ -162,7 +170,8 @@ sweep_stale(int limit)
     int scanned = 0;
     while (e && scanned < limit) {
         fsql_session_entry *prev = e->lru_prev;
-        if (e->refcount == 0 && (now - e->last_used) >= FSQL_SESSION_IDLE_TTL_SECONDS) {
+        if (e->refcount == 0 && e->busy == 0 &&
+            (now - e->last_used) >= FSQL_SESSION_IDLE_TTL_SECONDS) {
             bucket_unlink(e);
             lru_unlink(e);
             entry_destroy(e);
@@ -180,7 +189,7 @@ evict_one_lru(void)
     fsql_session_entry *e = g_lru_tail;
     while (e) {
         fsql_session_entry *prev = e->lru_prev;
-        if (e->refcount == 0) {
+        if (e->refcount == 0 && e->busy == 0) {
             bucket_unlink(e);
             lru_unlink(e);
             entry_destroy(e);
@@ -308,6 +317,73 @@ fractal_session_acquire_reason(unsigned long long session_id, bool *out_loaded)
     return ctx;
 }
 
+/* Exclusive-use acquire of session_id's Diversify/search ctx, for
+ * fractal_search()/fractal_explore() (see fractalsql.c). Same
+ * acquire/create/refcount/LRU contract as fractal_session_acquire, plus:
+ *   1. The entry is marked busy for the duration of the call, and
+ *      release_exclusive clears it. Busy entries are never destroyed by
+ *      sweep/eviction/registry_close, exactly like refcounted ones.
+ *   2. If the entry ALREADY has an outstanding exclusive acquire (another
+ *      connection running a search on the same, shared session_id), this
+ *      refuses up front: *out_busy is set to true and NULL returned,
+ *      rather than two threads running concurrent fsql_search_ptr calls
+ *      on the same non-thread-safe core ctx. Callers turn that into a
+ *      clean per-row error; it is not silently downgraded to the
+ *      stateless fallback, since that would silently drop the session's
+ *      Diversify state and return different semantics than documented.
+ * Release with fractal_session_release_exclusive exactly once, which
+ * clears the busy flag and drops the refcount in one step. */
+fsql_ctx *
+fractal_session_acquire_exclusive(unsigned long long session_id, bool *out_busy)
+{
+    if (out_busy) *out_busy = false;
+
+    session_lock();
+    sweep_stale(FSQL_SESSION_SWEEP_SCAN_LIMIT);
+
+    fsql_session_entry *e = find_entry(session_id);
+    if (e != NULL && e->busy) {
+        if (out_busy) *out_busy = true;
+        session_unlock();
+        return NULL;
+    }
+
+    e = find_or_create_entry_locked(session_id);
+    if (e == NULL) { session_unlock(); return NULL; }
+    e->busy = 1;
+
+    /* Sovereign tier and ledger VFS for the same reason as
+     * fractal_session_acquire above. */
+    if (e->ctx == NULL) {
+        e->ctx = fsql_new_sovereign(fractal_ledger_storage_vfs(), NULL);
+        if (e->ctx == NULL) {
+            if (e->refcount > 0) e->refcount--;
+            e->busy = 0;
+            session_unlock();
+            return NULL;
+        }
+    }
+
+    fsql_ctx *ctx = e->ctx;
+    session_unlock();
+    return ctx;
+}
+
+/* Release an exclusive acquire: clears the busy pin and drops the
+ * refcount under one lock hold. Safe to call on an id with no live
+ * entry (no-op, defensive only). */
+void
+fractal_session_release_exclusive(unsigned long long session_id)
+{
+    session_lock();
+    fsql_session_entry *e = find_entry(session_id);
+    if (e) {
+        e->busy = 0;
+        if (e->refcount > 0) e->refcount--;
+    }
+    session_unlock();
+}
+
 /* Same as fractal_session_acquire_reason but for fractal_embed()'s
  * ctx slot. See fsql_session_entry's field comment for why this is a
  * separate slot rather than sharing reason_ctx. */
@@ -411,7 +487,7 @@ fractal_session_registry_close(unsigned long long session_id)
 {
     session_lock();
     fsql_session_entry *e = find_entry(session_id);
-    if (e && e->refcount == 0) {
+    if (e && e->refcount == 0 && e->busy == 0) {
         bucket_unlink(e);
         lru_unlink(e);
         entry_destroy(e);

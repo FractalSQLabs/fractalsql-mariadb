@@ -26,7 +26,7 @@
 --   2. SOURCE sql/install_agents.sql;   (fractal_agent_network_coverage_alert,
 --      fractal_agent_regime_triage, fractal_agent_recommend_diverse --
 --      sections 0-1 need nothing else)
---   3. Reasoning configured (see docs/COOKBOOK.md) -- Sections 2 and 3's
+--   3. Reasoning configured (see docs/reasoning-setup.md) -- Sections 2 and 3's
 --      presets call fractal_reason internally. Confirm before running:
 --        SELECT fractal_reason(CONNECTION_ID(), 'reply with a short confirmation');
 --

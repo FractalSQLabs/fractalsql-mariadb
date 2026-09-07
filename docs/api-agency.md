@@ -4,7 +4,7 @@
 
 # Sovereign Agency
 
-FractalSQL ships **fifteen installable agents**: autonomous, self-correcting
+FractalSQL ships **sixteen installable agents**: autonomous, self-correcting
 routines that compose the extension's Discovery, Analytics, and Cognition
 primitives into end-to-end workflows. Each agent is a *recipe* for a
 recurring agentic pattern: "drift on a metric series," "match a task to the
@@ -20,24 +20,15 @@ see [Composing your own](#composing-your-own) and
 [Building blocks](#building-blocks-the-primitives-agents-compose) further
 down.
 
-> **Fifteen recipes.** `diverse_portfolios` (Engine P) needs
-> `fractal_optimize_portfolio_multimodal`, an enterprise-tier primitive
-> dlopen'd from the enterprise core `.so` (see [`enterprise.md`](enterprise.md)),
-> that isn't available here. Engine P is skipped outright
-> (see `sql/install_agents.sql`'s own header comment) rather than shipped
-> half-working.
-
 > **Every "installable agent" here is a stored PROCEDURE, not a function.**
-> This is the single biggest structural difference from postgres's version
-> of this page. MariaDB's C UDF ABI has no SPI (a C function can't run SQL
-> against the caller's tables) and no table-returning functions at all, so
+> MariaDB's C UDF ABI gives a C function no way to run SQL
+> against the caller's tables, and there are no table-returning functions at all, so
 > every agent that needs to read a caller-named table, or return more than
 > one scalar, is a plain SQL/PSM stored procedure with a trailing
 > `OUT p_result JSON` parameter, composing the C-level primitives
 > (`fractal_search`, `fractal_reason`, `fractal_dimension_*`, ...) via
 > ordinary `CALL`s and dynamic SQL, never a C-level "Universal Agent"
-> function the way postgres's `fractal_search_agent`/`fractal_rag_agent`/etc.
-> are. Every example on this page is `CALL fractal_agent_x(...args..., @result); SELECT @result;`,
+> function. Every example on this page is `CALL fractal_agent_x(...args..., @result); SELECT @result;`,
 > never `SELECT fractal_agent_x(...) FROM ...`.
 
 ---
@@ -57,7 +48,7 @@ ran and calls its functions/procedures directly (see
 list).
 
 Twelve agents end in a `fractal_reason` step and need reasoning configured
-(env vars, not a sysvar; see [`docs/COOKBOOK.md`](../docs/COOKBOOK.md) for
+(env vars, not a sysvar; see [`docs/reasoning-setup.md`](../docs/reasoning-setup.md) for
 the full setup). Three are **pure retrieval/analytics** with no LLM step
 (`recall_hybrid`, `recommend_diverse`, `feedback_audit`) and need no
 endpoint. Confirm reasoning before running the cognition agents:
@@ -80,6 +71,7 @@ Pick by the problem shape, not by the function name.
 | "Did this vehicle detour, and how complex is its GPS trace?" | `detour_classify` | trajectory deviation + box-counting → LLM classify | ✓ |
 | "Is my sensor grid's coverage degrading?" | `network_coverage_alert` | spatial morphology + telemetry drift → LLM alert | ✓ |
 | "What's the best cardinality-constrained allocation?" | `allocate` | SFS Sharpe optimizer → LLM rationale | ✓ |
+| "I want several genuinely different allocations to choose from, not just one" (enterprise-tier) | `diverse_portfolios` | multi-restart SFS + diverse-select → LLM rationale | ✓ |
 | "Rebalance, and compare to the nearest historical allocation?" | `rebalance_sibling` | optimizer + trajectory search → LLM rationale | ✓ |
 | "Which sub-agent should handle this incoming task?" | `route_task` | nearest-capability search + budget accounting → LLM rationale | ✓ |
 | "Which node should this workload land on (with vector refinement)?" | `schedule_workload` | `fractal_search` refine + nearest node → LLM rationale | ✓ |
@@ -106,7 +98,7 @@ Pick by the problem shape, not by the function name.
 
 ---
 
-## The fifteen recipes
+## The sixteen recipes
 
 ### Anomaly triage: `fractal_agent_anomaly_triage`
 **Triage drift on one entity's metric time series.**
@@ -348,7 +340,7 @@ itself always threads `CONNECTION_ID()` into the underlying search as its
 `session_id`, so the Diversify state just enabled actually applies:
 repulsion-diverse top-k per that procedure's own header comment. `score`
 is `1 − cosine_distance`. **Leaves Diversify enabled on this session
-afterward**, matching postgres's own documented behavior. Call
+afterward.** Call
 `fractal_diversify_disable(CONNECTION_ID())` yourself when done, or use
 [`feedback_audit`](#feedback-audit-fractal_agent_feedback_audit-pure-analytics-no-llm) below,
 which cleans up after itself.
@@ -707,16 +699,73 @@ SELECT @result;
 
 ---
 
+### Diverse portfolios: `fractal_agent_diverse_portfolios` (enterprise-tier)
+**A diverse SET of cardinality-constrained allocations, not just one.**
+
+Use it when a single best allocation ([allocate](#allocate-fractal_agent_allocate)
+above) isn't enough and you want several genuinely different candidates to
+choose from, at comparable quality: Quant-Finance scenario comparison,
+FinTech client-facing "here are three ways to do this" tooling. Enterprise-
+tier: calls `fractal_optimize_portfolio_multimodal` (or
+`fractal_optimize_portfolio_multimodal_pareto` in `pareto` mode), dlopen'd
+from the enterprise core `.so` (see [`enterprise.md`](enterprise.md)).
+Dormant on a Community deployment.
+
+**Inputs**
+
+| Argument | Type | What it is |
+| --- | --- | --- |
+| `p_mu` | `JSON` | expected returns per asset, e.g. `'[0.05,0.1]'` |
+| `p_cov` | `JSON` | covariance matrix, **flattened 1-D row-major n×n**, e.g. `'[1.0,0.0,0.0,1.0]'` |
+| `p_cardinality` | `INT` | how many assets to hold |
+| `p_n_restarts` | `INT` | independent search restarts to attempt, 1-64 (`NULL` defaults to 8) |
+| `p_overlap_threshold` | `DOUBLE` | max allowed asset overlap between any two returned candidates, 0.0-1.0 (`NULL` defaults to 0.3); sharpe mode only — the pareto front has no overlap filter |
+| `p_quality_frac` | `DOUBLE` | a candidate must reach at least this fraction of the best Sharpe found, 0.0 exclusive-1.0 (`NULL` defaults to 0.8); sharpe mode only |
+| `p_context` | `TEXT` | optional label passed to the reason call (`NULL` ok) |
+| `p_objective_mode` | `TEXT` | optimization objective: `'sharpe'` (default, also used for `NULL`) or `'pareto'` |
+| `p_result` (OUT) | `JSON` | sharpe mode: `{"optimization":{"n_found":..,"candidates":[{"sharpe":..,"weights":[..]},...]}, "rationale":".."}`; pareto mode: candidates carry `{"return":..,"risk":..,"sharpe":..}` instead |
+
+**How it works.** (1) In `sharpe` mode,
+`fractal_optimize_portfolio_multimodal(mu, cov, cardinality, n_restarts,
+overlap_threshold, quality_frac, 0)`: runs the SFS Sharpe maximizer
+`n_restarts` times with different derived seeds, then greedy
+diverse-selects the results by asset overlap and a quality floor. In
+`pareto` mode, `fractal_optimize_portfolio_multimodal_pareto(mu, cov,
+cardinality, n_restarts, 8, 0, 0, 'gaussian')`: same independent restarts,
+but scores each by decomposed return/risk and reduces them to a
+non-dominated Pareto front (see
+[`enterprise.md`](enterprise.md) for both UDFs' full parameter stories). (2)
+`fractal_reason` explains the trade-offs across the returned set.
+
+**Example**
+```sql
+-- 2 assets, hold 1; cov is the 2x2 identity flattened row-major. Needs
+-- FRACTALSQL_ENTERPRISE_LIB set and mariadbd restarted, see enterprise.md.
+CALL fractal_agent_diverse_portfolios(
+    '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.3, 0.8,
+    '{"portfolio": "agents-demo-diverse"}', 'sharpe', @result);
+SELECT @result;
+
+-- Pareto mode: a return/risk front instead of sharpe-ranked candidates.
+CALL fractal_agent_diverse_portfolios(
+    '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, NULL, NULL,
+    '{"portfolio": "agents-demo-diverse-pareto"}', 'pareto', @result);
+SELECT @result;
+```
+
+**Notes.** `SIGNAL`s a clean `fractal_agent_diverse_portfolios: enterprise
+tier not loaded` error, rather than passing a `NULL` optimization result
+through as if it were real data, when no enterprise library is loaded.
+`p_cov` must be flattened 1-D row-major, same as `allocate` above.
+
+---
+
 ### A note on id resolution
 
 `fractal_search_telemetry`, `fractal_hybrid_clinical_search`, and
 `fractal_search_trajectory` return `doc_id` as the target table's own real
-primary-key value, not a row position. In postgres, the equivalent
-functions return a 0-indexed heap-scan position, and the installable
-agents there resolve it back to a named id column via
-`row_number() OVER (ORDER BY ctid) - 1`. That extra resolution step, and
-the separate "which column is the id" argument it needs (postgres's
-`id_col`/`cap_id_col`/`node_id_col`, and so on), don't exist here: every
+primary-key value, not a position index. There is no separate resolution
+step and no separate "which column is the id" argument: every
 table-searching agent above just requires its target table to have exactly
 one single-column `PRIMARY KEY`, and returns that column's real value
 directly (`nearest_cohort_id`, `assigned_node`, `mem_id`, and so on are all
@@ -734,17 +783,14 @@ the connection clean without any caller cleanup.
 
 ## Building blocks: the primitives agents compose
 
-fractalsql-postgresql has a separate parallel set of C-level "Universal
-Agent" functions (`fractal_search_agent`, `fractal_rag_agent`,
-`fractal_agent_plan_explore`, `fractal_agent_detect_loop`, plus
-`fractal_agent_trajectory_predict`) built directly into the extension's C
-core via SPI (fetching rows by physical position, materializing a set of
-rows from inside a C function), which MariaDB's C UDF ABI does not
-provide. A MariaDB stored PROCEDURE can run the same table-scan via
-dynamic SQL (`PREPARE`/`EXECUTE`), which is exactly the mechanism the
-table-backed search compositions below already use. **All five are
-plain stored procedures**, and live in `sql/install_agents.sql`
-alongside the 15 recipes above:
+Six procedures underneath the sixteen recipes above are general-purpose
+composition primitives rather than one fixed recipe each. MariaDB's C UDF
+ABI gives a C function no way to run SQL against the calling session,
+so each is a plain stored PROCEDURE that reaches its target table via
+dynamic SQL (`PREPARE`/`EXECUTE`), the same mechanism the table-backed
+search compositions below use. All six are plain stored procedures,
+living in `sql/install_agents.sql` (five of them) and `sql/install_udf.sql`
+(`fractal_sql_agent`) alongside the 15 recipes above:
 
 - `fractal_agent_trajectory_predict(table_name, vector_col, baseline_id, forecast_steps, risk_threshold, OUT result)`:
   baseline-to-current drift prediction against a table's own latest row.
@@ -755,22 +801,23 @@ alongside the 15 recipes above:
 - `fractal_rag_agent(query, table_name, vector_col, meta_filter, OUT answer)`:
   a thin wrapper around `fractal_search_agent` with fixed
   `pop_size=50`/`iterations=15`, returning only the answer text.
-  `meta_filter` is accepted for signature parity but unused, matching
-  postgres's own current behavior (its `WHERE`-clause filtering is a
-  documented postgres TODO, not a mariadb-side omission).
+  `meta_filter` is accepted for signature parity but currently unused.
+- `fractal_sql_agent(question, table_names, max_retries, auto_execute, OUT generated_sql, OUT status, OUT result_json)`:
+  self-correcting Text-to-SQL with an optional auto-execute step, the
+  `auto_execute`-capable sibling of `fractal_text_to_sql`; see
+  [`text-to-sql-setup.md`](text-to-sql-setup.md) for the full behavior.
 - `fractal_agent_plan_explore(initial_state, strategy_table, vector_col, max_branches, OUT result)`:
   embed `initial_state`, Scout-search `strategy_table` for up to
   `max_branches` candidate branches, and return each branch's real row id,
   its own vector (`plan_trajectory`), and `score = 1 - distance`, as a JSON
   array in `p_result` (MariaDB has no `RETURNS TABLE`, so this replaces
-  postgres's set-returning function).
+  a set-returning function).
 - `fractal_agent_detect_loop(log_hashes, OUT result)`: a pure numeric
   function needing no table access at all. It flags a loop if either the DFA
   scaling exponent on `log_hashes` exceeds 0.9, or a tight discrete
-  repetition period is found (period search capped at n/4), matching
-  postgres exactly.
+  repetition period is found (period search capped at n/4).
 
-Each of these five is a MariaDB stored PROCEDURE with a trailing `OUT`
+Each of these six is a MariaDB stored PROCEDURE with a trailing `OUT`
 parameter, called with `CALL ...(..., @result); SELECT @result;`, the
 same convention as the 15 recipes above.
 
@@ -785,7 +832,7 @@ same convention as the 15 recipes above.
   search primitive `fractal_search` itself wraps. See
   `sql/install_udf.sql`'s own header comment near
   `CREATE PROCEDURE fractal_search_telemetry` for the full mechanism, and
-  the five Universal Agent procedures' own header comments in
+  the Universal Agent procedures' own header comments in
   `sql/install_agents.sql` for the same pattern applied to each one.
 - **Table-free composition**: `fractal_agent_detect_loop`, pure numeric,
   no dynamic SQL needed.
@@ -794,9 +841,6 @@ same convention as the 15 recipes above.
   [`api-analytics.md`](api-analytics.md).
 - **Cognition**: `fractal_reason`, `fractal_embed`, see
   [`api-cognition.md`](api-cognition.md).
-- **Self-correcting SQL**: `fractal_sql_agent` (the `auto_execute`-capable
-  sibling of `fractal_text_to_sql`), see
-  [`text-to-sql-setup.md`](text-to-sql-setup.md).
 - **Diversify/Repulsion state**: `fractal_diversify_enable`/`_disable`/
   `_set_params`, `fractal_feedback_report`, `fractal_detect_collapse`,
   connection-scoped via `CONNECTION_ID()`.
@@ -811,15 +855,13 @@ the 15 recipes above.
 
 ## Reference blueprints: industry verticals
 
-fractalsql-postgresql also ships Domain Agent reference blueprints across
-three agentic verticals (DevOps/SRE, FinTech, Customer Support), plus eight
+Eleven runnable industry walkthroughs ship as `demo/demo-vertical-*.sql`:
+three agentic verticals (DevOps/SRE, FinTech, Customer Support) plus eight
 further industry-vertical demos covering quant finance, MedTech, and
-others (eleven vertical demo scripts in total). **All eleven have MariaDB
-equivalents in this repo**, as `demo/demo-vertical-*.sql`, and every one
-has been run end-to-end against a real MariaDB server and a real Ollama
-endpoint. See
+others. Every one has been run end-to-end against a real MariaDB server
+and a real Ollama endpoint. See
 [demo/README.md](../demo/README.md#industry-vertical-demos) for the exact
-list. The 15 recipes above, the five Universal Agent procedures in
+list. The 15 recipes above, the six Universal Agent procedures in
 [Building blocks](#building-blocks-the-primitives-agents-compose) above,
 and the primitives in [Composing your own](#composing-your-own) below, are
 the same building blocks those blueprints compose.
@@ -853,4 +895,4 @@ mariadb -u<user> -p <database> < demo/demo-agents.sql
 compositions (`recall_hybrid`, `recommend_diverse`, `route_task`) in a
 throwaway cluster against a real reasoning round trip, so the agent wiring
 is also covered by the automated regression suite across all four
-compat-matrix MariaDB majors (10.6 / 10.11 / 11.4 / 12.2).
+compat-matrix MariaDB majors (10.6 / 10.11 / 11.4 / 12.3).

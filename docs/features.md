@@ -21,7 +21,7 @@ exposes whichever capability tiers that edition includes.
 
 | Tier | Focus | Key Capabilities | Build / Requirement |
 | --- | --- | --- | --- |
-| **Community** | Discovery, Cognition, Agency | SFS Core, Sniper Search, Scout Discovery, In-DB Reasoning, Embeddings, 15 Agents | Base UDF set (`fractalsql.so`), everything most installs need |
+| **Community** | Discovery, Cognition, Agency | SFS Core, Sniper Search, Scout Discovery, In-DB Reasoning, Embeddings, 16 Agents | Base UDF set (`fractalsql.so`), everything most installs need |
 | **Enterprise** | Governance | Activation gating plus a real, tamper-evident ledger storage layer. See [Enterprise Tier](enterprise.md) for the full scope |
 
 ---
@@ -41,9 +41,9 @@ a "precision" tool for finding the absolute global minimum.
 ### Scout Discovery (`fractal_explore`)
 An SFS population search blended with **Maximal Marginal Relevance (MMR)**
 re-ranking, so the results cover the data's distinct basins of attraction
-instead of the "mode collapse" common in top-K search. Unlike postgres's
-`fractal_search_explore(table, col, ...)`, this repo's Scout Mode takes its
-corpus as one inline argument. MariaDB's C UDF ABI has no SPI and no
+instead of the "mode collapse" common in top-K search. Scout Mode takes its
+corpus as one inline argument. MariaDB's C UDF ABI can't run SQL against
+the calling session and has no
 table-returning UDFs at all, so there is no server-side table scan for it.
 
 ### Table-Backed Telemetry (`fractal_search_telemetry`)
@@ -79,7 +79,7 @@ providers send it to that provider under your own account and agreement
 Generates vectors from text using a purpose-trained embedding model,
 `fractal_embed(session_id, input)`. Returns a `fractal_vector`
 JSON-array-string (not a native array type: MariaDB has none across the
-10.6-12.2 compat floor this repo targets). This removes the need for an
+10.6-12.3 compat floor this repo targets). This removes the need for an
 external embedding pipeline for many RAG use cases.
 
 ### Safe Text-to-SQL (`fractal_text_to_sql`)
@@ -110,7 +110,8 @@ recurring pattern.
 > (`fractal_search_agent`, `fractal_rag_agent`, `fractal_sql_agent`,
 > `fractal_agent_plan_explore`, `fractal_agent_trajectory_predict`,
 > `fractal_agent_detect_loop`) sit underneath the recipes above. None
-> exist here as C-level primitives (no SPI), but a MariaDB stored
+> exist here as C-level primitives (a C UDF can't run SQL against the
+> calling session), but a MariaDB stored
 > PROCEDURE reaches the same table access via dynamic SQL
 > (`PREPARE`/`EXECUTE`) instead, the same mechanism the table-backed
 > Discovery primitives already use. All six are implemented this way
@@ -181,12 +182,12 @@ large universe without the exponential cost of a brute-force search.
 
 ### Native `VECTOR(n)` index vs. Scout Discovery
 
-At 5000 vectors across 50 Gaussian clusters, dim=128, a **much smaller**
-default than postgres's 100k-row comparison, and deliberately so: Scout
+At 5000 vectors across 50 Gaussian clusters, dim=128, a **comparatively
+small** default, and deliberately so: Scout
 Mode (`fractal_explore`) has no server-side scan at all, every call
-re-sends the whole corpus as a client-supplied string; at postgres's scale
+re-sends the whole corpus as a client-supplied string; at large row counts
 that string would be hundreds of megabytes per query. See
-`benchmark/README.md` for the full methodology and reasoning. This is a
+`bench/README.md` for the full methodology and reasoning. This is a
 real architectural ceiling, not a smaller-is-easier choice. Measured
 directly against a real `mariadb:12.2` container:
 
@@ -205,9 +206,9 @@ sub-corpora, not full-corpus top-k at scale).
 
 ### Storage: TEXT/JSON-string vs. native `VECTOR(n)`
 
-MariaDB has no equivalent of postgres's custom `fractal_vector` SQL type
-(no `CREATE TYPE`/typmod mechanism at all). The real comparison here is
-this repo's portable TEXT/JSON-array-string convention against MariaDB's
+There is no custom `fractal_vector` SQL type here
+(MariaDB has no `CREATE TYPE`/type-modifier mechanism at all). The real comparison
+is this repo's portable TEXT/JSON-array-string convention against MariaDB's
 own built-in `VECTOR(n)` column type (11.7+). Measured at 5000 rows,
 dim=128, MariaDB 12.2: `VECTOR(n)` is **~2.4x smaller on disk** (fixed 4
 bytes/dim, architecturally fixed, not data-dependent) and loads **~2x
@@ -215,7 +216,7 @@ faster** in bulk. It was **~50% slower**, in this measurement, for
 `fractal_search_trajectory`-style table-backed search latency, since the
 `VEC_TOTEXT()` conversion step this repo's search compositions need to read
 a native column costs more than reading plain `TEXT` directly. Not a clean
-sweep either way; measure on your own workload (see `benchmark/README.md`'s
+sweep either way; measure on your own workload (see `bench/README.md`'s
 `vector_type_head_to_head.py` section for the full numbers and caveats).
 
 ---

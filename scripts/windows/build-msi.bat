@@ -23,7 +23,7 @@ REM   * dist\windows\mdb^<MARIADB_MAJOR^>\fractalsql.dll already produced
 REM     by scripts\windows\build.bat.
 REM
 REM Environment
-REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 ^| 12.2: selects UpgradeCode and install-folder name
+REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 ^| 12.3: selects UpgradeCode and install-folder name
 REM   MSI_ARCH      x64 ^| arm64: passed to candle -arch
 REM   MSI_VERSION   overrides Product Version (default 2.0.0, read from src\fractalsql.c's FSQL_VERSION if not set)
 
@@ -33,7 +33,7 @@ set REPO_ROOT=%~dp0..\..
 pushd %REPO_ROOT%
 
 if "%MARIADB_MAJOR%"==""    (
-    echo ==^> ERROR: MARIADB_MAJOR must be set ^(10.6 ^| 10.11 ^| 11.4 ^| 12.2^)
+    echo ==^> ERROR: MARIADB_MAJOR must be set ^(10.6 ^| 10.11 ^| 11.4 ^| 12.3^)
     popd ^& exit /b 1
 )
 if "%MSI_ARCH%"==""    set MSI_ARCH=x64
@@ -89,7 +89,7 @@ set MAJOR_TAG=%MARIADB_MAJOR:.=_%
 if "%MARIADB_MAJOR%"=="10.6"   set MAJOR_HEX=0A06
 if "%MARIADB_MAJOR%"=="10.11"  set MAJOR_HEX=0A11
 if "%MARIADB_MAJOR%"=="11.4"   set MAJOR_HEX=0B04
-if "%MARIADB_MAJOR%"=="12.2"   set MAJOR_HEX=0C02
+if "%MARIADB_MAJOR%"=="12.3"   set MAJOR_HEX=0C03
 if "%MAJOR_HEX%"==""    (
     echo ==^> ERROR: no MAJOR_HEX mapping for MARIADB_MAJOR=%MARIADB_MAJOR%
     popd ^& exit /b 1
