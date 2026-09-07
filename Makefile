@@ -3,10 +3,9 @@
 # v1: pure-C path. Statically links the vendored core archive at
 # include/libfractalsql-community-minimal-c.a. No runtime LuaJIT dep.
 #
-# Refresh include/ from the foundry:
-#     cd ../fractalsql-core
-#     make validated-drop-native
-#     ./scripts/deploy.sh --git fractalsql-mariadb
+# To refresh the vendored core release drop, re-deploy it into
+# include/ (restores the archive, the public headers, and
+# .artifacts.sha256 together).
 #
 # Build:   make
 # Install: sudo make install
@@ -32,8 +31,7 @@ endif
 # additions this repo's UDF port links against: fsql_dimension_*,
 # fsql_optimize_portfolio*, fsql_vascular_network, fsql_cortical_folding,
 # fsql_nerve_plexus_metric, and fsql_morphological_complexity; see
-# include/fractalsql_sql.h). Override to `community-sovereign-c-legacy`
-# for glibc 2.28 hosts.
+# include/fractalsql_sql.h).
 CORE_VARIANT ?= community-sovereign-c
 # v1.2 platform layout: link the per-platform subdir
 # include/<os>-<arch>/ (os = uname -s lower-cased, arch = uname -m, which
@@ -73,13 +71,9 @@ endif
 
 CFLAGS  = -Wall -Wextra -O3 -fPIC $(MDB_CFLAGS) -Iinclude $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
 # -lpthread: fractalsql_session.c's connection-scoped ctx registry
-# (for Discovery/Diversify) uses a pthread_mutex_t. A no-op stub on
-# glibc >= 2.34 (pthread merged into libc) but required on glibc 2.28
-# (the -legacy CORE_VARIANT target) and on macOS/BSD libc.
+# (for Discovery/Diversify) uses a pthread_mutex_t.
 # -ldl: the vendored core archive's fsql_load_reasoning (Cognition
-# tier) dlopen's the reasoning plugin internally. Same glibc-2.34-merge
-# story as -lpthread: a no-op stub on modern glibc, required on the
-# -legacy CORE_VARIANT target. Harmless on macOS/BSD.
+# tier) dlopen's the reasoning plugin internally.
 # -lcrypto: fractalsql_enterprise.c's ent_verify_signature() verifies
 # the enterprise .so's detached Ed25519 signature via OpenSSL's EVP API
 # (EVP_PKEY_new_raw_public_key/EVP_DigestVerify*). Requires libssl-dev
@@ -104,27 +98,27 @@ all: verify-vendor $(TARGET)
 
 $(CORE_ARCHIVE):
 	@echo "ERROR: $(CORE_ARCHIVE) missing." >&2
-	@echo "  Refresh from foundry:" >&2
-	@echo "    cd ../fractalsql-core && make validated-drop-native && ./scripts/deploy.sh --git fractalsql-mariadb" >&2
+	@echo "  Re-deploy the vendored core release drop into include/," >&2
+	@echo "  which restores both the archive and .artifacts.sha256." >&2
 	@exit 1
 
 
-# Supply-chain verification. The vendored archive is dropped from
-# fractalsql-core's deploy.sh together with `.artifacts.sha256`
-# (sha256sum of every shipped .h/.a/.so). Verify it matches the
-# bytes on disk before linking: catches a tampered .a in this
-# repo's include/ at build time, both in `make` and in CI.
+# Supply-chain verification. The vendored core release drop ships the
+# archive plus `.artifacts.sha256` (sha256sum of every shipped
+# .h/.a/.so). Verify it matches the bytes on disk before linking:
+# catches a tampered .a in this repo's include/ at build time, both
+# in `make` and in CI.
 .PHONY: verify-vendor
 verify-vendor:
 	@if [ ! -f include/.artifacts.sha256 ]; then \
-		echo "ERROR: include/.artifacts.sha256 missing, re-deploy from core" >&2; \
-		echo "  cd ../fractalsql-core && make validated-drop-native && ./scripts/deploy.sh --git fractalsql-mariadb" >&2; \
+		echo "ERROR: include/.artifacts.sha256 missing." >&2; \
+		echo "  Re-deploy the vendored core release drop into include/ to restore it." >&2; \
 		exit 1; \
 	fi
 	@cd include && sha256sum --quiet --check .artifacts.sha256 || { \
 		echo "ERROR: vendored artifact checksum mismatch in include/." >&2; \
 		echo "  Possible causes: tampered .a/.so, partial deploy, or stale .sha256." >&2; \
-		echo "  Re-deploy from core to recover." >&2; \
+		echo "  Re-deploy the vendored core release drop to recover." >&2; \
 		exit 1; \
 	}
 

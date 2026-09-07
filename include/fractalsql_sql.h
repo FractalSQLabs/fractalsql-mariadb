@@ -451,8 +451,7 @@ FSQL_API int fsql_ledger_shadow_count(const fsql_ctx *ctx, size_t *out);
  *
  * Input:  a QTL BLOB previously produced by core (typically read
  *         out-of-band by an admin via the host's storage backend
- *         — a plain SELECT into a server-side file, a Redis
- *         GETRANGE, etc — and passed in
+ *         — Postgres SELECT, Redis GETRANGE, etc — and passed in
  *         as a contiguous buffer + length).
  *
  * Output: caller-allocated JSON buffer (Pattern A per V1 plan §5.1).
@@ -468,8 +467,8 @@ FSQL_API int fsql_ledger_shadow_count(const fsql_ctx *ctx, size_t *out);
  * malformed or the version magic does not match.
  *
  * Caller-allocated by design — no allocator-mismatch risk between
- * core's malloc and the host's allocator (whatever runtime is
- * hosting it: another language binding's heap, JNI, V8, etc.). */
+ * core's malloc and the host's allocator (palloc / enif_alloc /
+ * JNI types / V8 heap). */
 FSQL_API int fsql_audit_unpack(const void *blob, size_t blob_len,
                                char *json_out, size_t *json_cap);
 
@@ -705,8 +704,9 @@ FSQL_API int fsql_morphological_complexity(const double *points, size_t n_points
 /* ----- Vector Arithmetic --------------------------------------------
  *
  * Simple O(dim) float32 vector ops, added to serve fractal_vector's
- * float4 vector storage and any future DB-agnostic float4 vector type
- * directly, with no float<->double conversion at the call site. Deliberately NOT used by
+ * float4 varlena storage format (fractalsql-postgresql) and any future
+ * DB-agnostic float4 vector type (fractalsql-sqlite) directly, with no
+ * float<->double conversion at the call site. Deliberately NOT used by
  * and NOT a replacement for the double-precision vector math already
  * private to src/index/hnsw.c, src/sfs/, src/diversify/ -- those
  * remain byte-for-byte unchanged, protected by gate 19 (shadow Lua/C
@@ -717,7 +717,7 @@ FSQL_API int fsql_morphological_complexity(const double *points, size_t n_points
  *
  * Convention: on a degenerate zero-norm input to cosine_distance/
  * cosine_similarity, returns distance=1.0f / similarity=0.0f rather
- * than NaN -- deliberate, so a FLOAT/DOUBLE result column never has
+ * than NaN -- deliberate, so a Postgres float8 result column never has
  * to special-case NaN. (Existing double-precision sites in this
  * codebase are NOT consistent with each other on this point --
  * src/fsql.c's cosine_distance returns 1.0 on zero norm,
