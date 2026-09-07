@@ -502,9 +502,18 @@ mdb_setup() {
   SOCK="/tmp/fractalsql_bt_sock_${v//./_}/mysql.sock"
   PLUGDIR="$TMPROOT/fractalsql_bt_plugin_${v//./_}"
   PIDFILE="/tmp/fractalsql_bt_pid_${v//./_}.pid"
+  CNF="$TMPROOT/fractalsql_bt_cnf_${v//./_}.cnf"
   PORT=$(( 13300 + $(echo "$v" | tr -d '.') % 100 ))
   rm -rf "$DATADIR" "$(dirname "$SOCK")" "$PLUGDIR"
   mkdir -p "$DATADIR" "$(dirname "$SOCK")" "$PLUGDIR"
+  # Config isolation: hand every server process below a minimal
+  # defaults file. Without it, a distro-installed mariadbd also reads
+  # the host's own /etc/mysql config (caught live on an Ubuntu 24.04
+  # host: provider_*=force_plus_permanent lines in the system config
+  # pointed the scratch daemon at plugin files it was never given,
+  # aborting cluster setup). Container CI has no /etc/mysql config,
+  # which is why this never surfaced there.
+  : > "$CNF"
 
   cp "$HERE/fractalsql.so" "$PLUGDIR/fractalsql.so" || return 2
   # Reasoning-tier gates (03/04/13/22/23) dispatch through the real
@@ -581,7 +590,7 @@ mdb_setup() {
   cc -shared -fPIC -std=c99 $fsql_inc tests/think_reasoning_plugin.c -o "$THINK_SO" 2>/tmp/fractalsql_bt_setup_${v//./_}.log \
     || { cat /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
 
-  "$installdb_bin" --datadir="$DATADIR" --auth-root-authentication-method=normal \
+  "$installdb_bin" --defaults-file="$CNF" --datadir="$DATADIR" --auth-root-authentication-method=normal \
     >/tmp/fractalsql_bt_setup_${v//./_}.log 2>&1 \
     || { tail -30 /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
 
@@ -619,7 +628,7 @@ mdb_setup() {
     # supervisor: it watches the mariadbd child and restarts it on
     # abnormal exit, which is exactly the platform behavior gate 06
     # needs to observe.
-    "$mysqld_safe_bin" --ledir="$(dirname "$mariadbd_bin")" \
+    "$mysqld_safe_bin" --defaults-file="$CNF" --ledir="$(dirname "$mariadbd_bin")" \
       --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
       --plugin-dir="$PLUGDIR" --pid-file="$PIDFILE" \
       --skip-networking=0 --bind-address=127.0.0.1 \
@@ -631,7 +640,7 @@ mdb_setup() {
     # to prove the specific claim gate 06 checks: SOMETHING brings
     # mariadbd back after a UDF-triggered crash.
     ( while true; do
-        "$mariadbd_bin" --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
+        "$mariadbd_bin" --defaults-file="$CNF" --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
           --plugin-dir="$PLUGDIR" --pid-file="$PIDFILE" \
           --skip-networking=0 --bind-address=127.0.0.1 \
           >>/tmp/fractalsql_bt_server_${v//./_}.log 2>&1
@@ -743,7 +752,7 @@ mdb_restart_inplace_reasoning_plugin() {
   mysqld_safe_bin="$(mdb_sibling "$BIN" mariadbd-safe)"
   [ -z "$mysqld_safe_bin" ] && mysqld_safe_bin="$(mdb_sibling "$BIN" mysqld_safe)"
   if [ -n "$mysqld_safe_bin" ]; then
-    "$mysqld_safe_bin" --ledir="$(dirname "$mariadbd_bin")" \
+    "$mysqld_safe_bin" --defaults-file="$CNF" --ledir="$(dirname "$mariadbd_bin")" \
       --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
       --plugin-dir="$PLUGDIR" --pid-file="$PIDFILE" \
       --skip-networking=0 --bind-address=127.0.0.1 \
@@ -751,7 +760,7 @@ mdb_restart_inplace_reasoning_plugin() {
     SUPERVISOR_PID=$!
   else
     ( while true; do
-        "$mariadbd_bin" --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
+        "$mariadbd_bin" --defaults-file="$CNF" --datadir="$DATADIR" --socket="$SOCK" --port="$PORT" \
           --plugin-dir="$PLUGDIR" --pid-file="$PIDFILE" \
           --skip-networking=0 --bind-address=127.0.0.1 \
           >>/tmp/fractalsql_bt_server_${MDB_MAJOR//./_}.log 2>&1

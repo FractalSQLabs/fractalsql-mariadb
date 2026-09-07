@@ -22,7 +22,9 @@ ifeq ($(strip $(MDB_CFLAGS)),)
   MDB_CFLAGS := $(shell $(MDB_CONFIG) --cflags 2>/dev/null)
 endif
 ifeq ($(strip $(MDB_CFLAGS)),)
-  MDB_CFLAGS := -I/usr/include/mariadb
+  # Debian/Ubuntu's libmariadb-dev installs headers to
+  # /usr/include/mysql; other distros use /usr/include/mariadb.
+  MDB_CFLAGS := -I/usr/include/mysql -I/usr/include/mariadb
 endif
 
 # Vendored core archive selector. `community-sovereign-c` is the modern
