@@ -359,6 +359,12 @@ jobs:
           ./Configure darwin64-x86_64 no-shared no-tests \
               --prefix=/tmp/openssl-x64 \
               -mmacosx-version-min=11.0 -fPIC
+          # opensslv.h and friends are generated at build time, not
+          # shipped in the tarball. Serially force the header-generation
+          # step first: kicking straight into a parallel libcrypto.a
+          # build races it, and the first .o compiles fail with
+          # "fatal error: 'openssl/opensslv.h' file not found".
+          make -j1 -s build_generated
           make -j"$(sysctl -n hw.ncpu)" -s libcrypto.a
           make -s install_sw
 
