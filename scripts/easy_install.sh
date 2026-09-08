@@ -349,14 +349,39 @@ phase_b_install() {
 # --- Phase C: the wizard -----------------------------------------------
 # Doubles any single quote in a value before it goes inside a shell-quoted
 # EnvironmentFile / launchctl / registry write. Values here come from user
-# input (a URL, a model name, a token).
-envq() { printf '%s' "${1//\'/\'\\\'\'}"; }
+# input (a URL, a model name, a token). Done with an explicit loop rather
+# than a ${1//\'/...} expansion: getting the backslash quoting of that
+# replacement right is fragile in a way bash -n won't catch, and a wrong
+# result writes an /etc/default/mariadb line that no longer parses.
+envq() {
+    local rest="$1" out=""
+    while [[ "${rest}" == *\'* ]]; do
+        out+="${rest%%\'*}"        # text up to the quote
+        out+="'\''"                # close the field, escaped quote, reopen
+        rest="${rest#*\'}"         # skip past the quote
+    done
+    printf '%s' "${out}${rest}"
+}
 
-FSQL_ENV_KEYS=(FRACTALSQL_REASONING_PLUGIN FRACTALSQL_HTTP_URL FRACTALSQL_HTTP_TOKEN
+FSQL_ENV_ALL_KEYS=(FRACTALSQL_REASONING_PLUGIN FRACTALSQL_HTTP_URL FRACTALSQL_HTTP_TOKEN
     FRACTALSQL_HTTP_MODEL FRACTALSQL_HTTP_ALLOW_PLAINTEXT FRACTALSQL_HTTP_EMBED_URL
     FRACTALSQL_HTTP_EMBED_MODEL FRACTALSQL_HTTP_THINK FRACTALSQL_HTTP_THINK_PROVIDER)
-declare -A FSQL_ENV_VALUES=()
-env_set() { FSQL_ENV_VALUES["FRACTALSQL_$1"]="$2"; }
+# bash 3.2 -- macOS's stock shell -- has no associative arrays ("declare -A"
+# fails outright there), so the wizard's config state is two parallel
+# indexed arrays, kept in insertion order by env_set.
+FSQL_ENV_KEYS=()
+FSQL_ENV_VALUES=()
+env_set() {
+    local k="FRACTALSQL_$1" i
+    for i in "${!FSQL_ENV_KEYS[@]}"; do
+        if [[ "${FSQL_ENV_KEYS[i]}" = "${k}" ]]; then
+            FSQL_ENV_VALUES[i]="$2"
+            return
+        fi
+    done
+    FSQL_ENV_KEYS+=("${k}")
+    FSQL_ENV_VALUES+=("$2")
+}
 
 # Applies FSQL_ENV_VALUES to mariadbd's environment and restarts it, or
 # prints the manual steps if the user declines / --dry-run. There is no
@@ -409,12 +434,13 @@ apply_env_and_restart() {
     priv_as_root() { priv "${as_root}" "$@"; }
 
     log "About to set (mariadbd environment):"
-    local k
-    for k in "${!FSQL_ENV_VALUES[@]}"; do
+    local i k v
+    for i in "${!FSQL_ENV_KEYS[@]}"; do
+        k="${FSQL_ENV_KEYS[i]}"; v="${FSQL_ENV_VALUES[i]}"
         if [[ "$k" == *HTTP_TOKEN* ]]; then
             echo "  ${k}=***"
         else
-            echo "  ${k}=${FSQL_ENV_VALUES[$k]}"
+            echo "  ${k}=${v}"
         fi
     done
     confirm "Apply this configuration? This needs a mariadbd restart, which drops active connections -- there is no live reload for these." \
@@ -430,12 +456,12 @@ apply_env_and_restart() {
             fi
             [[ "${as_root}" -eq 1 ]] || restart_cmd="sudo ${restart_cmd}"
             if [[ "${DRY_RUN}" -eq 1 ]]; then log "(--dry-run: not actually writing or restarting)"; return 0; fi
-            for k in "${FSQL_ENV_KEYS[@]}"; do
+            for k in "${FSQL_ENV_ALL_KEYS[@]}"; do
                 priv "${as_root}" sed -i "/^${k}=/d" "${envfile}" 2>/dev/null || true
             done
             {
-                for k in "${!FSQL_ENV_VALUES[@]}"; do
-                    printf "%s='%s'\n" "${k}" "$(envq "${FSQL_ENV_VALUES[$k]}")"
+                for i in "${!FSQL_ENV_KEYS[@]}"; do
+                    printf "%s='%s'\n" "${FSQL_ENV_KEYS[i]}" "$(envq "${FSQL_ENV_VALUES[i]}")"
                 done
             } | priv "${as_root}" tee -a "${envfile}" >/dev/null
             log "${restart_cmd}"
@@ -460,8 +486,8 @@ apply_env_and_restart() {
             priv "${as_root}" mkdir -p "${dropin_dir}"
             {
                 echo "[Service]"
-                for k in "${!FSQL_ENV_VALUES[@]}"; do
-                    printf "Environment=%s=%s\n" "${k}" "${FSQL_ENV_VALUES[$k]}"
+                for i in "${!FSQL_ENV_KEYS[@]}"; do
+                    printf "Environment=%s=%s\n" "${FSQL_ENV_KEYS[i]}" "${FSQL_ENV_VALUES[i]}"
                 done
             } | priv "${as_root}" tee "${dropin}" >/dev/null
             priv "${as_root}" systemctl daemon-reload
@@ -551,9 +577,12 @@ phase_c_wizard() {
     if [[ "${PROVIDER}" != "skip" ]]; then
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             log "About to set (mariadbd environment):"
-            for k in "${!FSQL_ENV_VALUES[@]}"; do
-                [[ "$k" == *HTTP_TOKEN* ]] && { echo "  ${k}=***"; continue; }
-                echo "  ${k}=${FSQL_ENV_VALUES[$k]}"
+            for i in "${!FSQL_ENV_KEYS[@]}"; do
+                if [[ "${FSQL_ENV_KEYS[i]}" == *HTTP_TOKEN* ]]; then
+                    echo "  ${FSQL_ENV_KEYS[i]}=***"
+                else
+                    echo "  ${FSQL_ENV_KEYS[i]}=${FSQL_ENV_VALUES[i]}"
+                fi
             done
             log "(--dry-run: not actually applying)"
         else
@@ -623,7 +652,7 @@ uninstall_flow() {
         else
             case "${OS_FAMILY}" in
                 debian)
-                    for k in "${FSQL_ENV_KEYS[@]}"; do priv "${as_root}" sed -i "/^${k}=/d" /etc/default/mariadb 2>/dev/null || true; done
+                    for k in "${FSQL_ENV_ALL_KEYS[@]}"; do priv "${as_root}" sed -i "/^${k}=/d" /etc/default/mariadb 2>/dev/null || true; done
                     if confirm "Restart mariadbd now?"; then
                         if have_systemd; then priv "${as_root}" systemctl restart mariadb; else restart_mariadbd_direct priv_as_root; fi
                         ok "mariadbd restarted."

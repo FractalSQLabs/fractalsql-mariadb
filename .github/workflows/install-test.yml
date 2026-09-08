@@ -161,13 +161,17 @@ jobs:
 
           # Params caps match the documented bounds (iterations<=10000,
           # pop_size<=100000, diff_factor<=32). Verify each just-over-cap
-          # value is rejected (UDF sets *error=1, non-zero client exit).
+          # value is rejected (UDF sets *error=1, client shows NULL).
           for over_params in \
               '{"iterations":10001}' \
               '{"population_size":100001}' \
               '{"diffusion_factor":33}'; do
-              if mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null; then
-                  echo "FAIL: expected rejection on params=\$over_params"; exit 1
+              # A UDF that sets *error surfaces as a NULL result with a
+              # zero client exit, not as a non-zero exit, so "empty or
+              # NULL" is the rejection signal here.
+              OUT=\$(mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
+              if [ -n "\$OUT" ] && [ "\$OUT" != "NULL" ]; then
+                  echo "FAIL: expected rejection on params=\$over_params, got \$OUT"; exit 1
               fi
               echo "ok: params-bound cap rejects \$over_params"
           done
@@ -313,8 +317,10 @@ jobs:
           set -euo pipefail
 
           # mariadb_repo_setup itself needs curl; rockylinux:9's minimal
-          # image doesn't ship it.
-          dnf install -qy curl
+          # image ships only curl-minimal, which provides /usr/bin/curl
+          # but not the "curl" package name its yum check requires, and a
+          # plain dnf install of curl then conflicts with it.
+          dnf install -qy --allowerasing curl
 
           # MariaDB Foundation's repo setup, same script as the Debian
           # job, auto-detects dnf and pins the requested major.
@@ -377,8 +383,12 @@ jobs:
               '{"iterations":10001}' \
               '{"population_size":100001}' \
               '{"diffusion_factor":33}'; do
-              if mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null; then
-                  echo "FAIL: expected rejection on params=\$over_params"; exit 1
+              # A UDF that sets *error surfaces as a NULL result with a
+              # zero client exit, not as a non-zero exit, so "empty or
+              # NULL" is the rejection signal here.
+              OUT=\$(mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
+              if [ -n "\$OUT" ] && [ "\$OUT" != "NULL" ]; then
+                  echo "FAIL: expected rejection on params=\$over_params, got \$OUT"; exit 1
               fi
               echo "ok: params-bound cap rejects \$over_params"
           done
@@ -489,7 +499,7 @@ jobs:
       - name: Reasoning round-trip against a mock endpoint
         run: |
           set -euo pipefail
-          python3 scripts/ci/mock_llm.py 18080 &
+          python3 scripts/ci/mock_llm.py 18080 >/tmp/mock_llm.out 2>&1 &
           MOCK_PID=$!
           for i in $(seq 1 50); do
               nc -z 127.0.0.1 18080 >/dev/null 2>&1 && break
@@ -498,8 +508,9 @@ jobs:
 
           # Reasoning config is a process env var, read once by
           # fractalsql_cognition.c. It must be set BEFORE mariadbd's
-          # next dlopen of a reasoning path. Restart via brew services
-          # so the new environment actually takes.
+          # next dlopen of a reasoning path, so the server is restarted
+          # with the config in its environment (see below for why that
+          # restart is a direct mariadbd start, not brew services).
           PLUGIN_DIR=$(mariadb -N -B -e "SELECT @@plugin_dir")
           brew services stop mariadb
           export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
@@ -522,12 +533,34 @@ jobs:
               sleep 0.5
           done
 
-          REPLY=$(mariadb -S /tmp/fsql_install_test.sock -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');")
+          # 2>&1 on purpose: a NULL without a UDF error and a UDF that
+          # failed to initialize ("ERROR 1123 ... Can't initialize
+          # function 'fractal_reason'; <reason>") look identical on
+          # stdout -- the error text is the discriminator between a
+          # plugin-load failure and a dispatch failure.
+          REPLY=$(mariadb -S /tmp/fsql_install_test.sock -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');" 2>&1) || true
           echo "reason reply: ${REPLY:0:80}"
+          # Environment actually inside the server process, captured
+          # before it's killed: BSD ps -E shows it, and it separates
+          # "the exports never reached mariadbd" from everything else.
+          MDB_ENV=$(ps -E -p "${MDB_PID}" -o command= 2>/dev/null || true)
           kill "${MOCK_PID}" 2>/dev/null || true
           kill "${MDB_PID}" 2>/dev/null || true
           echo "$REPLY" | grep -qi sql \
-              || { echo "FAIL: reasoning round-trip returned '${REPLY}'"; exit 1; }
+              || { echo "FAIL: reasoning round-trip returned '${REPLY}'"
+                   echo "--- reasoning env in this shell ---"
+                   env | grep '^FRACTALSQL_' || echo "(none)"
+                   echo "--- env as mariadbd sees it (ps -E) ---"
+                   echo "${MDB_ENV:-(mariadbd already exited; could not read)}"
+                   echo "--- plugin dir ---"
+                   ls -l "${PLUGIN_DIR}"
+                   echo "--- mock still reachable? ---"
+                   nc -z 127.0.0.1 18080 && echo "yes" || echo "no"
+                   echo "--- mock requests seen this run (if any) ---"
+                   cat /tmp/mock_llm.out 2>/dev/null || echo "(no mock output)"
+                   echo "--- datadir error log (tail) ---"
+                   tail -30 "${MARIADB_DATADIR}/$(hostname).err" 2>/dev/null || true
+                   exit 1; }
           echo "ok: macOS reasoning round-trip via mock endpoint"
 
   # -Provider skip only: scripts/easy_install.sh's own darwin branch of

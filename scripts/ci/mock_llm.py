@@ -66,8 +66,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args):
-        pass  # keep CI logs quiet
+    def log_message(self, fmt, *args):
+        # One line per request to stderr: did the plugin's HTTP POST
+        # actually arrive? build_test.sh and the CI jobs redirect this
+        # (mock's output lands in their own log files or on the FAIL
+        # branch), so it stays quiet where it needs to be -- but it makes
+        # a round-trip failure distinguishable between "no request ever
+        # arrived" (dlopen/plugin-load problem) and "request arrived but
+        # the reply wasn't accepted" (HTTP/parse problem).
+        sys.stderr.write("mock: %s %s\n" % (self.command, self.path))
 
 
 if __name__ == "__main__":
