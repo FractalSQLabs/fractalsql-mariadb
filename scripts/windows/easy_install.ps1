@@ -7,10 +7,13 @@
     same design, Windows-native underneath.
 
 .DESCRIPTION
-    Detects an installed MariaDB via its Windows Service (registered as
-    "MariaDB" by MariaDB Foundation's own installer since 10.4; every
-    major this repo supports is 10.6+, so that name is unconditional
-    here). -MdbDir overrides detection entirely. Offers to install the
+    Detects an installed MariaDB via its Windows Service, resolved from
+    the server binary's location rather than a hardcoded service name --
+    machines with several installs register several services (MariaDB,
+    MariaDB11, MariaDB12, ...), so the literal name "MariaDB" is just one
+    candidate, and it can belong to a different major than the one you
+    meant. -MdbDir overrides detection entirely; -ServiceName overrides
+    the service resolution. Offers to install the
     matching .msi if the FractalSQL plugin itself is missing. Runs the
     same reasoning-provider wizard as easy_install.sh: registers the
     UDFs and agent procedures, configures reasoning via the service's
@@ -51,6 +54,15 @@
     unix_socket, no password), the Windows MSI sets a root password
     during install.
 
+.PARAMETER ServiceName
+    Windows Service name to target, e.g. "MariaDB11". Optional: resolved
+    automatically from the install being targeted, since machines with
+    several MariaDB installs have several services (MariaDB, MariaDB11,
+    MariaDB12, ...) and the literal name "MariaDB" belongs to whichever
+    install registered it. Only needed when the service can't be matched
+    to the install directory another way (custom service names pointing
+    outside the install root).
+
 .PARAMETER Database
     Target database for the agent stored procedures -- must already
     exist. UDFs themselves are server-global (mysql.func) and need no
@@ -60,6 +72,15 @@
 
 .PARAMETER Provider
     ollama | openai-compatible | skip
+
+.PARAMETER TimeoutSecs
+    Reasoning request timeout in seconds, applied as the reasoning
+    plugin's FSQL_REASONING_HTTP_TIMEOUT_MS (minus 30s for its
+    low-speed abort). Default 330, the same cold-start headroom the
+    docker-compose demo sets: a local model that isn't loaded yet can
+    take minutes before its first token, and the plugin's shorter
+    built-in default turns that into a clean NULL. Only set for the
+    ollama provider.
 
 .PARAMETER Yes
     Pre-confirm every prompt (needed for CI/non-interactive use).
@@ -90,6 +111,7 @@ param(
     [string]$MdbDir,
     [int]$Port,
     [string]$RootPassword,
+    [string]$ServiceName,
     [string]$Database,
     [ValidateSet('ollama', 'openai-compatible', 'skip')][string]$Provider,
     [string]$Url,
@@ -97,6 +119,7 @@ param(
     [string]$Token,
     [string]$EmbedUrl,
     [string]$EmbedModel,
+    [int]$TimeoutSecs = 330,
     [string]$Think,
     [string]$ThinkProvider,
     [switch]$Yes,
@@ -122,7 +145,9 @@ if (-not $Version) { $Version = $FsqlVersion }
 if (-not $Version) { throw "could not determine a version to install. Pass -Version X.Y.Z" }
 
 $Repo = 'FractalSQLabs/fractalsql-mariadb'
-$ServiceName = 'MariaDB'
+# Resolved from the targeted install by Get-MariaDbTarget (see its
+# comments); -ServiceName overrides the resolution. Not hardcoded here:
+# machines with several installs have several candidate services.
 
 # --- output helpers ------------------------------------------------------
 function Write-Step { param([string]$Msg) Write-Host "==> $Msg" -ForegroundColor White }
@@ -186,25 +211,56 @@ function Resolve-RootPassword {
 
 # --- detect ----------------------------------------------------------------
 # Single-target detection (no -PgMajor-style multi-install selector, see
-# this file's own .DESCRIPTION): exactly one MariaDB Windows Service to
-# find, via Win32_Service's PathName (its mariadbd.exe location), the
-# same authoritative-over-a-guessed-registry-key approach build_test.ps1
-# itself uses for -MdbDir auto-completion. -MdbDir overrides this
-# entirely when given.
+# this file's own .DESCRIPTION): exactly one MariaDB install to target,
+# but NOT necessarily one service name. Reasoning config lives in the
+# service's registry Environment value and is applied by restarting that
+# service, so the service has to be resolved from the install being
+# targeted -- machines with several installs register several services
+# (MariaDB, MariaDB11, MariaDB12, ...) and the literal name "MariaDB"
+# belongs to whichever install registered it. -ServiceName overrides the
+# resolution when the service can't be matched another way.
+function Find-ServiceForDir {
+    param([string]$BaseDir)
+    $binDir = (Join-Path $BaseDir 'bin').TrimEnd('\').ToLower()
+    $found = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+        $_.PathName -and $_.PathName.ToLower().Contains($binDir)
+    })
+    return ($found | Select-Object -First 1)
+}
+
 function Get-MariaDbTarget {
     if ($MdbDir) {
         $exe = Join-Path $MdbDir 'bin\mariadbd.exe'
         if (-not (Test-Path $exe)) { Write-Die "-MdbDir '$MdbDir' doesn't look like a MariaDB install (no bin\mariadbd.exe)" }
+        $svc = Find-ServiceForDir $MdbDir
+        if (-not $svc) {
+            Write-Die "no Windows Service runs a server out of '$MdbDir\bin'. If the service exists under a name that can't be matched to this directory, pass -ServiceName."
+        }
+        $script:ServiceName = $svc.Name
         return @{ Dir = $MdbDir; Port = (Get-PortFor $MdbDir) }
     }
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Write-Die "no '$ServiceName' Windows Service found. If MariaDB is installed but the service has a different name, or you installed a no-service ZIP archive, pass -MdbDir."
+    # No -MdbDir: auto-detect by the server binary, not by the literal
+    # service name "MariaDB" -- that name is just one candidate, and on a
+    # multi-install machine it can belong to a different major than the
+    # one you meant.
+    $svcs = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+        $_.PathName -match '[\\/](mariadbd|mysqld)\.exe'
+    })
+    if (-not $svcs) {
+        Write-Die "no MariaDB Windows Service found (nothing runs mariadbd.exe/mysqld.exe). If MariaDB is installed as a no-service ZIP archive, pass -MdbDir."
     }
+    if ($svcs.Count -gt 1) {
+        Write-Host "Several MariaDB Windows Services found:"
+        foreach ($s in $svcs) { Write-Host "  $($s.Name) -> $($s.PathName)" }
+        Write-Die "pass -MdbDir <install dir> (or -ServiceName <name>) to pick one."
+    }
+    $svc = $svcs[0]
     # PathName looks like: "C:\Program Files\MariaDB 11.4\bin\mariadbd.exe" --defaults-file=...
-    $exePath = ($svc.PathName -replace '^"?([^"]+mariadbd\.exe)".*$', '$1')
-    if (-not (Test-Path $exePath)) { Write-Die "Service '$ServiceName' PathName didn't resolve to a real mariadbd.exe ($exePath). Pass -MdbDir." }
+    # (older installs register mysqld.exe; both names are the same binary.)
+    $exePath = ($svc.PathName -replace '^"?([^"]+[\\/](mariadbd|mysqld)\.exe)".*$', '$1')
+    if (-not (Test-Path $exePath)) { Write-Die "Service '$($svc.Name)' PathName didn't resolve to a real server exe ($exePath). Pass -MdbDir." }
     $dir = Split-Path (Split-Path $exePath -Parent) -Parent
+    $script:ServiceName = $svc.Name
     return @{ Dir = $dir; Port = (Get-PortFor $dir) }
 }
 
@@ -256,13 +312,45 @@ function Invoke-MariadbFile {
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.StandardInput.Write([IO.File]::ReadAllText($Path))
-    $proc.StandardInput.Close()
+    try {
+        $sqlText = [IO.File]::ReadAllText($Path)
+        # install_udf.sql hardcodes SONAME 'fractalsql.so' on every CREATE
+        # FUNCTION (the Linux load name). The UDF loader treats a SONAME
+        # with an explicit extension as a literal filename, so on Windows
+        # that has to be fractalsql.dll -- rewrite at pipe time rather than
+        # diverge the file per platform. install_agents.sql is pure SQL/PSM
+        # with no SONAME references, so this is a no-op for it.
+        $sqlText = $sqlText -replace "SONAME 'fractalsql\.so'", "SONAME 'fractalsql.dll'"
+        $proc.StandardInput.Write($sqlText)
+        $proc.StandardInput.Close()
+    } catch {
+        # mariadb.exe exits on the first statement error, which breaks the
+        # write pipe above. Fall through: the server's own error text on
+        # stderr is the useful diagnostic, not this pipe exception.
+    }
     $out = $proc.StandardOutput.ReadToEnd()
     $errOut = $proc.StandardError.ReadToEnd()
     $proc.WaitForExit()
     if ($proc.ExitCode -ne 0) { throw "mariadb.exe (< $Path) failed: $errOut" }
     return $out.Trim()
+}
+
+# Restart-Service returns when the service reports Running, but mariadbd
+# only starts accepting connections some seconds later. Everything this
+# script does after a restart talks to the live server, so poll for
+# readiness instead of racing it (a connection refused here used to
+# surface as a confusing "pipe is being closed" from the client).
+function Wait-ServerReady {
+    param([string]$Bin, [int]$MdbPort, [int]$TimeoutSecs = 60)
+    for ($i = 0; $i -lt $TimeoutSecs; $i++) {
+        try {
+            Invoke-Mariadb $Bin $MdbPort @('SELECT 1;') | Out-Null
+            return $true
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    return $false
 }
 
 # plugin_dir comes from a live `SELECT @@plugin_dir` query, not a
@@ -277,6 +365,13 @@ function Resolve-PluginDir {
     $mdbPort = if ($Port) { $Port } else { $Target.Port }
     $dir = Invoke-Mariadb $bin $mdbPort @('SELECT @@plugin_dir;')
     if (-not $dir) { Write-Die "SELECT @@plugin_dir returned nothing" }
+    # @@plugin_dir reports backslash-escaped paths on Windows
+    # ("C:\\Program Files\\..."). The reasoning plugin's loader doesn't
+    # resolve that escape, so a FRACTALSQL_REASONING_PLUGIN path built
+    # from the raw value never loads -- every reasoning call returns a
+    # clean NULL with no error and no HTTP attempt. Normalize to single
+    # separators before anything consumes it.
+    $dir = $dir -replace '\\\\', '\'
     $script:PluginDir = $dir.TrimEnd('\')
 }
 
@@ -329,11 +424,18 @@ function Install-Package {
 # read once at mariadbd.exe startup -- there is no GUC/sysvar surface at
 # all here (see this file's own .DESCRIPTION).
 # A Windows Service's environment lives in the registry
-# (HKLM:\SYSTEM\CurrentControlSet\Services\<service>\Environment, a
-# REG_MULTI_SZ value), written here via Set-ItemProperty, then
+# (HKLM:\SYSTEM\CurrentControlSet\Services\<service>, in a REG_MULTI_SZ
+# *value* named Environment -- NOT in a subkey of that name; the service
+# manager only reads the value), written here via Set-ItemProperty, then
 # Restart-Service.
+#
+# The write MERGES: entries already on the service that this wizard does
+# not manage (e.g. FRACTALSQL_ENTERPRISE_LIB set up by a separate
+# enterprise install) are preserved; wizard-managed keys overwrite their
+# own old values. A wholesale replace here is what silently disables a
+# previously-working enterprise tier on the next restart.
 function Set-ReasoningEnvAndRestart {
-    param([hashtable]$EnvValues)
+    param([hashtable]$EnvValues, [string]$Bin, [int]$MdbPort)
 
     Write-Step "About to set (service environment for '$ServiceName'):"
     foreach ($k in $EnvValues.Keys) {
@@ -351,7 +453,19 @@ function Set-ReasoningEnvAndRestart {
     $doRestart = Confirm-Step "Restart the MariaDB service now to apply it?"
 
     $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
-    $regValues = $EnvValues.Keys | ForEach-Object { "$_=$($EnvValues[$_])" }
+    $managedKeys = @($EnvValues.Keys)
+    $existing = @()
+    try {
+        $existing = @(Get-ItemProperty $regPath -ErrorAction Stop).Environment
+    } catch { }
+    $kept = @($existing | Where-Object {
+        $_ -and ($_.Split('=', 2)[0] -notin $managedKeys)
+    })
+    if ($kept.Count -gt 0) {
+        Write-Step ("Preserving existing service-environment entries this wizard does not manage: " +
+            (($kept | ForEach-Object { $_.Split('=', 2)[0] }) -join ', '))
+    }
+    $regValues = $kept + @($EnvValues.Keys | ForEach-Object { "$_=$($EnvValues[$_])" })
     $quotedValues = ($regValues | ForEach-Object { "'$($_ -replace "'", "''")'" }) -join ','
     $elevatedCmd = "Set-ItemProperty -Path '$regPath' -Name Environment -Value @($quotedValues) -Type MultiString"
     if ($doRestart) { $elevatedCmd += "; Restart-Service -Name '$ServiceName' -Force" }
@@ -379,7 +493,12 @@ function Set-ReasoningEnvAndRestart {
     }
 
     if ($doRestart) {
-        Write-Ok "$ServiceName restarted with the new reasoning config."
+        Write-Step "Waiting for $script:ServiceName to accept connections..."
+        if (-not (Wait-ServerReady $Bin $MdbPort)) {
+            Write-Warn2 "$script:ServiceName didn't accept connections within 60s of the restart. Check the error log under the install's data\ directory before continuing."
+            return $false
+        }
+        Write-Ok "$script:ServiceName restarted with the new reasoning config."
         return $true
     } else {
         Write-Ok "Environment written."
@@ -430,6 +549,13 @@ function Invoke-Wizard {
             $envValues['FRACTALSQL_HTTP_EMBED_MODEL'] = $EmbedModel
             $envValues['FRACTALSQL_HTTP_THINK'] = $Think
             $envValues['FRACTALSQL_HTTP_THINK_PROVIDER'] = $ThinkProvider
+            # Cold-start headroom for a local Ollama: a model that isn't
+            # loaded yet can take minutes before its first token, and the
+            # plugin's shorter built-in default turns that into a clean
+            # NULL. Same values docker-compose.yml sets for the same
+            # reason (330000ms / 300s).
+            $envValues['FSQL_REASONING_HTTP_TIMEOUT_MS'] = "$($TimeoutSecs * 1000)"
+            $envValues['FSQL_REASONING_HTTP_LOW_SPEED_SECS'] = "$([Math]::Max(1, $TimeoutSecs - 30))"
         }
         'openai-compatible' {
             if (-not $Url) { $Url = Prompt-Value "Chat completions URL" }
@@ -458,7 +584,7 @@ function Invoke-Wizard {
             }
             Write-Step "(-DryRun: not actually applying)"
         } else {
-            $applied = Set-ReasoningEnvAndRestart $envValues
+            $applied = Set-ReasoningEnvAndRestart $envValues $bin $mdbPort
         }
     }
 
@@ -538,6 +664,10 @@ function Invoke-Uninstall {
                 Write-Warn2 "Skipping: needs administrator access. Remove the Environment value under $regPath and restart $ServiceName by hand."
             }
             Write-Ok "Reasoning env vars reset."
+            Write-Step "Waiting for $script:ServiceName to accept connections..."
+            if (-not (Wait-ServerReady $bin $mdbPort)) {
+                Write-Warn2 "$script:ServiceName didn't accept connections within 60s of the restart. Check the error log under the install's data\ directory."
+            }
         }
     }
 

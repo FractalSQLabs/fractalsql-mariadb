@@ -97,6 +97,7 @@
 
 #include <mysql.h>
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -121,6 +122,7 @@
 #include "fractalsql_session.h"  /* fractal_session_acquire/_release */
 #include "fractalsql_enterprise.h"
 #include "fractalsql_hmac.h"     /* fsql_sha256/fsql_hmac_sha256: vendored, public-domain SHA-256 + HMAC-SHA256 */
+#include "fractalsql_msvc_compat.h"  /* strdup -> _strdup rename on MSVC/clang-cl */
 #include "fractalsql_parse.h"    /* parse_vector_csv, shared with fractalsql.c/fractalsql_vector.c */
 
 #include <openssl/evp.h>         /* Ed25519 signature verification, see ent_verify_signature() */
@@ -231,34 +233,76 @@ static void *ent_dlsym(void *h, const char *name) { return dlsym(h, name); }
  *
  * POSIX unlinks the copy immediately after the load -- the mapping
  * survives, and nothing is left on disk. Windows cannot delete a loaded
- * library, so the copy persists: it is pid-named (pids recycle), owned
- * by the mysqld service user, and a later mysqld with the same pid
- * overwrites it rather than accumulating copies. */
+ * library, so the copy persists for the life of the process: it is
+ * pid-named (pids recycle, so a later process with the same pid
+ * overwrites it) and lives in the OS temp directory, NOT next to the
+ * original -- the original may be a source tree or staging directory,
+ * and one unique pid per restart would otherwise accumulate a copy
+ * there on every mysqld restart. ent_clean_stale_copies() below
+ * garbage-collects leftovers from dead processes as a side effect of
+ * each verified load, so the temp directory stays bounded. */
+#if defined(_WIN32)
+static void
+ent_clean_stale_copies(const char *dir)
+{
+    char               pattern[MAX_PATH];
+    WIN32_FIND_DATAA   fd;
+    HANDLE             h;
+
+    if (snprintf(pattern, sizeof pattern, "%s.fractalsql-ent-*.tmp", dir)
+        >= (int) sizeof pattern)
+        return;
+    h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        char p[MAX_PATH];
+        if (snprintf(p, sizeof p, "%s%s", dir, fd.cFileName) < (int) sizeof p)
+            /* Best effort: a file still loaded by a live process (ours
+             * before restart, or another mysqld) fails the delete with
+             * a sharing violation, which is exactly right -- anything
+             * deletable is by definition not mapped anywhere. */
+            DeleteFileA(p);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+#endif /* _WIN32 */
+
 static void *
 ent_dlopen_verified_copy(const char *orig_path,
                          const unsigned char *bytes, size_t len)
 {
-    char        tmp_path[4096];
-    const char *slash    = strrchr(orig_path, '/');
-    const char *backlash = strrchr(orig_path, '\\');
-    const char *sep      = (backlash > slash) ? backlash : slash;
-    size_t      dir_len  = (sep != NULL) ? (size_t) (sep - orig_path + 1) : 0;
-    FILE       *f;
+    char  tmp_path[4096];
+    FILE *f;
 
-    if (dir_len >= sizeof tmp_path) return NULL;
-    memcpy(tmp_path, orig_path, dir_len);
 #if defined(_WIN32)
-    snprintf(tmp_path + dir_len, sizeof tmp_path - dir_len,
-             ".fractalsql-ent-%lu.tmp", (unsigned long) GetCurrentProcessId());
-    f = fopen(tmp_path, "wb");   /* pid-recycled overwrite, see above */
-#else
-    snprintf(tmp_path + dir_len, sizeof tmp_path - dir_len,
-             ".fractalsql-ent-XXXXXX");
     {
-        int fd = mkstemp(tmp_path);   /* exclusive create, mode 0600 */
-        if (fd < 0) return NULL;
-        f = fdopen(fd, "wb");
-        if (f == NULL) { close(fd); remove(tmp_path); return NULL; }
+        char tmpdir[MAX_PATH];
+        if (GetTempPathA(sizeof tmpdir, tmpdir) == 0) return NULL;
+        ent_clean_stale_copies(tmpdir);
+        if (snprintf(tmp_path, sizeof tmp_path, "%s.fractalsql-ent-%lu.tmp",
+                     tmpdir, (unsigned long) GetCurrentProcessId())
+            >= (int) sizeof tmp_path)
+            return NULL;
+        f = fopen(tmp_path, "wb");   /* pid-recycled overwrite, see above */
+    }
+#else
+    {
+        const char *slash    = strrchr(orig_path, '/');
+        const char *backlash = strrchr(orig_path, '\\');
+        const char *sep      = (backlash > slash) ? backlash : slash;
+        size_t      dir_len  = (sep != NULL) ? (size_t) (sep - orig_path + 1) : 0;
+
+        if (dir_len >= sizeof tmp_path) return NULL;
+        memcpy(tmp_path, orig_path, dir_len);
+        snprintf(tmp_path + dir_len, sizeof tmp_path - dir_len,
+                 ".fractalsql-ent-XXXXXX");
+        {
+            int fd = mkstemp(tmp_path);   /* exclusive create, mode 0600 */
+            if (fd < 0) return NULL;
+            f = fdopen(fd, "wb");
+            if (f == NULL) { close(fd); remove(tmp_path); return NULL; }
+        }
     }
 #endif
     {
@@ -831,6 +875,19 @@ ledger_scan_latest_two(FILE *fp, uint32_t want_kind,
     return 0;
 }
 
+/* Diagnostics for the ledger write path: the UDF layer collapses every
+ * storage failure into one SQL error, so an append that starts failing
+ * (bad path, bad permissions, a flush that silently drops bytes) is
+ * undebuggable from the SQL surface alone. Each FSQL_ESTORAGE exit in
+ * ledger_write_entry therefore names itself on stderr -- mysqld's error
+ * log destination -- before returning. */
+static void
+ledger_log_exit(const char *where)
+{
+    fprintf(stderr, "fractalsql-ledger: write path failed at %s (errno=%d)\n",
+            where, errno);
+}
+
 /* write_entry: append one new record for `kind`, chained to the latest
  * existing record of the same kind (or the all-zero genesis sentinel),
  * via a file append. */
@@ -876,12 +933,26 @@ ledger_repair_torn_tail(void)
 
     if (torn_at >= 0L)
     {
+        /* ledger_open_for_read handed us a read-only FILE*: truncating
+         * through it (ftruncate/_chsize both write) fails on every
+         * platform -- on Windows with EACCES -- so a torn tail could
+         * never actually be repaired and one bad append bricked the
+         * file for good. Reopen read-write for the truncate. */
+        fclose(fp);
 #if defined(_WIN32) || defined(__CYGWIN__)
-        int rc = _chsize(_fileno(fp), torn_at);
+        FILE *wr = fopen(ledger_path(), "r+b");
+        if (wr == NULL) return false;
+        int rc = _chsize(_fileno(wr), torn_at);
+        int werr = errno;
+        fclose(wr);
 #else
-        int rc = ftruncate(fileno(fp), torn_at);
+        FILE *wr = fopen(ledger_path(), "r+b");
+        if (wr == NULL) return false;
+        int rc = ftruncate(fileno(wr), torn_at);
+        int werr = errno;
+        fclose(wr);
 #endif
-        if (rc != 0) { fclose(fp); return false; }
+        if (rc != 0) { errno = werr; return false; }
     }
     fclose(fp);
     return true;
@@ -897,7 +968,7 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
      * own bytes (an instant chain brick for every later reader). No
      * current caller can reach this (packet caps bound len far below
      * 4 GiB), but this is an exported seam -- fail loudly instead. */
-    if (len > 0xFFFFFFFFu) return FSQL_ESTORAGE;
+    if (len > 0xFFFFFFFFu) { ledger_log_exit("oversize blob"); return FSQL_ESTORAGE; }
 
     ent_lock();
 
@@ -906,13 +977,23 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
     if (fp == NULL)
     {
         fp = fopen(ledger_path(), "w+b");
-        if (fp == NULL) { ent_unlock(); return FSQL_ESTORAGE; }
+        if (fp == NULL) { ledger_log_exit("open new ledger"); ent_unlock(); return FSQL_ESTORAGE; }
         is_new = true;
     }
 
     if (is_new)
     {
-        if (!ledger_write_header(fp)) { fclose(fp); ent_unlock(); return FSQL_ESTORAGE; }
+        if (!ledger_write_header(fp))
+            { fclose(fp); ledger_log_exit("write ledger header"); ent_unlock(); return FSQL_ESTORAGE; }
+        /* C11 7.21.5.3: on an update-mode stream ("w+b"), a write must
+         * be followed by an fflush or a reposition before any read.
+         * The scan below reads right after this header write; without
+         * the flush the Windows CRT has been observed to write out the
+         * stream's whole 4096-byte buffer (header plus zero filler),
+         * which the scan then parses as a tail of zero-length records
+         * -- a corrupted ledger from the very first append. */
+        if (fflush(fp) != 0)
+            { fclose(fp); ledger_log_exit("write ledger header"); ent_unlock(); return FSQL_ESTORAGE; }
     }
     else
     {
@@ -921,7 +1002,7 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
             memcmp(magic, LEDGER_MAGIC, LEDGER_MAGIC_LEN) != 0 ||
             fgetc(fp) != LEDGER_VERSION)
         {
-            fclose(fp); ent_unlock(); return FSQL_ESTORAGE;
+            fclose(fp); ledger_log_exit("bad ledger header"); ent_unlock(); return FSQL_ESTORAGE;
         }
     }
 
@@ -935,13 +1016,31 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
          * record) and rescan once; without this, a single torn append
          * bricks the file for every future write. */
         fclose(fp);
-        if (!ledger_repair_torn_tail()) { ent_unlock(); return FSQL_ESTORAGE; }
+        if (!ledger_repair_torn_tail())
+            { ledger_log_exit("torn-tail repair"); ent_unlock(); return FSQL_ESTORAGE; }
         fp = fopen(ledger_path(), "r+b");
-        if (fp == NULL) { ent_unlock(); return FSQL_ESTORAGE; }
+        if (fp == NULL)
+            { ledger_log_exit("reopen after repair"); ent_unlock(); return FSQL_ESTORAGE; }
+        /* Re-position past the file header: a fresh fopen starts at
+         * offset 0, and the scan below would otherwise parse the magic
+         * bytes as a record header whose blob length is garbage
+         * (e.g. "LDGR" as a uint32), failing every repair for a reason
+         * that has nothing to do with the repair itself. The initial
+         * scan above skips these 9 bytes via the write/validate branch;
+         * the rescan must skip them the same way. */
+        {
+            char magic[LEDGER_MAGIC_LEN];
+            if (fread(magic, 1, LEDGER_MAGIC_LEN, fp) != LEDGER_MAGIC_LEN ||
+                memcmp(magic, LEDGER_MAGIC, LEDGER_MAGIC_LEN) != 0 ||
+                fgetc(fp) != LEDGER_VERSION)
+            {
+                fclose(fp); ledger_log_exit("rescan after repair"); ent_unlock(); return FSQL_ESTORAGE;
+            }
+        }
         if (ledger_scan_latest_two(fp, (uint32_t) kind, &latest, &have_latest,
                                    &prior, &have_prior) < 0)
         {
-            fclose(fp); ent_unlock(); return FSQL_ESTORAGE;
+            fclose(fp); ledger_log_exit("rescan after repair"); ent_unlock(); return FSQL_ESTORAGE;
         }
     }
     if (have_prior) free(prior.blob);
@@ -968,7 +1067,7 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
     {
         size_t   buflen = LEDGER_HASH_LEN + len + (have_mac ? LEDGER_HASH_LEN : 0);
         uint8_t *buf    = (uint8_t *) malloc(buflen);
-        if (buf == NULL) { fclose(fp); ent_unlock(); return FSQL_ESTORAGE; }
+        if (buf == NULL) { fclose(fp); ledger_log_exit("out of memory"); ent_unlock(); return FSQL_ESTORAGE; }
         memcpy(buf, prev_hash, LEDGER_HASH_LEN);
         memcpy(buf + LEDGER_HASH_LEN, payload, len);
         if (have_mac) memcpy(buf + LEDGER_HASH_LEN + len, mac_tag, LEDGER_HASH_LEN);
@@ -985,7 +1084,7 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
      * across this whole function.) */
     fclose(fp);
     fp = fopen(ledger_path(), "ab");
-    if (fp == NULL) { ent_unlock(); return FSQL_ESTORAGE; }
+    if (fp == NULL) { ledger_log_exit("open ledger for append"); ent_unlock(); return FSQL_ESTORAGE; }
 
     uint32_t kind32     = (uint32_t) kind;
     uint32_t blen32      = (uint32_t) len;
@@ -1008,15 +1107,19 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
     ok = ok && fwrite(entry_hash, 1, LEDGER_HASH_LEN, fp) == LEDGER_HASH_LEN;
     ok = ok && fwrite(&updated, sizeof updated, 1, fp) == 1;
     if (ok && len > 0) ok = fwrite(payload, 1, len, fp) == len;
+    if (!ok) ledger_log_exit("record fwrite");
 
     /* Check the flush: on ENOSPC, an unchecked fflush would report a
      * successful append for bytes that never reached the file (and the
      * CSV mirror below would record a row the binary chain lacks). */
     if (ok) ok = (fflush(fp) == 0);
+    if (!ok) ledger_log_exit("fflush");
 #if defined(_WIN32) || defined(__CYGWIN__)
     if (ok) ok = (_commit(_fileno(fp)) == 0);
+    if (!ok) ledger_log_exit("_commit");
 #else
     if (ok) ok = (fsync(fileno(fp)) == 0);
+    if (!ok) ledger_log_exit("fsync");
 #endif
     fclose(fp);
 
@@ -1572,6 +1675,22 @@ ent_json_well_formed(const char *s, size_t len)
         }
         if (c == ',')
         {
+            if (sp == 0 || !after_value) return false;
+            after_value = false;
+            continue;
+        }
+        if (c == ':')
+        {
+            /* A colon is a separator exactly where a comma is: after a
+             * completed value, inside a container, always followed by
+             * another value. Which strings were keys is not tracked
+             * (see the block comment above) -- this checks separation,
+             * not placement. Without this branch a colon fell through
+             * to the generic "two values without a separator" rejection
+             * below, because after_value is always still set from the
+             * key string -- every valid object was rejected, so
+             * fractal_audit_log(type, JSON_OBJECT(...)) refused every
+             * payload and silently wrote nothing. */
             if (sp == 0 || !after_value) return false;
             after_value = false;
             continue;

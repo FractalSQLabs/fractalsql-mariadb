@@ -700,7 +700,10 @@ jobs:
         shell: pwsh
         run: |
           $svc = Get-CimInstance Win32_Service -Filter "Name='MariaDB'"
-          $exePath = ($svc.PathName -replace '^"?([^"]+mariadbd\.exe)".*$', '$1')
+          # MariaDB Windows installs register the service under either
+          # server binary name (mysqld.exe on older/most MSI layouts,
+          # mariadbd.exe elsewhere); both are the same binary.
+          $exePath = ($svc.PathName -replace '^"?([^"]+[\\/](mariadbd|mysqld)\.exe)".*$', '$1')
           $mdbDir = Split-Path (Split-Path $exePath -Parent) -Parent
           $env:MYSQL_PWD = 'fractalsql-ci'
           $mdbExe = Join-Path $mdbDir 'bin\mariadb.exe'

@@ -323,13 +323,13 @@ CALL fractal_agent_detour_classify(
     (SELECT CONCAT('[', GROUP_CONCAT(cum ORDER BY t, ord), ']') FROM (
         SELECT t, ord, SUM(step) OVER (PARTITION BY ord ORDER BY t) AS cum
           FROM (
-              WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 100)
+              WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 200)
               SELECT t, 1 AS ord, (RAND()-0.5)*0.3 AS step FROM seq
               UNION ALL
               SELECT t, 2 AS ord, (RAND()-0.5)*0.3 AS step FROM seq
           ) s
     ) c),
-    5, @r);
+    2, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.trace_complexity') AS trace_complexity,

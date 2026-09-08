@@ -1768,7 +1768,14 @@ SELECT fractal_audit_log('gate27_test', JSON_OBJECT('probe', 1));
 "@
     & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e $seedSql 2>&1 | Out-Null
 
-    $installSql = (Get-Content "$Here\sql\install_enterprise_connect.sql" -Raw) -replace [regex]::Escape("fractalsql_ledger.dat.csv"), "$ledgerPath.csv"
+    # Rewriting just the filename inside install_enterprise_connect.sql
+    # would leave its CONCAT(@@GLOBAL.datadir, ...) prefix glued onto our
+    # absolute path -- a path that can't exist, which CONNECT reads back
+    # as zero rows with no error. Override the ledger file via the
+    # script's own @fsql_ledger_csv session variable instead; forward
+    # slashes dodge MySQL string-literal escape handling on Windows.
+    $csvPath = "$ledgerPath.csv" -replace '\\', '/'
+    $installSql = "SET @fsql_ledger_csv = '$csvPath';`n" + (Get-Content "$Here\sql\install_enterprise_connect.sql" -Raw)
     $cr = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e $installSql 2>&1
     if (-not $cr) { Pass "27 enterprise_connect: CREATE TABLE ... ENGINE=CONNECT succeeds" } else { Fail "27 enterprise_connect: CREATE TABLE failed: $cr" }
 

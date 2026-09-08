@@ -131,7 +131,40 @@ Copyright notice:
 
 -------------------------------------------------------------------------------
 
-### 5. Algorithm Attributions (Original Implementations)
+### 5. OpenSSL
+Component: OpenSSL (libcrypto), statically linked into the Windows
+build of fractalsql.dll and redistributed inside that binary. Used by
+fractalsql_enterprise.c's ent_verify_signature() to verify the
+enterprise library's detached Ed25519 signature (EVP one-shot
+PureEdDSA verify) before loading it. Obtained via the vcpkg
+openssl:x64-windows-static triplet, matching the /MT static CRT build.
+Source: https://www.openssl.org/
+License: Apache License, Version 2.0
+
+Linkage by platform (same linkage-notes convention as entry 3):
+  - Windows: statically linked and bundled into the shipped
+    fractalsql.dll (MariaDB's official Windows binaries statically
+    link wolfSSL and provide no libcrypto to link against).
+  - Linux: dynamically linked against the distro-provided libcrypto
+    at link time; not bundled into the shipped .so. The same shared
+    object the MariaDB server package itself links, so no OpenSSL
+    code is redistributed.
+  - Darwin: dynamically linked against the system-provided libcrypto;
+    not bundled into the shipped .so.
+
+This product incorporates software developed by the OpenSSL Project
+for use in the OpenSSL Toolkit (https://www.openssl.org/).
+
+Copyright (c) The OpenSSL Project Authors. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you
+may not use this file except in compliance with the License. A copy
+of the License ships alongside this notice as the LICENSE file and is
+also available at https://www.apache.org/licenses/LICENSE-2.0.
+
+-------------------------------------------------------------------------------
+
+### 6. Algorithm Attributions (Original Implementations)
 
 The vendored core artifact (v2.x, community-sovereign) includes several
 components that are ORIGINAL C implementations of published algorithms/

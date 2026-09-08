@@ -1929,9 +1929,14 @@ SELECT fractal_audit_log('gate27_test', JSON_OBJECT('probe', 1));
 SQL
   "${MARIADB[@]}" < /tmp/fsql_gate27_seed.sql >/dev/null 2>&1
 
-  local install_sql; install_sql=$(sed \
-    -e "s#fractalsql_ledger.dat.csv#$ledger_path.csv#" \
-    "$HERE/sql/install_enterprise_connect.sql")
+  # Rewriting just the filename inside install_enterprise_connect.sql
+  # would leave its CONCAT(@@GLOBAL.datadir, ...) prefix glued onto our
+  # absolute $ledger_path.csv -- a path that can't exist, which CONNECT
+  # reads back as zero rows with no error. Override the ledger file via
+  # the script's own @fsql_ledger_csv session variable instead.
+  local install_sql
+  install_sql="SET @fsql_ledger_csv = '$ledger_path.csv';
+$(cat "$HERE/sql/install_enterprise_connect.sql")"
   local cr; cr=$(printf '%s\n' "$install_sql" | "${MARIADB[@]}" 2>&1)
   [ -z "$cr" ] && pass "27 enterprise_connect: CREATE TABLE ... ENGINE=CONNECT succeeds" \
                 || fail "27 enterprise_connect: CREATE TABLE failed: $cr"

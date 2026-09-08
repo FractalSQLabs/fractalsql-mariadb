@@ -12,7 +12,11 @@
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 
   UX flow
-    1. Welcome / EULA (bundled LICENSE).
+    1. Welcome / EULA. WixUI_InstallDir's LicenseAgreementDlg is
+       populated exclusively by the WixUILicenseRtf WixVariable below;
+       without it the WixUIExtension silently falls back to its own
+       bundled placeholder (lorem ipsum), so this must point at the
+       plain Apache 2.0 text (converted to RTF) shown in the dialog.
     2. WixUI_InstallDir lets the user pick the MariaDB install root
        (default: C:\Program Files\MariaDB X.Y). This must be the
        folder that MariaDB's own MSI server installer created, i.e.
@@ -58,6 +62,11 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of FractalSQL for MariaDB $(var.MARIADB_MAJOR) is already installed." />
     <MediaTemplate EmbedCab="yes" />
+
+    <!-- EULA dialog text. Resolved relative to the directory light
+         runs from (repo root, per build-msi.bat's pushd), and kept in
+         sync with the LICENSE file also shipped into share\doc\. -->
+    <WixVariable Id="WixUILicenseRtf" Value="scripts\windows\License.rtf" />
 
     <!-- WixUI_InstallDir targets the MariaDB-install-root folder. The
          power-user override for a non-default MariaDB root (e.g.

@@ -29,10 +29,15 @@
 -- @@GLOBAL.datadir so this works on any datadir, not just the default.
 --
 -- If FRACTALSQL_ENTERPRISE_LEDGER_PATH is set to something other than
--- "fractalsql_ledger.dat" (or to an absolute path of its own), edit
--- @ledger_file below to match -- the CSV mirror always lives alongside
+-- "fractalsql_ledger.dat" (or to an absolute path of its own), point
+-- @ledger_file at the matching CSV: either set the session variable
+--   SET @fsql_ledger_csv = '/absolute/path/to/ledger.dat.csv';
+-- in the same client session just before running this script, or
+-- hand-edit the COALESCE below. The CSV mirror always lives alongside
 -- the binary file with a .csv suffix appended, see ledger_csv_path()
--- in src/fractalsql_enterprise.c.
+-- in src/fractalsql_enterprise.c. On Windows pass forward slashes (or
+-- doubled backslashes): the path is read as a MySQL string literal,
+-- so single backslashes get eaten as escape sequences.
 --
 -- READONLY=1 is load-bearing, not a style choice: the CSV mirror carries
 -- no hash-chain enforcement of its own (that lives only in the binary
@@ -42,7 +47,8 @@
 -- fractal_ledger_flush / fractal_audit_log; this table is a read
 -- surface only.
 DROP TABLE IF EXISTS fractalsql_ledger;
-SET @ledger_file = CONCAT(@@GLOBAL.datadir, 'fractalsql_ledger.dat.csv');
+SET @ledger_file = COALESCE(@fsql_ledger_csv,
+                            CONCAT(@@GLOBAL.datadir, 'fractalsql_ledger.dat.csv'));
 SET @ddl = CONCAT('CREATE TABLE fractalsql_ledger (
     id              BIGINT,
     kind            INT,

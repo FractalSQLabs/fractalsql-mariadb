@@ -7,23 +7,19 @@
 *.pdb
 fractalsql.so
 fractal_mdb*.so
-
-# Gate-harness run logs (build_test.ps1 / build_test.sh output)
 build_test*.log
+demo-run.log
 
-# NOTE: include/sfs_core_bc.h is a tracked source file
-# (pre-compiled LuaJIT bytecode). Do not add it to this list.
+/.gate*
+/obj/
 
-# Build output trees
 dist/
 deps/
 
-# gcov/lcov coverage artifacts (build_test.sh --coverage)
 *.gcno
 *.gcda
 coverage_html/
 
-# Packaging temp files (fpm + debhelper + rpmbuild stagedirs)
 *.deb
 *.rpm
 packaging/debian/.debhelper/

@@ -155,8 +155,25 @@ DROP PROCEDURE IF EXISTS demo_bi_section3;
 DELIMITER $$
 CREATE PROCEDURE demo_bi_section3()
 BEGIN
-    DECLARE trend_sql   TEXT;
-    DECLARE trend_error TEXT;
+    DECLARE trend_sql    TEXT;
+    DECLARE trend_error  TEXT;
+    DECLARE exec_failed  TINYINT DEFAULT 0;
+    DECLARE exec_msg     TEXT DEFAULT NULL;
+    -- The model's generated SELECT is free to return a different column
+    -- shape than this demo's 2-column staging table (a live run returned
+    -- `yr, mo, revenue` instead of `mon, total_revenue`). Catch that here
+    -- rather than letting it abort the whole script: it is itself the
+    -- lesson -- generated SQL is never guaranteed to match a fixed
+    -- consumer schema, which is exactly why nothing should auto-execute
+    -- it in production without review.
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 @bi_err_state = RETURNED_SQLSTATE,
+                                  @bi_err_msg   = MESSAGE_TEXT;
+        SET exec_failed = 1,
+            exec_msg    = CONCAT('[', @bi_err_state, '] ', @bi_err_msg);
+    END;
+
     CALL fractal_text_to_sql(
         'show total revenue for each of the 6 most recent FULLY COMPLETED calendar months, excluding the current in-progress month, oldest first',
         '["bi_orders"]', trend_sql, trend_error);
@@ -165,13 +182,19 @@ BEGIN
     IF trend_error IS NULL THEN
         SET @sql = CONCAT('INSERT INTO bi_trend_result ', trend_sql);
         PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-        SELECT * FROM bi_trend_result;
+        IF exec_failed = 0 THEN
+            SELECT * FROM bi_trend_result;
 
-        SELECT fractal_reason(
-            CONNECTION_ID(),
-            'this is our last 6 months of revenue by month, what happened, and does it need attention?',
-            (SELECT JSON_ARRAYAGG(JSON_OBJECT('mon', mon, 'total_revenue', total_revenue)) FROM bi_trend_result)
-        );
+            SELECT fractal_reason(
+                CONNECTION_ID(),
+                'this is our last 6 months of revenue by month, what happened, and does it need attention?',
+                (SELECT JSON_ARRAYAGG(JSON_OBJECT('mon', mon, 'total_revenue', total_revenue)) FROM bi_trend_result)
+            );
+        ELSE
+            SELECT CONCAT('Skipped execution and reasoning: the generated SQL ran but its result shape did not match this demo''s 2-column staging table (mon, total_revenue) -- ',
+                          exec_msg,
+                          '. The model returned its own column layout instead. Generated SQL must be reviewed against whatever consumes its result before anything executes it.') AS note;
+        END IF;
     ELSE
         SELECT 'Skipped execution and reasoning: generation itself failed for this question.' AS note;
     END IF;

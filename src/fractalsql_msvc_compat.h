@@ -6,9 +6,9 @@
  * Minimal MSVC compatibility shims for the POSIX names this extension's
  * own translation units call directly. Included by every src\*.c TU that
  * uses the shimmed names (fractalsql_cognition.c, fractalsql_textsql.c,
- * fractalsql_session.c) -- one definition here instead of three
- * duplicated static blocks, following src\'s existing shared-header
- * pattern (fractalsql_session.h, fractalsql_parse.h).
+ * fractalsql_session.c, fractalsql_enterprise.c) -- one definition here
+ * instead of duplicated blocks per TU, following src\'s existing
+ * shared-header pattern (fractalsql_session.h, fractalsql_parse.h).
  *
  * MSVC has no POSIX setenv()/unsetenv(), and neither the UCRT nor the
  * vendored community-sovereign-c.lib carries them (confirmed directly:
@@ -64,6 +64,7 @@
 #define FRACTALSQL_MSVC_COMPAT_H
 
 #include <stdlib.h>  /* getenv, _putenv_s -- idempotent; don't rely on the includer */
+#include <string.h>  /* strdup/_strdup declarations for the macro below */
 
 /* GetModuleHandleW / GetProcAddress for the shared-UCRT write below.
  * Every includer of this header already includes <windows.h> first
@@ -74,15 +75,31 @@
 #  include <windows.h>
 #endif
 
+#if defined(_MSC_VER)
+
+/* strdup: the POSIX name exists in the UCRT but is marked deprecated
+ * (_CRT_NONSTDC_DEPRECATE), which clang-cl surfaces as
+ * -Wdeprecated-declarations on every call site. _strdup is the same
+ * CRT function under its ISO-conformant spelling, so a macro rename
+ * changes nothing at runtime. POSIX spellings stay on MinGW (no
+ * _MSC_VER) and everywhere else. */
+#define strdup _strdup
+
+#endif /* _MSC_VER */
+
 #if defined(_MSC_VER) && !defined(HAVE_SETENV)
 
 /* ucrtbase.dll's own _putenv_s -- the one that updates the environ block
  * shared by every DYNAMICALLY-linked UCRT module in this process, i.e.
  * the view the vendored reasoning plugin's getenv() reads. Not declared
- * in any header we ship; resolved dynamically below. */
+ * in any header we ship; resolved dynamically below. static inline
+ * rather than plain static so a TU that includes this header for one
+ * shim but calls neither setenv() nor unsetenv() (fractalsql_enterprise.c
+ * wants only the strdup rename) doesn't earn -Wunused-function for the
+ * other two. */
 typedef int (__cdecl *fsql_ucrt_putenv_s_fn)(const char *, const char *);
 
-static void
+static inline void
 fsql_putenv_shared_ucrt(const char *name, const char *value)
 {
     HMODULE ucrt;
@@ -94,7 +111,7 @@ fsql_putenv_shared_ucrt(const char *name, const char *value)
     if (putenv_s != NULL) putenv_s(name, value);
 }
 
-static int
+static inline int
 setenv(const char *name, const char *value, int overwrite)
 {
     if (!overwrite && getenv(name) != NULL) return 0;
@@ -103,7 +120,7 @@ setenv(const char *name, const char *value, int overwrite)
     return 0;
 }
 
-static int
+static inline int
 unsetenv(const char *name)
 {
     if (_putenv_s(name, "") != 0) return -1;

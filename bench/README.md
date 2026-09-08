@@ -1,21 +1,26 @@
+<p align="center">
+  <img src="../FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
 # FractalSQL benchmark: native VECTOR(n) index vs Scout Mode
 
 Head-to-head comparison of MariaDB's own built-in `VECTOR(n)` ANN index
-against `fractal_explore` (Scout Mode, `walk=0`). Measures search
-latency and island recall on a synthetic Gaussian-cluster dataset.
-
-This is a SEPARATE suite from `bench/tester/` (the pre-existing Node.js
-throughput driver that measures raw `fractal_search()` latency percentiles);
-this one is a research/methodology comparison.
+against FractalSQL's `fractal_explore` (Scout Mode, `walk=0`). Measures
+search latency and island recall on a synthetic Gaussian-cluster dataset.
+This is a research/methodology comparison, distinct from
+[`bench/tester/`](tester/)'s raw `fractal_search()` latency-percentile
+throughput driver.
 
 ## Prerequisites
 
-- MariaDB 10.6-12.3 with `fractalsql.so` installed. The native-`VECTOR(n)`
-  comparison arm additionally needs MariaDB 11.7+ (GA in 11.8 LTS). Every
-  script here self-detects and degrades gracefully (Scout-only numbers, no
-  native arm) on older majors.
+- MariaDB 10.6-12.3 with FractalSQL installed (the example output below
+  is from a real `mariadb:12.2` run; nothing here is version-specific).
+  The native-`VECTOR(n)` comparison arm additionally needs MariaDB 11.7+
+  (GA in 11.8 LTS). Every script here self-detects and degrades
+  gracefully (Scout-only numbers, no native arm) on older majors.
 - Python 3.9+
-- A database you can create/drop tables in (default: `fractalsql_bench`)
+- A database you can create/drop tables in (default connection expects
+  a database named `fractalsql_bench`)
 
 ## Setup
 
@@ -51,7 +56,7 @@ Or run the two steps directly:
 ```bash
 python3 bench/data_gen.py --host 127.0.0.1 --password <root password> \
     --with-native-vector          # ~15-45s to populate 5000 rows + build the index
-python3 bench/head_to_head.py --host 127.0.0.1 --password <root password>
+python3 bench/head_to_head.py --host 127.0.0.1 --password <root password>   # seconds for 5 queries at the default scale
 ```
 
 ## What you should see
@@ -139,11 +144,12 @@ this table. The native-index arm (see "What
 you should see" above) is a real server-side ANN query and is effectively
 N-independent by comparison, at whatever N your MariaDB 11.7+ server can
 hold; that section's own 5000-row measurement is the reference point for
-it, not this table.
+it, not this table. For now, Scout Mode is best applied to curated
+sub-corpora where diversity matters more than scan throughput.
 
 ## Tuning
 
-`head_to_head.py` exposes:
+`head_to_head.py` exposes a few knobs:
 
 ```
 --n-queries     number of queries to average (default 5)
