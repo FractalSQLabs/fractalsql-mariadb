@@ -110,7 +110,16 @@ jobs:
               MC="mariadb --protocol=socket -uroot -ptest"
 
               docker cp "${SO}" "${M}:/usr/lib/mysql/plugin/fractalsql.so"
-              docker exec -i "${M}" ${MC} < sql/install_udf.sql
+              # install_udf.sql's UDF half is server-global (mysql.func,
+              # no default database needed), but its procedural half
+              # (fractal_schema_context, _fractalsql_scan_corpus, ...)
+              # are ordinary stored procedures: DROP/CREATE PROCEDURE
+              # fails with ERROR 1046 "No database selected" unless the
+              # client has a default database. Create a scratch one and
+              # select it; CREATE FUNCTION is unaffected by the choice.
+              docker exec "${M}" ${MC} \
+                  -e "CREATE DATABASE IF NOT EXISTS fractalsql_ci;"
+              docker exec -i "${M}" ${MC} -D fractalsql_ci < sql/install_udf.sql
 
               EDITION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractalsql_edition();")
@@ -317,6 +326,12 @@ jobs:
         run: |
           set -euo pipefail
           brew install mariadb-connector-c pkg-config
+          # mariadb-connector-c is keg-only (homebrew-core #196747):
+          # nothing is linked into the default prefix, so its
+          # libmariadb.pc is not on pkg-config's default search path
+          # and "pkg-config --cflags libmariadb" fails with "Package
+          # 'libmariadb' not found". Point pkg-config at the keg.
+          echo "PKG_CONFIG_PATH=$(brew --prefix mariadb-connector-c)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Verify vendored core archive is present
         run: |
@@ -635,6 +650,12 @@ jobs:
         shell: cmd
         env:
           MARIADB_MAJOR: ${{ matrix.mariadb_major }}
+          # Newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # (and VCPKG_INSTALLATION_ROOT) pointing at it -- an install
+          # tree that has no OpenSSL and that build.bat would then
+          # resolve OPENSSL_DIR against. Pin VCPKG_ROOT to the
+          # pre-installed C:\vcpkg the install below actually populates.
+          VCPKG_ROOT: 'C:\vcpkg'
         run: |
           set MARIADB_DIR=%CD%\deps\mariadb\root
           set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%

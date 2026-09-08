@@ -162,7 +162,12 @@ jobs:
       - name: build_test.ps1 -MdbDir deps\mariadb\root -MdbMajor ${{ matrix.mdb }}
         shell: pwsh
         run: |
-          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "${{ matrix.mdb }}" -TimeoutMult 2
+          # -VcpkgRoot pins the vcpkg tree the step above populates:
+          # newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # pointing at it, and Resolve-VcpkgRoot's env fallback would
+          # resolve OpenSSL against that empty tree. Same drift fix as
+          # release.yml's build-windows-msi job.
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "${{ matrix.mdb }}" -VcpkgRoot "C:\vcpkg" -TimeoutMult 2
           exit $LASTEXITCODE
 
   darwin-gate-matrix:
@@ -290,7 +295,7 @@ jobs:
       - name: build_test.ps1 -Asan mdb11.4
         shell: pwsh
         run: |
-          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Asan -TimeoutMult 4
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Asan -VcpkgRoot "C:\vcpkg" -TimeoutMult 4
           exit $LASTEXITCODE
 
   windows-ubsan:
@@ -327,7 +332,7 @@ jobs:
       - name: build_test.ps1 -Ubsan mdb11.4
         shell: pwsh
         run: |
-          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Ubsan -TimeoutMult 4
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Ubsan -VcpkgRoot "C:\vcpkg" -TimeoutMult 4
           exit $LASTEXITCODE
 
   darwin-asan:

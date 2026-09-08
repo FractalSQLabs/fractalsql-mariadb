@@ -678,6 +678,12 @@ jobs:
         shell: cmd
         env:
           MARIADB_MAJOR: ${{ env.MDB_VER }}
+          # Pin VCPKG_ROOT to the pre-installed C:\vcpkg the install
+          # below populates: newer runner images ship VS-bundled vcpkg
+          # with VCPKG_ROOT pointing at it, and build.bat would resolve
+          # OPENSSL_DIR against that empty install tree. Same pin as
+          # release.yml's build-windows-msi job.
+          VCPKG_ROOT: 'C:\vcpkg'
         run: |
           set MARIADB_DIR=%CD%\deps\mariadb\root
           set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%
