@@ -325,7 +325,10 @@ jobs:
       - name: Install MariaDB client headers
         run: |
           set -euo pipefail
-          brew install mariadb-connector-c pkg-config
+          # openssl@3 for fractalsql_enterprise.c's Ed25519 signature
+          # check (the macOS SDK ships no OpenSSL headers; linked
+          # statically in the compile step below).
+          brew install mariadb-connector-c pkg-config openssl@3
           # mariadb-connector-c is keg-only (homebrew-core #196747):
           # nothing is linked into the default prefix, so its
           # libmariadb.pc is not on pkg-config's default search path
@@ -348,13 +351,22 @@ jobs:
           set -euo pipefail
           OUT_DIR="dist/${{ matrix.platform_tag }}"
           mkdir -p "${OUT_DIR}"
+          # OpenSSL (static) for fractalsql_enterprise.c's Ed25519
+          # signature check, same linkage as the Windows build. macOS
+          # ships no OpenSSL headers in its SDK and Homebrew's openssl@3
+          # is keg-only, so point the compile at the keg explicitly and
+          # link its libcrypto.a statically -- the otool posture check
+          # below would reject a dynamic libcrypto dependency.
+          OPENSSL_DIR="$(brew --prefix openssl@3)"
           MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
           echo "MARIADB_CFLAGS: ${MDB_CFLAGS}"
+          echo "OPENSSL_DIR: ${OPENSSL_DIR}"
           CORE_A="include/darwin-${{ matrix.arch }}/libfractalsql-community-sovereign-c.a"
           clang -Wall -Wextra -O3 -fPIC \
               -arch ${{ matrix.arch }} \
               ${MDB_CFLAGS} \
               -Iinclude \
+              -I"${OPENSSL_DIR}/include" \
               -ffunction-sections -fdata-sections -fvisibility=default \
               -dynamiclib \
               -Wl,-dead_strip \
@@ -367,6 +379,7 @@ jobs:
               src/fractalsql_textsql.c \
               src/fractalsql_enterprise.c \
               "${CORE_A}" \
+              "${OPENSSL_DIR}/lib/libcrypto.a" \
               -lm -lpthread
           ls -l "${OUT_DIR}/fractalsql.dylib"
 

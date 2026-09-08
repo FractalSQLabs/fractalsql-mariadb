@@ -145,12 +145,16 @@ Linkage by platform (same linkage-notes convention as entry 3):
   - Windows: statically linked and bundled into the shipped
     fractalsql.dll (MariaDB's official Windows binaries statically
     link wolfSSL and provide no libcrypto to link against).
-  - Linux: dynamically linked against the distro-provided libcrypto
-    at link time; not bundled into the shipped .so. The same shared
-    object the MariaDB server package itself links, so no OpenSSL
-    code is redistributed.
-  - Darwin: dynamically linked against the system-provided libcrypto;
-    not bundled into the shipped .so.
+  - Linux: no libcrypto dependency is linked into the shipped .so at
+    all (the release posture check allowlists only glibc); its
+    OpenSSL symbols resolve at plugin-load time from mariadbd's own
+    dynamically-linked libcrypto, the same shared object the MariaDB
+    server package itself links. No OpenSSL code is redistributed.
+  - Darwin: statically linked (from Homebrew's openssl@3 keg) and
+    bundled into the shipped fractalsql.dylib -- the macOS SDK ships no
+    OpenSSL headers, and a dynamic libcrypto dependency would violate
+    the release workflow's otool posture check, which allowlists only
+    the system's own libs.
 
 This product incorporates software developed by the OpenSSL Project
 for use in the OpenSSL Toolkit (https://www.openssl.org/).

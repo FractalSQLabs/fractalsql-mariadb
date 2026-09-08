@@ -34,21 +34,28 @@ pushd %REPO_ROOT%
 
 if "%MARIADB_MAJOR%"==""    (
     echo ==^> ERROR: MARIADB_MAJOR must be set ^(10.6 ^| 10.11 ^| 11.4 ^| 12.3^)
-    popd ^& exit /b 1
+    popd
+    exit /b 1
 )
 if "%MSI_ARCH%"==""    set MSI_ARCH=x64
 if "%MSI_VERSION%"=="" (
-    for /f "tokens=3" %%V in ('findstr /r "^#define FSQL_VERSION" src\fractalsql.c') do set MSI_VERSION=%%~V
+    REM findstr splits a plain /r pattern on spaces into multiple search
+    REM strings, which would also match every other line mentioning
+    REM FSQL_VERSION (e.g. "static const char kVersion[] = FSQL_VERSION;")
+    REM and let the last match's token 3 win. /c: keeps it one pattern.
+    for /f "tokens=3" %%V in ('findstr /r /c:"^#define FSQL_VERSION" src\fractalsql.c') do set MSI_VERSION=%%~V
 )
 if "%MSI_VERSION%"=="" (
     echo ==^> ERROR: could not read FSQL_VERSION from src\fractalsql.c; set MSI_VERSION explicitly
-    popd ^& exit /b 1
+    popd
+    exit /b 1
 )
 
 set DLL=dist\windows\mdb%MARIADB_MAJOR%\fractalsql.dll
 if not exist "%DLL%" (
     echo ==^> ERROR: %DLL% missing: run build.bat with MARIADB_MAJOR=%MARIADB_MAJOR% first
-    popd ^& exit /b 1
+    popd
+    exit /b 1
 )
 
 REM Per-(major, arch) staging dir so candle can reference a stable
@@ -92,7 +99,8 @@ if "%MARIADB_MAJOR%"=="11.4"   set MAJOR_HEX=0B04
 if "%MARIADB_MAJOR%"=="12.3"   set MAJOR_HEX=0C03
 if "%MAJOR_HEX%"==""    (
     echo ==^> ERROR: no MAJOR_HEX mapping for MARIADB_MAJOR=%MARIADB_MAJOR%
-    popd ^& exit /b 1
+    popd
+    exit /b 1
 )
 set OBJ=obj\fractalsql-mdb%MAJOR_TAG%-%MSI_ARCH%.wixobj
 
@@ -122,7 +130,8 @@ candle -nologo -arch %MSI_ARCH% ^
     -out %OBJ% %WXS%
 if errorlevel 1 (
     echo ==^> candle failed
-    popd ^& exit /b 1
+    popd
+    exit /b 1
 )
 
 light -nologo ^
@@ -132,7 +141,8 @@ light -nologo ^
       %OBJ%
 if errorlevel 1 (
     echo ==^> light failed
-    popd ^& exit /b 1
+    popd
+    exit /b 1
 )
 
 echo ==^> Built %MSI%
