@@ -22,13 +22,14 @@ jobs:
   # MariaDB 10.6 / 10.11 / 11.4 LTS and 12.3 LTS, so one .so per
   # arch covers the whole supported range, no per-major fan-in.
   #
-  # amd64 gets a native smoke test inside real mariadb:11.4 AND
+  # Both arches get a native smoke test inside real mariadb:11.4 AND
   # mariadb:12.3 containers (edition + version + fractal_search
   # cosine-similarity convergence), the same .so in, both containers
-  # out, which is the actual cross-major-ABI proof.
-  # arm64 skips the smoke test: QEMU + mariadbd is too slow and flaky,
-  # and the Dockerfile's post-link assertions already validate the
-  # arm64 ABI (ldd shortlist, .dynsym exports, size ceiling).
+  # out, which is the actual cross-major-ABI proof. The arm64 cell
+  # runs on GitHub's native ubuntu-24.04-arm runner, so its Docker
+  # images and mariadbd are arm64 at full speed -- the historical
+  # reason for skipping it (QEMU translation of the whole server was
+  # too slow and flaky) went away when the runner became native.
   # ------------------------------------------------------------------
   build:
     name: build ${{ matrix.arch }}
@@ -62,10 +63,9 @@ jobs:
           ls -l dist/${{ matrix.arch }}/fractalsql.so
 
       - name: Smoke test (edition/version + fractal_search convergence)
-        if: matrix.arch == 'amd64'
         run: |
           set -euo pipefail
-          SO="dist/amd64/fractalsql.so"
+          SO="dist/${{ matrix.arch }}/fractalsql.so"
 
           # Validate the same fractalsql.so against both current LTS
           # majors (11.4 and 12.3). Same binary in, both containers
@@ -336,6 +336,21 @@ jobs:
           # 'libmariadb' not found". Point pkg-config at the keg.
           echo "PKG_CONFIG_PATH=$(brew --prefix mariadb-connector-c)/lib/pkgconfig" >> "$GITHUB_ENV"
 
+      # The macos-14 runner is arm64, so arm-Homebrew's openssl@3 keg
+      # contains only arm64 objects; linking them into an -arch x86_64
+      # build makes ld discard every member ("found architecture 'arm64',
+      # required architecture 'x86_64'") and all EVP symbols go
+      # undefined. Install Intel Homebrew under Rosetta (its prefix is
+      # /usr/local, x86_64 bottles -- no source build) to get an x86_64
+      # libcrypto.a for the amd64 cell only.
+      - name: Install x86_64 OpenSSL under Rosetta
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          arch -x86_64 /usr/local/bin/brew install openssl@3
+
       - name: Verify vendored core archive is present
         run: |
           set -euo pipefail
@@ -356,8 +371,15 @@ jobs:
           # ships no OpenSSL headers in its SDK and Homebrew's openssl@3
           # is keg-only, so point the compile at the keg explicitly and
           # link its libcrypto.a statically -- the otool posture check
-          # below would reject a dynamic libcrypto dependency.
-          OPENSSL_DIR="$(brew --prefix openssl@3)"
+          # below would reject a dynamic libcrypto dependency. The keg
+          # must match the -arch being built: x86_64 uses the
+          # Rosetta-Homebrew keg (see the install step above), arm64
+          # uses the runner's own arm-Homebrew keg.
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+              OPENSSL_DIR="/usr/local/opt/openssl@3"
+          else
+              OPENSSL_DIR="$(brew --prefix openssl@3)"
+          fi
           MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
           echo "MARIADB_CFLAGS: ${MDB_CFLAGS}"
           echo "OPENSSL_DIR: ${OPENSSL_DIR}"
@@ -390,9 +412,14 @@ jobs:
 
           echo "--- otool -L ---"
           otool -L "${DYLIB}"
+          # tail drops the "path:" header; the self-name filter drops
+          # the dylib's own LC_ID_DYLIB entry, which otool -L also
+          # prints (install name = the -o output path) and which is
+          # not a real dependency.
           BAD=$(otool -L "${DYLIB}" \
                   | tail -n +2 \
                   | awk '{print $1}' \
+                  | grep -v 'fractalsql\.dylib$' \
                   | grep -vE '^(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|/usr/lib/libresolv\.[0-9]+\.dylib|/System/Library/Frameworks/)' \
                   | grep -v '^$' || true)
           if [ -n "${BAD}" ]; then
