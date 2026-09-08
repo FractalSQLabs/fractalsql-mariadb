@@ -79,9 +79,14 @@ jobs:
         with:
           name: packages-amd64
           path: dist/packages
-      - name: Install + verify in ubuntu:24.04 with mariadb-server ${{ matrix.mdb }}
+      # MariaDB's apt repo carries 10.6 only through jammy (the mirror's
+      # repo/10.6/ubuntu/dists listing stops at jammy -- no noble), so
+      # the 10.6 cell runs the 22.04 image; jammy's glibc 2.35 still
+      # satisfies the .deb's libc6 >= 2.34 dependency.
+      - name: Install + verify in ${{ matrix.mdb == '10.6' && 'ubuntu:22.04' || 'ubuntu:24.04' }} with mariadb-server ${{ matrix.mdb }}
         env:
           MDB_VER: ${{ matrix.mdb }}
+          MDB_IMAGE: ${{ matrix.mdb == '10.6' && 'ubuntu:22.04' || 'ubuntu:24.04' }}
         run: |
           cat > test-deb.sh <<SCRIPT
           set -euo pipefail
@@ -130,8 +135,14 @@ jobs:
           ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
               || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
 
-          mariadb < /work/sql/install_udf.sql
-          mariadb < /work/sql/install_agents.sql
+          # install_udf.sql registers the fractal_schema_context stored
+          # procedure after the global CREATE FUNCTIONs -- CREATE/DROP
+          # PROCEDURE need a database selected (ERROR 1046 "No database
+          # selected" otherwise), even though the FUNCTIONs themselves
+          # are server-global.
+          mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mariadb fractalsql_ci < /work/sql/install_udf.sql
+          mariadb fractalsql_ci < /work/sql/install_agents.sql
 
           EDITION=\$(mariadb -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
           VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
@@ -195,7 +206,7 @@ jobs:
           docker run --rm \
               -e MDB_VER="${MDB_VER}" \
               -v "${{ github.workspace }}:/work" -w /work \
-              ubuntu:24.04 bash /work/test-deb.sh
+              "${MDB_IMAGE}" bash /work/test-deb.sh
 
   # Runs inside a bare ubuntu:24.04 container with no systemd (mariadbd
   # started directly, same as debian-install above) -- this deliberately
@@ -301,6 +312,10 @@ jobs:
           cat > test-rpm.sh <<SCRIPT
           set -euo pipefail
 
+          # mariadb_repo_setup itself needs curl; rockylinux:9's minimal
+          # image doesn't ship it.
+          dnf install -qy curl
+
           # MariaDB Foundation's repo setup, same script as the Debian
           # job, auto-detects dnf and pins the requested major.
           curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
@@ -336,8 +351,14 @@ jobs:
           ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
               || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
 
-          mariadb < /work/sql/install_udf.sql
-          mariadb < /work/sql/install_agents.sql
+          # install_udf.sql registers the fractal_schema_context stored
+          # procedure after the global CREATE FUNCTIONs -- CREATE/DROP
+          # PROCEDURE need a database selected (ERROR 1046 "No database
+          # selected" otherwise), even though the FUNCTIONs themselves
+          # are server-global.
+          mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mariadb fractalsql_ci < /work/sql/install_udf.sql
+          mariadb fractalsql_ci < /work/sql/install_agents.sql
 
           EDITION=\$(mariadb -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
           VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
@@ -398,7 +419,7 @@ jobs:
       - name: Install MariaDB (Homebrew) + client headers
         run: |
           set -euo pipefail
-          brew install mariadb mariadb-connector-c pkg-config
+          brew install mariadb mariadb-connector-c pkg-config openssl@3
           brew services start mariadb
           # No -uroot: Homebrew's MariaDB 12.x post-install creates
           # root@localhost with unix_socket auth only (connection denied
@@ -418,10 +439,15 @@ jobs:
           CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
           test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
           MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
+          # Homebrew's openssl@3 is keg-only and the macos-14 SDK ships
+          # no OpenSSL headers: without -I/-L/-lcrypto the build dies at
+          # fractalsql_enterprise.c's #include <openssl/evp.h>.
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
           mkdir -p dist/darwin
           clang -Wall -Wextra -O3 -fPIC \
               -arch arm64 \
               ${MDB_CFLAGS} \
+              -I"${OPENSSL_PREFIX}/include" \
               -Iinclude \
               -ffunction-sections -fdata-sections -fvisibility=default \
               -dynamiclib \
@@ -435,6 +461,7 @@ jobs:
               src/fractalsql_textsql.c \
               src/fractalsql_enterprise.c \
               "${CORE_A}" \
+              -L"${OPENSSL_PREFIX}/lib" -lcrypto \
               -lm -lpthread
           ls -l dist/darwin/fractalsql.dylib
 
@@ -445,8 +472,9 @@ jobs:
           echo "plugin_dir: ${PLUGIN_DIR}"
           cp dist/darwin/fractalsql.dylib "${PLUGIN_DIR}/fractalsql.so"
           cp include/darwin-arm64/fractalsql-reasoning-http.so "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
-          mariadb < sql/install_udf.sql
-          mariadb < sql/install_agents.sql
+          mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mariadb fractalsql_ci < sql/install_udf.sql
+          mariadb fractalsql_ci < sql/install_agents.sql
 
           EDITION=$(mariadb -N -B -e "SELECT fractalsql_edition();")
           VERSION=$(mariadb -N -B -e "SELECT fractalsql_version();")
@@ -520,7 +548,7 @@ jobs:
       - name: Install MariaDB (Homebrew) and start it
         run: |
           set -euo pipefail
-          brew install mariadb mariadb-connector-c pkg-config
+          brew install mariadb mariadb-connector-c pkg-config openssl@3
           brew services start mariadb
           # No -uroot: Homebrew's MariaDB 12.x post-install creates
           # root@localhost with unix_socket auth only (connection denied
@@ -540,14 +568,16 @@ jobs:
           CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
           test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
           MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
           mkdir -p /tmp/fsql-stage
-          clang -Wall -Wextra -O3 -fPIC -arch arm64 ${MDB_CFLAGS} -Iinclude \
+          clang -Wall -Wextra -O3 -fPIC -arch arm64 ${MDB_CFLAGS} \
+              -I"${OPENSSL_PREFIX}/include" -Iinclude \
               -ffunction-sections -fdata-sections -fvisibility=default \
               -dynamiclib -Wl,-dead_strip \
               -o /tmp/fsql-stage/fractalsql.dylib \
               src/fractalsql.c src/fractalsql_parse.c src/fractalsql_session.c src/fractalsql_vector.c \
               src/fractalsql_cognition.c src/fractalsql_textsql.c src/fractalsql_enterprise.c \
-              "${CORE_A}" -lm -lpthread
+              "${CORE_A}" -L"${OPENSSL_PREFIX}/lib" -lcrypto -lm -lpthread
           cp include/darwin-arm64/fractalsql-reasoning-http.so /tmp/fsql-stage/
           chmod +x scripts/macos/install.sh
           cp scripts/macos/install.sh /tmp/fsql-stage/

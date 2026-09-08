@@ -533,7 +533,18 @@ mdb_setup() {
   # FRACTALSQL_REASONING_PLUGIN/HTTP_URL/HTTP_EMBED_URL must be in
   # mariadbd's OWN process environment at exec time (read once, lazily,
   # per process).
-  cp "$HERE/include/linux-x86_64/fractalsql-reasoning-http.so" "$PLUGDIR/fractalsql-reasoning-http.so" || return 2
+  # Vendored per-platform: "linux-x86_64"/"linux-aarch64" on Linux,
+  # "darwin-arm64"/"darwin-x86_64" on macOS (same naming fsql_platform
+  # below resolves; the darwin file is a Mach-O under the same .so
+  # name, matching what the darwin release zip's install.sh stages).
+  # Hardcoding linux-x86_64 here would copy the Linux ELF on macOS: cp
+  # itself succeeds (the repo checkout carries every platform's dir),
+  # but mariadbd's dlopen of an ELF on Mach-O then fails, and every
+  # HTTP-backed gate (04 text_to_sql, 13 vectorizer, 15/17/18 embed,
+  # 23 cognition) NULLs while the locally-compiled fixture gates
+  # (05/07/14/15/29) still pass -- caught live on darwin-gate-matrix.
+  local fsql_platform; fsql_platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+  cp "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so" "$PLUGDIR/fractalsql-reasoning-http.so" || return 2
   local mock_port=$(( 18300 + $(echo "$v" | tr -d '.') % 100 ))
   python3 "$HERE/scripts/ci/mock_llm.py" "$mock_port" \
     >/tmp/fractalsql_bt_mockllm_${v//./_}.log 2>&1 &
@@ -584,7 +595,6 @@ mdb_setup() {
   EVIL_EMBED_SO="$PLUGDIR/evil_embed.so"
   RETRY_SO="$PLUGDIR/retry_reasoning.so"
   THINK_SO="$PLUGDIR/think_reasoning.so"
-  local fsql_platform; fsql_platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
   local fsql_inc="-I$HERE/include/$fsql_platform -I$HERE/include"
   cc -shared -fPIC -std=c99 $fsql_inc tests/evil_nonterminating_plugin.c -o "$EVIL_REASONING_SO" 2>/tmp/fractalsql_bt_setup_${v//./_}.log \
     || { cat /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }

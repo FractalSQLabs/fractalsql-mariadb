@@ -566,9 +566,10 @@ jobs:
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql.so \\
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so
 
-          5. Register the UDFs and agent procedures:
-                 mariadb -uroot -p < install_udf.sql
-                 mariadb -uroot -p < install_agents.sql
+          5. Register the UDFs and agent procedures (the database is
+             needed because the scripts also CREATE PROCEDURE):
+                 mariadb -uroot -p mydb < install_udf.sql
+                 mariadb -uroot -p mydb < install_agents.sql
 
           6. Verify:
                  mariadb -uroot -p -e "SELECT fractalsql_edition(), fractalsql_version();"

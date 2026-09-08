@@ -36,6 +36,7 @@ down.
 ## Install
 
 ```sql
+USE mydb;                        -- CREATE PROCEDURE needs a selected database
 SOURCE sql/install_udf.sql;      -- the base UDF set (prerequisite)
 SOURCE sql/install_agents.sql;   -- the 15 agent procedures below
 ```

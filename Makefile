@@ -9,7 +9,7 @@
 #
 # Build:   make
 # Install: sudo make install
-# Load:    mysql -u root -p < sql/install_udf.sql
+# Load:    mysql -u root -p mydb < sql/install_udf.sql
 
 CC      = gcc
 

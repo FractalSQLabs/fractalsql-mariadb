@@ -226,7 +226,19 @@ detect_mariadb() {
         MDB_CONFIG_BIN="$c"
         break
     done
-    [[ -n "${MDB_CONFIG_BIN}" ]] || die "no mariadb_config/mysql_config found (checked PATH and common Homebrew paths). Set MDB_BINDIR to the bin/ directory of your MariaDB install."
+    if [[ -z "${MDB_CONFIG_BIN}" ]]; then
+        # Debian/Ubuntu's mariadb-server package ships neither config
+        # script (those come with libmariadb-dev), but MDB_CONFIG_BIN is
+        # only used below as an anchor to locate the client sitting next
+        # to it -- so fall back to whatever mariadb/mysql client is on
+        # PATH (caught live in the Debian easy-install CI container).
+        if command -v mariadb >/dev/null 2>&1; then
+            MDB_CONFIG_BIN="$(dirname "$(command -v mariadb)")/mariadb_config"
+        elif command -v mysql >/dev/null 2>&1; then
+            MDB_CONFIG_BIN="$(dirname "$(command -v mysql)")/mysql_config"
+        fi
+    fi
+    [[ -n "${MDB_CONFIG_BIN}" ]] || die "no mariadb_config/mysql_config or mariadb/mysql client found (checked PATH, MDB_BINDIR and common Homebrew paths). Set MDB_BINDIR to the bin/ directory of your MariaDB install."
     # mariadb_config/mysql_config only locates the mariadb/mysql client
     # binary below (via resolve_mdb_as), not the plugin directory.
     # `--plugindir` reports the client connector library's own plugin
