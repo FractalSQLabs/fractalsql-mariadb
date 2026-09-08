@@ -134,7 +134,18 @@ verify-vendor:
 		echo "  Re-deploy the vendored core release drop into include/ to restore it." >&2; \
 		exit 1; \
 	fi
-	@cd include && sha256sum --quiet --check .artifacts.sha256 || { \
+	# GNU coreutils' sha256sum on Linux; macOS ships no coreutils, only
+	# Perl's shasum (/usr/bin/shasum), so fall back to `shasum -a 256`.
+	# Both read the same "<hash>  <name>" manifest format. A missing
+	# binary exits nonzero too, so the handler below still fires (which
+	# is why this can't just assume sha256sum exists).
+	@cd include && { \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			sha256sum --quiet --check .artifacts.sha256; \
+		else \
+			shasum -a 256 -c .artifacts.sha256; \
+		fi; \
+	} || { \
 		echo "ERROR: vendored artifact checksum mismatch in include/." >&2; \
 		echo "  Possible causes: tampered .a/.so, partial deploy, or stale .sha256." >&2; \
 		echo "  Re-deploy the vendored core release drop to recover." >&2; \

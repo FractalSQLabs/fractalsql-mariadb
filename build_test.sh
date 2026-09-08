@@ -494,6 +494,15 @@ mdb_setup() {
   fi
   local mariadbd_bin; mariadbd_bin="$([ -x "$BIN/mariadbd" ] && echo "$BIN/mariadbd" || command -v mariadbd)"
   local installdb_bin; installdb_bin="$(mdb_sibling "$BIN" mariadb-install-db)"
+  # MariaDB 10.6 is the tool-rename transition major: Homebrew's
+  # mariadb@10.6 bottle still ships only the pre-rename
+  # mysql_install_db, no mariadb-install-db (10.11+ ship the new name).
+  # Fall back to it -- the 10.6 script takes the same
+  # --defaults-file/--datadir/--auth-root-authentication-method flags
+  # (caught live on a macos-14 darwin-gate-matrix cell: 10.6 failed
+  # cluster setup with "mariadb-install-db or mariadb client not
+  # found" while 11.4 passed this check).
+  [ -n "$installdb_bin" ] || installdb_bin="$(mdb_sibling "$BIN" mysql_install_db)"
   local admin_bin;     admin_bin="$(mdb_sibling "$BIN" mariadb-admin)"
   local client_bin;    client_bin="$(mdb_sibling "$BIN" mariadb)"
   [ -n "$installdb_bin" ] && [ -n "$client_bin" ] || { echo "mariadb-install-db or mariadb client not found" >&2; return 2; }

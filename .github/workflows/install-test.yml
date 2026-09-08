@@ -9,9 +9,9 @@ name: Install test (packaging)
 # fractal_search and
 # its params-bounds caps, then a reasoning round-trip against a
 # mock OpenAI-compatible endpoint (one gated major per family, so the
-# same fixed-reply mock is never run N times redundantly). Also covers the
-# Rocky 8 legacy-glibc .rpm channel and a native macOS (Homebrew)
-# build+install, neither of which fit the per-major matrix model.
+# same fixed-reply mock is never run N times redundantly). Also covers a
+# native macOS (Homebrew) build+install, which doesn't fit the
+# per-major matrix model.
 #
 # NOTE: this workflow is drafted against MariaDB Foundation's
 # documented repo-setup flow (downloads.mariadb.com/MariaDB/
@@ -56,14 +56,6 @@ jobs:
         run: |
           chmod +x scripts/package.sh
           scripts/package.sh amd64
-
-      # Legacy profile (glibc 2.28), for RHEL 8 / Ubuntu 20.04-class
-      # hosts. Built unconditionally so the rocky8 smoke job below has
-      # something to test.
-      - name: Build fractalsql.so (legacy profile)
-        run: PROFILE=legacy ./build.sh amd64
-      - name: Package .deb and .rpm (legacy)
-        run: PROFILE=legacy scripts/package.sh amd64
 
       - run: ls -l dist/packages
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -395,71 +387,6 @@ jobs:
               -v "${{ github.workspace }}:/work" -w /work \
               rockylinux:9 bash /work/test-rpm.sh
 
-  rpm-install-rocky8:
-    name: RHEL (Rocky 8), install legacy .rpm + UDF exec
-    needs: build-artifacts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-        with:
-          name: packages-amd64
-          path: dist/packages
-      - name: Install + verify in rockylinux:8 with mariadb-server
-        run: |
-          cat > test-rpm-legacy.sh <<'SCRIPT'
-          set -euo pipefail
-          # Rocky 8's AppStream ships mariadb-server natively (10.3 by
-          # default). The legacy build only cares that the UDF ABI is
-          # stable across majors, which it has been since 10.x, so no
-          # per-major matrix is needed here, unlike debian-install/
-          # rpm-install above.
-          dnf install -qy mariadb-server mariadb
-
-          mkdir -p /var/lib/mysql /var/log/mariadb /var/run/mariadb
-          chown -R mysql:mysql /var/lib/mysql /var/log/mariadb /var/run/mariadb
-          mysql_install_db --user=mysql --datadir=/var/lib/mysql 2>/dev/null \
-              || mariadb-install-db --user=mysql --datadir=/var/lib/mysql
-          mysqld --user=mysql 2>/dev/null &
-          MARIADBD_PID=$!
-
-          for i in $(seq 1 120); do
-              mysqladmin ping >/dev/null 2>&1 && break
-              sleep 1
-          done
-          mysqladmin ping
-
-          # Install our LEGACY .rpm, built against glibc 2.28 so it
-          # actually loads on RHEL 8. The modern .rpm would fail at
-          # ld.so time on this host.
-          dnf install -qy ./dist/packages/fractalsql-mariadb-legacy-amd64.rpm
-
-          PLUGIN_DIR=$(mysql -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
-          PLUGIN_DIR="${PLUGIN_DIR%/}"
-          echo "plugin_dir: $PLUGIN_DIR"
-          test -f "$PLUGIN_DIR/fractalsql.so" \
-              || { echo "FAIL: fractalsql.so missing from $PLUGIN_DIR"; ls -la "$PLUGIN_DIR" || true; exit 1; }
-
-          mysql < /work/sql/install_udf.sql
-
-          EDITION=$(mysql -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
-          VERSION=$(mysql -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
-          echo "edition=$EDITION version=$VERSION"
-          test "$EDITION" = "Community"
-          test "$VERSION" = "2.0.0"
-
-          RESULT=$(mysql -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
-          echo "fractal_search result (first 200 chars): ${RESULT:0:200}"
-          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
-          echo "$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
-          echo "$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
-          echo "ok: fractal_search returned canonical JSON"
-          echo "ok: Rocky 8 + legacy .rpm + UDF exec"
-          SCRIPT
-          chmod +x test-rpm-legacy.sh
-          docker run --rm -v "${{ github.workspace }}:/work" -w /work \
-              rockylinux:8 bash /work/test-rpm-legacy.sh
-
   macos-install:
     name: macOS, build + install + reason (Homebrew, arm64)
     runs-on: macos-14
@@ -473,11 +400,17 @@ jobs:
           set -euo pipefail
           brew install mariadb mariadb-connector-c pkg-config
           brew services start mariadb
+          # No -uroot: Homebrew's MariaDB 12.x post-install creates
+          # root@localhost with unix_socket auth only (connection denied
+          # to everyone but the OS root user), plus a same-named
+          # all-privilege account for the invoking user
+          # (e.g. runner@localhost). The bare client connects as that
+          # invoking user over the unix socket.
           for i in $(seq 1 30); do
-              mariadb -uroot -e 'SELECT 1' >/dev/null 2>&1 && break
+              mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
               sleep 1
           done
-          mariadb -uroot -e 'SELECT 1'
+          mariadb -e 'SELECT 1'
 
       - name: Compile fractalsql.dylib (native arm64)
         run: |
@@ -508,20 +441,20 @@ jobs:
       - name: Install into Homebrew's mariadb plugin_dir + register UDFs
         run: |
           set -euo pipefail
-          PLUGIN_DIR=$(mariadb -uroot -N -B -e "SELECT @@plugin_dir")
+          PLUGIN_DIR=$(mariadb -N -B -e "SELECT @@plugin_dir")
           echo "plugin_dir: ${PLUGIN_DIR}"
           cp dist/darwin/fractalsql.dylib "${PLUGIN_DIR}/fractalsql.so"
           cp include/darwin-arm64/fractalsql-reasoning-http.so "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
-          mariadb -uroot < sql/install_udf.sql
-          mariadb -uroot < sql/install_agents.sql
+          mariadb < sql/install_udf.sql
+          mariadb < sql/install_agents.sql
 
-          EDITION=$(mariadb -uroot -N -B -e "SELECT fractalsql_edition();")
-          VERSION=$(mariadb -uroot -N -B -e "SELECT fractalsql_version();")
+          EDITION=$(mariadb -N -B -e "SELECT fractalsql_edition();")
+          VERSION=$(mariadb -N -B -e "SELECT fractalsql_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
           test "${VERSION}" = "2.0.0"
 
-          RESULT=$(mariadb -uroot -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
+          RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
           echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
           echo "ok: macOS build + install + fractal_search"
 
@@ -539,7 +472,7 @@ jobs:
           # fractalsql_cognition.c. It must be set BEFORE mariadbd's
           # next dlopen of a reasoning path. Restart via brew services
           # so the new environment actually takes.
-          PLUGIN_DIR=$(mariadb -uroot -N -B -e "SELECT @@plugin_dir")
+          PLUGIN_DIR=$(mariadb -N -B -e "SELECT @@plugin_dir")
           brew services stop mariadb
           export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
           export FRACTALSQL_HTTP_URL="http://127.0.0.1:18080/v1/chat/completions"
@@ -547,17 +480,21 @@ jobs:
           # brew services runs under launchd, which won't inherit this
           # shell's export, so run mariadbd directly instead for this
           # one check, matching the Linux jobs' manual-start pattern.
-          MARIADB_DATADIR=$(mariadb -uroot -N -B -e "SELECT @@datadir" 2>/dev/null || echo "$(brew --prefix)/var/mysql")
+          MARIADB_DATADIR=$(mariadb -N -B -e "SELECT @@datadir" 2>/dev/null || echo "$(brew --prefix)/var/mysql")
           "$(brew --prefix mariadb)/bin/mariadbd" \
               --datadir="${MARIADB_DATADIR}" --socket=/tmp/fsql_install_test.sock \
               --skip-networking=0 --port=13306 --pid-file=/tmp/fsql_install_test.pid &
           MDB_PID=$!
+          # Unix socket, not TCP: the invoking user's account is
+          # unix_socket-authenticated, which only works over a unix
+          # domain socket -- the TCP path has no peer credential to
+          # authenticate with, so -uroot/--protocol=tcp would be denied.
           for i in $(seq 1 50); do
-              mariadb -uroot -P13306 --protocol=tcp -e 'SELECT 1' >/dev/null 2>&1 && break
+              mariadb -S /tmp/fsql_install_test.sock -e 'SELECT 1' >/dev/null 2>&1 && break
               sleep 0.5
           done
 
-          REPLY=$(mariadb -uroot -P13306 --protocol=tcp -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');")
+          REPLY=$(mariadb -S /tmp/fsql_install_test.sock -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');")
           echo "reason reply: ${REPLY:0:80}"
           kill "${MOCK_PID}" 2>/dev/null || true
           kill "${MDB_PID}" 2>/dev/null || true
@@ -585,11 +522,17 @@ jobs:
           set -euo pipefail
           brew install mariadb mariadb-connector-c pkg-config
           brew services start mariadb
+          # No -uroot: Homebrew's MariaDB 12.x post-install creates
+          # root@localhost with unix_socket auth only (connection denied
+          # to everyone but the OS root user), plus a same-named
+          # all-privilege account for the invoking user
+          # (e.g. runner@localhost). The bare client connects as that
+          # invoking user over the unix socket.
           for i in $(seq 1 30); do
-              mariadb -uroot -e 'SELECT 1' >/dev/null 2>&1 && break
+              mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
               sleep 1
           done
-          mariadb -uroot -e 'SELECT 1'
+          mariadb -e 'SELECT 1'
 
       - name: Build + install via scripts/macos/install.sh manually first
         run: |
@@ -609,18 +552,18 @@ jobs:
           chmod +x scripts/macos/install.sh
           cp scripts/macos/install.sh /tmp/fsql-stage/
           MARIADB_BIN="$(brew --prefix mariadb)/bin/mariadb" /tmp/fsql-stage/install.sh
-          test -f "$(mariadb -uroot -N -B -e 'SELECT @@plugin_dir;')/fractalsql.so"
+          test -f "$(mariadb -N -B -e 'SELECT @@plugin_dir;')/fractalsql.so"
 
       - name: Run easy_install.sh wizard (provider skip)
         run: |
           set -euo pipefail
-          mariadb -uroot -e 'CREATE DATABASE fractalsql_ci;'
+          mariadb -e 'CREATE DATABASE fractalsql_ci;'
           chmod +x scripts/easy_install.sh
           MDB_BINDIR="$(brew --prefix mariadb)/bin" \
             ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --provider skip | tee /tmp/easy-install.log
 
-          EDITION=$(mariadb -uroot -D fractalsql_ci -N -B -e 'SELECT fractalsql_edition();')
-          VERSION=$(mariadb -uroot -D fractalsql_ci -N -B -e 'SELECT fractalsql_version();')
+          EDITION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractalsql_edition();')
+          VERSION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractalsql_version();')
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
 
@@ -723,12 +666,39 @@ jobs:
           if (-not $pluginDir) { Write-Host "FATAL: SELECT @@plugin_dir returned nothing"; exit 1 }
           Write-Host "plugin_dir: $pluginDir"
           Copy-Item "fractalsql.dll" (Join-Path $pluginDir 'fractalsql.dll')
+          # The wizard's reasoning config points FRACTALSQL_REASONING_
+          # PLUGIN at <plugin_dir>\fractalsql-reasoning-http.dll, so the
+          # vendored reasoning plugin must sit next to fractalsql.dll --
+          # without it fractal_reason() can't dlopen anything and NULLs.
+          Copy-Item "include\windows-x86_64\fractalsql-reasoning-http.dll" (Join-Path $pluginDir 'fractalsql-reasoning-http.dll')
 
       - name: Run easy_install.ps1 against a mock LLM
         shell: pwsh
         run: |
-          Start-Process python -ArgumentList 'scripts\ci\mock_llm.py','18080' -WindowStyle Hidden
-          Start-Sleep -Seconds 2
+          # Same launch discipline as build_test.ps1's own mock startup:
+          # quote the script path (Start-Process -ArgumentList joins the
+          # array with spaces without quoting), capture stdout/stderr so
+          # a bind failure is diagnosable instead of a silent NULL, and
+          # poll the port rather than assuming a fixed sleep was enough.
+          $mockLog = Join-Path $pwd 'mock_llm.log'
+          $py = (Get-Command python).Source
+          $null = Start-Process -FilePath $py `
+              -ArgumentList @("`"$pwd\scripts\ci\mock_llm.py`"", '18080') `
+              -RedirectStandardOutput $mockLog -RedirectStandardError "$mockLog.err" `
+              -PassThru -WindowStyle Hidden
+          $up = $false
+          for ($i = 0; $i -lt 50; $i++) {
+              $c = New-Object Net.Sockets.TcpClient
+              try { $c.Connect('127.0.0.1', 18080); $up = $true } catch { } finally { $c.Dispose() }
+              if ($up) { break }
+              Start-Sleep -Milliseconds 200
+          }
+          if (-not $up) {
+              Write-Host "FATAL: mock_llm.py never came up on 127.0.0.1:18080"
+              if (Test-Path "$mockLog.err") { Get-Content "$mockLog.err" }
+              if (Test-Path $mockLog)    { Get-Content $mockLog }
+              exit 1
+          }
 
           # Deliberately no -MdbDir: this exercises the script's own
           # Win32_Service-based auto-detection (Get-MariaDbTarget)
@@ -756,6 +726,9 @@ jobs:
           $hit = Select-String -Path easy-install.log -Pattern 'select 1' -Quiet
           if (-not $hit) {
               Write-Host "FAIL: reasoning round-trip via easy_install.ps1 didn't reach the mock reply"
+              Write-Host "--- mock_llm.log ---"
+              if (Test-Path mock_llm.log)     { Get-Content mock_llm.log }
+              if (Test-Path mock_llm.log.err) { Get-Content mock_llm.log.err }
               exit 1
           }
 

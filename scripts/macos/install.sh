@@ -43,13 +43,26 @@ if ! command -v "${MARIADB_BIN}" >/dev/null 2>&1; then
     echo "  Homebrew example: MARIADB_BIN=\$(brew --prefix mariadb)/bin/mariadb ./install.sh" >&2
     exit 1
 fi
-if ! "${MARIADB_BIN}" -u root -Nse 'SELECT 1;' >/dev/null 2>&1; then
-    echo "error: can't connect to a running MariaDB server as root via ${MARIADB_BIN}." >&2
+# Connection account. Fresh Homebrew MariaDB (12.x) creates root@localhost
+# with unix_socket auth only -- connecting as root is denied to everyone
+# but the OS root user -- plus a same-named, all-privilege account for
+# the invoking user (e.g. runner@localhost, or your own username). So
+# try the invoking user first (the common case: a per-user `brew
+# services` server), then fall back to -u root (older installs, or
+# running this script under sudo).
+MDB_AUTH=""
+if "${MARIADB_BIN}" -Nse 'SELECT 1;' >/dev/null 2>&1; then
+    :
+elif "${MARIADB_BIN}" -u root -Nse 'SELECT 1;' >/dev/null 2>&1; then
+    MDB_AUTH="-u root"
+else
+    echo "error: can't connect to a running MariaDB server via ${MARIADB_BIN}." >&2
     echo "  This installs the plugin into an already-running server -- it doesn't start one." >&2
+    echo "  Tried your own account (unix_socket auth) and root." >&2
     exit 1
 fi
 
-PLUGIN_DIR="$("${MARIADB_BIN}" -u root -Nse 'SELECT @@plugin_dir;' 2>/dev/null || true)"
+PLUGIN_DIR="$("${MARIADB_BIN}" ${MDB_AUTH} -Nse 'SELECT @@plugin_dir;' 2>/dev/null || true)"
 PLUGIN_DIR="${PLUGIN_DIR%/}"
 if [[ -z "${PLUGIN_DIR}" ]]; then
     echo "error: SELECT @@plugin_dir returned nothing." >&2
@@ -88,12 +101,13 @@ echo "  ${PLUGIN_DIR}/fractalsql.so (from fractalsql.dylib)"
 echo "  ${PLUGIN_DIR}/fractalsql-reasoning-http.so"
 echo
 
-echo "Next: register the UDFs (server-global, no database needed):"
-echo "  ${MARIADB_BIN} -u root -p < ${HERE}/install_udf.sql"
-echo "  ${MARIADB_BIN} -u root -p -e 'SELECT fractalsql_edition(), fractalsql_version();'"
+echo "Next: register the UDFs (server-global, no database needed) --"
+echo "with the same account this script connected as:"
+echo "  ${MARIADB_BIN} ${MDB_AUTH} < ${HERE}/install_udf.sql"
+echo "  ${MARIADB_BIN} ${MDB_AUTH} -e 'SELECT fractalsql_edition(), fractalsql_version();'"
 echo "...then the agent procedures into a specific database (mydb below"
 echo "must already exist -- CREATE PROCEDURE needs one, UDFs don't):"
-echo "  ${MARIADB_BIN} -u root -p mydb < ${HERE}/install_agents.sql"
+echo "  ${MARIADB_BIN} ${MDB_AUTH} mydb < ${HERE}/install_agents.sql"
 echo
 echo "Reasoning is opt-in and set via a process environment variable, not"
 echo "a SQL statement -- MariaDB has no GUC/sysvar surface for this (see"

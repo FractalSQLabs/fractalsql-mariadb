@@ -9,15 +9,13 @@
 # across all of them, so this Dockerfile only needs one build stage
 # per (arch, libc-profile) cell.
 #
-# Build artifacts (collected in the `export` stage, emitted to the host
+# Build artifact (collected in the `export` stage, emitted to the host
 # via `docker buildx --output type=local,dest=...`):
-#   /fractalsql.so           (modern glibc, no suffix)
-#   /fractalsql-legacy.so    (legacy glibc, --build-arg OUTPUT_SUFFIX=-legacy)
+#   /fractalsql.so           (glibc 2.34)
 #
-# musl/Alpine is NOT a supported build target for this repo.
-# build.sh only drives modern/legacy glibc
-# profiles, so only those two core-archive variants are vendored under
-# include/linux-<arch>/.
+# musl/Alpine is NOT a supported build target for this repo's shipped
+# .so: build.sh drives the modern glibc-2.34 profile only, against the
+# core archive vendored under include/linux-<arch>/.
 #
 # Usage:
 #   DOCKER_BUILDKIT=1 docker buildx build \
@@ -27,22 +25,21 @@
 #     --build-arg CORE_VARIANT=community-minimal-c \
 #     -f docker/Dockerfile .
 #
-# build.sh drives this for amd64/arm64 x modern/legacy in turn.
+# build.sh drives this for amd64/arm64.
 
 ARG BASE_IMAGE=rockylinux:9
-ARG OUTPUT_SUFFIX=
 ARG GLIBC_CEILING=34
 ARG LIBC_KIND=glibc
 ARG SIZE_CEILING_BYTES=3145728
 
-# Vendored core archive variant. Default "community-sovereign-c" pulls the
-# modern glibc-2.34 build vendored via `fractalsql-core/scripts/deploy.sh
-# --git fractalsql-mariadb`, a superset of "community-minimal-c" (confirmed
-# via `nm`: exports every minimal-tier symbol plus the v2 sovereign-tier
-# additions this repo's UDF port links against, including fsql_dimension_*,
-# fsql_optimize_portfolio*, fsql_vascular_network, fsql_cortical_folding,
-# fsql_nerve_plexus_metric, and fsql_morphological_complexity). Override to
-# "community-sovereign-c-legacy" for RHEL 8 / Ubuntu 20.04 (glibc 2.28).
+# Vendored core archive variant. Default "community-sovereign-c" is the
+# modern glibc-2.34 build from the vendored core release drop in
+# include/, a superset of "community-minimal-c" (confirmed via `nm`:
+# exports every minimal-tier symbol plus the v2 sovereign-tier
+# additions this repo's UDF port links against, including
+# fsql_dimension_*, fsql_optimize_portfolio*, fsql_vascular_network,
+# fsql_cortical_folding, fsql_nerve_plexus_metric, and
+# fsql_morphological_complexity).
 ARG CORE_VARIANT=community-sovereign-c
 
 ARG EXT_CFLAGS="-D_GLIBCXX_USE_CXX11_ABI=0 -ffunction-sections -fdata-sections -fvisibility=default"
@@ -66,7 +63,6 @@ COPY docker/assert_so.sh /build/docker/assert_so.sh
 ARG EXT_CFLAGS
 ARG EXT_LDFLAGS
 ARG SIZE_CEILING_BYTES
-ARG OUTPUT_SUFFIX
 ARG GLIBC_CEILING
 ARG LIBC_KIND
 ARG CORE_VARIANT
@@ -79,9 +75,8 @@ RUN ARCH=$(uname -m) \
  && CORE_A="include/linux-${ARCH}/libfractalsql-${CORE_VARIANT}.a" \
  && test -f "/build/${CORE_A}" \
     || (echo "ERROR: vendored core archive missing: ${CORE_A}" >&2 \
-        && echo "  Refresh from foundry:" >&2 \
-        && echo "    cd ../fractalsql-core && ./scripts/deploy.sh --git fractalsql-mariadb" >&2 \
-        && echo "    cd ../fractalsql-core && ./scripts/deploy.sh --experimental --git fractalsql-mariadb   # + darwin" >&2 \
+        && echo "  Re-deploy the vendored core release drop into include/," >&2 \
+        && echo "  which restores the archive together with .artifacts.sha256." >&2 \
         && exit 1)
 
 RUN set -eux; \
@@ -91,7 +86,7 @@ RUN set -eux; \
     gcc -Wall -Wextra -O3 -fPIC \
         -Iinclude $MDB_CFLAGS \
         ${EXT_CFLAGS} \
-        -shared -o /fractalsql${OUTPUT_SUFFIX}.so \
+        -shared -o /fractalsql.so \
         src/fractalsql.c \
         src/fractalsql_parse.c \
         src/fractalsql_session.c \
@@ -102,15 +97,14 @@ RUN set -eux; \
         "/build/${CORE_A}" \
         -lm -lpthread -ldl \
         ${EXT_LDFLAGS}; \
-    sh /build/docker/assert_so.sh /fractalsql${OUTPUT_SUFFIX}.so \
+    sh /build/docker/assert_so.sh /fractalsql.so \
         "${SIZE_CEILING_BYTES}" "${GLIBC_CEILING}" "${LIBC_KIND}"
 
 # --------------------------------------------------------------------
 # Export stage: scratch, so `buildx --output=local` drops just the .so.
 # --------------------------------------------------------------------
 FROM scratch AS export
-ARG OUTPUT_SUFFIX
-COPY --from=builder /fractalsql${OUTPUT_SUFFIX}.so /fractalsql${OUTPUT_SUFFIX}.so
+COPY --from=builder /fractalsql.so /fractalsql.so
 
 # --------------------------------------------------------------------
 # Demo stage: a RUNNABLE MariaDB server with the UDFs already
@@ -170,8 +164,7 @@ RUN apt-get update \
         libcurl4 \
  && rm -rf /var/lib/apt/lists/*
 
-ARG OUTPUT_SUFFIX=
-COPY --from=builder /fractalsql${OUTPUT_SUFFIX}.so /usr/lib/mysql/plugin/fractalsql.so
+COPY --from=builder /fractalsql.so /usr/lib/mysql/plugin/fractalsql.so
 
 # Bundled reasoning plugin (vendored prebuilt .so from include/). Select
 # the right arch via `uname -m` the same way the builder stage does, so

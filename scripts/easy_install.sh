@@ -254,7 +254,16 @@ resolve_mdb_as() {
     local bin; bin="$(dirname "${MDB_CONFIG_BIN}")/mariadb"
     [[ -x "${bin}" ]] || bin="$(dirname "${MDB_CONFIG_BIN}")/mysql"
     [[ -x "${bin}" ]] || die "mariadb/mysql client not found next to ${MDB_CONFIG_BIN}"
-    if "${bin}" -u root -Nse 'SELECT 1;' >/dev/null 2>&1; then
+    # Homebrew's MariaDB 12.x creates root@localhost with unix_socket
+    # auth only (usable by the OS root user alone) plus a same-named,
+    # all-privilege account for the invoking user. Debian/RHEL
+    # mariadb-server likewise makes root@localhost unix_socket. So try
+    # the invoking user's own account first, then -u root (installs
+    # where root still has an empty native password, or running as
+    # root), then sudo.
+    if "${bin}" -Nse 'SELECT 1;' >/dev/null 2>&1; then
+        MDB_AS=("${bin}")
+    elif "${bin}" -u root -Nse 'SELECT 1;' >/dev/null 2>&1; then
         MDB_AS=("${bin}" -u root)
     elif command -v sudo >/dev/null 2>&1 && sudo "${bin}" -u root -Nse 'SELECT 1;' >/dev/null 2>&1; then
         MDB_AS=(sudo "${bin}" -u root)

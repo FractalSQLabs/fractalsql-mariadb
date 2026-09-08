@@ -15,9 +15,11 @@
 # the UDF ABI is stable across those majors, so the package depends on
 # mariadb-server generically rather than pinning a specific major.
 #
+# One glibc profile, matching build.sh: modern glibc-2.34 only (built
+# inside rockylinux:9).
+#
 # Usage:
-#   scripts/package.sh [amd64|arm64]              # modern (default)
-#   PROFILE=legacy scripts/package.sh amd64       # legacy channel
+#   scripts/package.sh [amd64|arm64]
 
 set -euo pipefail
 
@@ -28,20 +30,10 @@ VERSION="${FSQL_PKG_VERSION:-$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' s
 ITERATION="1"
 DIST_DIR="dist/packages"
 
-# PROFILE selector: picks which build.sh artifact to package and what
-# the resulting .deb/.rpm is named + depends on. The GLIBC_DEP value
-# matches the build target in build.sh: modern compiles inside
-# rockylinux:9 (glibc 2.34), legacy inside manylinux_2_28 (glibc 2.28).
-#   modern (default)  → fractalsql-mariadb,        libc6 >= 2.34
-#   legacy            → fractalsql-mariadb-legacy, libc6 >= 2.28
-PROFILE="${PROFILE:-modern}"
-case "${PROFILE}" in
-    modern) PKG_SUFFIX="" ; BIN_SUFFIX="" ; GLIBC_DEP="2.34" ;;
-    legacy) PKG_SUFFIX="-legacy" ; BIN_SUFFIX="-legacy" ; GLIBC_DEP="2.28" ;;
-    *) echo "unknown profile '${PROFILE}': expected modern or legacy" >&2; exit 2 ;;
-esac
-
-PKG_NAME="fractalsql-mariadb${PKG_SUFFIX}"
+# GLIBC_DEP matches the build target in build.sh: the .so compiles
+# inside rockylinux:9 (glibc 2.34).
+GLIBC_DEP="2.34"
+PKG_NAME="fractalsql-mariadb"
 mkdir -p "${DIST_DIR}"
 
 # Absolute repo root, captured before any -C chdir'd fpm invocation.
@@ -67,9 +59,9 @@ case "${PKG_ARCH}" in
     arm64) RPM_ARCH="aarch64" ; FSQL_PLATFORM="linux-aarch64" ;;
 esac
 
-SO="dist/${PKG_ARCH}/fractalsql${BIN_SUFFIX}.so"
+SO="dist/${PKG_ARCH}/fractalsql.so"
 if [[ ! -f "${SO}" ]]; then
-    echo "missing ${SO}: run ./build.sh ${PKG_ARCH} --profile=${PROFILE} first" >&2
+    echo "missing ${SO}: run ./build.sh ${PKG_ARCH} first" >&2
     exit 1
 fi
 

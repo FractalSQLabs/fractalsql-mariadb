@@ -338,18 +338,29 @@ jobs:
 
       # The macos-14 runner is arm64, so arm-Homebrew's openssl@3 keg
       # contains only arm64 objects; linking them into an -arch x86_64
-      # build makes ld discard every member ("found architecture 'arm64',
-      # required architecture 'x86_64'") and all EVP symbols go
-      # undefined. Install Intel Homebrew under Rosetta (its prefix is
-      # /usr/local, x86_64 bottles -- no source build) to get an x86_64
-      # libcrypto.a for the amd64 cell only.
-      - name: Install x86_64 OpenSSL under Rosetta
+      # build makes ld discard every member ("found architecture
+      # 'arm64', required architecture 'x86_64'") and all EVP symbols
+      # go undefined. Homebrew also no longer ships x86_64 bottles
+      # (Intel support discontinued -- a Rosetta brew install compiles
+      # from source under emulation, ~20 minutes, on a platform Apple,
+      # GitHub and Homebrew are all sunsetting). Cross-compile an
+      # x86_64 libcrypto natively instead: clang -arch x86_64 emits
+      # x86_64 objects at full speed on the arm64 host, no Rosetta
+      # needed, since only the archive is linked and its binaries are
+      # never run.
+      - name: Cross-build x86_64 libcrypto from source
         if: matrix.arch == 'x86_64'
         run: |
           set -euo pipefail
-          softwareupdate --install-rosetta --agree-to-license
-          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          arch -x86_64 /usr/local/bin/brew install openssl@3
+          curl -fsSLO https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
+          echo "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2  openssl-3.5.8.tar.gz" | shasum -a 256 -c -
+          tar xf openssl-3.5.8.tar.gz
+          cd openssl-3.5.8
+          ./Configure darwin64-x86_64 no-shared no-tests \
+              --prefix=/tmp/openssl-x64 \
+              -mmacosx-version-min=11.0 -fPIC
+          make -j"$(sysctl -n hw.ncpu)" -s libcrypto.a
+          make -s install_sw
 
       - name: Verify vendored core archive is present
         run: |
@@ -369,14 +380,14 @@ jobs:
           # OpenSSL (static) for fractalsql_enterprise.c's Ed25519
           # signature check, same linkage as the Windows build. macOS
           # ships no OpenSSL headers in its SDK and Homebrew's openssl@3
-          # is keg-only, so point the compile at the keg explicitly and
-          # link its libcrypto.a statically -- the otool posture check
-          # below would reject a dynamic libcrypto dependency. The keg
-          # must match the -arch being built: x86_64 uses the
-          # Rosetta-Homebrew keg (see the install step above), arm64
-          # uses the runner's own arm-Homebrew keg.
+          # is keg-only, so point the compile at the OpenSSL tree
+          # explicitly and link its libcrypto.a statically -- the otool
+          # posture check below would reject a dynamic libcrypto
+          # dependency. The tree must match the -arch being built:
+          # x86_64 uses the cross-compiled tree (see the source-build
+          # step above), arm64 uses the runner's own arm-Homebrew keg.
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              OPENSSL_DIR="/usr/local/opt/openssl@3"
+              OPENSSL_DIR="/tmp/openssl-x64"
           else
               OPENSSL_DIR="$(brew --prefix openssl@3)"
           fi
