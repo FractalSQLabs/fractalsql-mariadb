@@ -199,7 +199,11 @@ jobs:
       - name: "Install MariaDB ${{ matrix.mdb }} (Homebrew: ${{ matrix.formula }})"
         run: |
           set -euo pipefail
-          brew install jq "${{ matrix.formula }}"
+          # openssl@3: gate 01's `make` needs <openssl/evp.h> for
+          # fractalsql_enterprise.c (the SDK ships no OpenSSL headers,
+          # and openssl@3 is keg-only -- the Makefile resolves the keg
+          # itself via `brew --prefix openssl@3`).
+          brew install jq openssl@3 "${{ matrix.formula }}"
 
       - name: build_test.sh --mdb ${{ matrix.mdb }}
         run: |
@@ -226,7 +230,10 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
           sudo apt-get update -qq
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat build-essential
+          # libssl-dev named explicitly: gate 01's `make` links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
 
       - name: build_test.sh --asan
         run: |
@@ -254,7 +261,10 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
           sudo apt-get update -qq
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat build-essential
+          # libssl-dev named explicitly: gate 01's `make` links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
 
       - name: build_test.sh --ubsan
         run: |
@@ -346,7 +356,7 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb jq
+          brew install mariadb jq openssl@3
       - name: build_test.sh --asan
         run: |
           set -euo pipefail
@@ -364,7 +374,7 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb jq
+          brew install mariadb jq openssl@3
       - name: build_test.sh --ubsan
         run: |
           set -euo pipefail
@@ -390,7 +400,10 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
           sudo apt-get update -qq
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat build-essential
+          # libssl-dev named explicitly: gate 01's `make` links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
 
       - name: build_test.sh --coverage
         run: |

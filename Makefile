@@ -71,19 +71,36 @@ else
   FSQL_SAN_FLAGS :=
 endif
 
-CFLAGS  = -Wall -Wextra -O3 -fPIC $(MDB_CFLAGS) -Iinclude $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
+# OpenSSL headers + libcrypto for fractalsql_enterprise.c's Ed25519
+# signature check (<openssl/evp.h>). Linux: distro headers (libssl-dev,
+# installed explicitly in docker/Dockerfile.test and already present as
+# a transitive dependency of mariadb-server on the Debian/Ubuntu test
+# image) and the shared -lcrypto. macOS: the SDK ships no OpenSSL
+# headers and Homebrew's openssl@3 is keg-only, so point both compile
+# and link at the keg, linking libcrypto.a statically -- matching the
+# release build's posture, where a dynamic dep would record a Homebrew
+# path end-user Macs are not guaranteed to have.
+ifeq ($(shell uname -s),Darwin)
+  FSQL_OPENSSL_DIR := $(shell brew --prefix openssl@3 2>/dev/null)
+  ifeq ($(strip $(FSQL_OPENSSL_DIR)),)
+    $(error darwin build needs Homebrew's openssl@3: brew install openssl@3)
+  endif
+  FSQL_OPENSSL_CFLAGS := -I$(FSQL_OPENSSL_DIR)/include
+  FSQL_OPENSSL_LDFLAGS := $(FSQL_OPENSSL_DIR)/lib/libcrypto.a
+else
+  FSQL_OPENSSL_CFLAGS :=
+  FSQL_OPENSSL_LDFLAGS := -lcrypto
+endif
+
+CFLAGS  = -Wall -Wextra -O3 -fPIC $(MDB_CFLAGS) -Iinclude $(FSQL_OPENSSL_CFLAGS) $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
 # -lpthread: fractalsql_session.c's connection-scoped ctx registry
 # (for Discovery/Diversify) uses a pthread_mutex_t.
 # -ldl: the vendored core archive's fsql_load_reasoning (Cognition
 # tier) dlopen's the reasoning plugin internally.
-# -lcrypto: fractalsql_enterprise.c's ent_verify_signature() verifies
-# the enterprise .so's detached Ed25519 signature via OpenSSL's EVP API
-# (EVP_PKEY_new_raw_public_key/EVP_DigestVerify*). Requires libssl-dev
-# (or the platform equivalent) at build time; already present as a
-# transitive dependency of mariadb-server on the Debian/Ubuntu test
-# image, called out explicitly here (and in docker/Dockerfile.test) so
-# it isn't an implicit, silently-broken assumption.
-LDFLAGS = -shared -lm -lpthread -ldl -lcrypto $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
+# -lcrypto (Linux) / static libcrypto.a (macOS): see the FSQL_OPENSSL_*
+# block just above CFLAGS for how each platform finds OpenSSL for
+# fractalsql_enterprise.c's ent_verify_signature() (Ed25519 EVP verify).
+LDFLAGS = -shared -lm -lpthread -ldl $(FSQL_OPENSSL_LDFLAGS) $(FSQL_COV_FLAGS) $(FSQL_SAN_FLAGS)
 
 TARGET = fractalsql.so
 SRCS   = src/fractalsql.c src/fractalsql_parse.c src/fractalsql_session.c src/fractalsql_vector.c src/fractalsql_cognition.c src/fractalsql_textsql.c src/fractalsql_enterprise.c

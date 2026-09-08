@@ -431,8 +431,15 @@ jobs:
           echo "--- size ---"
           SZ=$(stat -f '%z' "${DYLIB}")
           echo "size: ${SZ} bytes"
-          if [ "${SZ}" -gt 3145728 ]; then
-              echo "FAIL: dylib exceeds 3 MiB ceiling" >&2
+          # Unlike the Linux .so (whose 3 MiB ceiling still holds --
+          # there libcrypto resolves from mariadbd at load time, see
+          # THIRD-PARTY-NOTICES.md), the macOS dylib statically bundles
+          # libcrypto.a for the Ed25519 signature check, which alone
+          # contributes ~1.4 MiB of EVP/provider machinery that
+          # -dead_strip cannot reach. 6 MiB leaves headroom for the
+          # core archive while still catching runaway bloat.
+          if [ "${SZ}" -gt 6291456 ]; then
+              echo "FAIL: dylib exceeds 6 MiB ceiling" >&2
               exit 1
           fi
 
