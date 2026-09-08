@@ -1,4 +1,4 @@
-%global         plugindir %{_libdir}/mariadb/plugin
+%global         plugindir %{_libdir}/mysql/plugin
 %global         sharedir  %{_datadir}/fractalsql-mariadb
 
 # Reference-only spec: scripts/package.sh (fpm-based, generic

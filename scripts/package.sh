@@ -88,10 +88,13 @@ RPM_OUT="${DIST_DIR}/${PKG_NAME}-${PKG_ARCH}.rpm"
 #
 #   Debian/Ubuntu mariadb-server (apt):
 #       plugin_dir = /usr/lib/mysql/plugin/
-#   RHEL/CentOS/Rocky Linux mariadb-server (yum):
-#       plugin_dir = /usr/lib64/mariadb/plugin/  (MariaDB 10.4+ on EL9
-#                                                 uses its OWN tree,
-#                                                 not /usr/lib64/mysql/)
+#   RHEL/CentOS/Rocky Linux MariaDB-server (MariaDB Foundation's own
+#   repo, via mariadb_repo_setup -- what install-test.yml actually
+#   installs):
+#       plugin_dir = /usr/lib64/mysql/plugin/  (confirmed live via
+#                                               SELECT @@plugin_dir on
+#                                               rockylinux:9, majors
+#                                               10.6/10.11/11.4/12.3)
 #
 # LICENSE ledger: staged into /usr/share/doc/<pkg>/ via install -Dm0644
 # BEFORE running fpm. Explicit fpm src=dst mappings break here: fpm's
@@ -119,16 +122,17 @@ install -Dm0755 "${REASONING_SO}" \
     "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql-reasoning-http.so"
 stage_common "${STAGE_DEB}"
 
-# RHEL layout. MariaDB 10.4+ on EL9 reports
-# @@plugin_dir = /usr/lib64/mariadb/plugin/, its own tree, not
-# /usr/lib64/mysql/plugin/. Earlier docs and other UDF projects
-# sometimes claim /usr/lib64/mysql/plugin/; that path is wrong on
-# current MariaDB. Verified against rockylinux:9 + stock
-# mariadb-server (10.5) + 11.4.
+# RHEL layout. rockylinux:9 + MariaDB Foundation's own MariaDB-server
+# package (mariadb_repo_setup, what install-test.yml installs) reports
+# @@plugin_dir = /usr/lib64/mysql/plugin/, not /usr/lib64/mariadb/plugin/
+# -- confirmed live across majors 10.6/10.11/11.4/12.3. A distro-stock
+# mariadb-server package may differ; this targets the Foundation repo
+# since that's what the install-test CI (and this script's own users
+# following docs/getting-started.md) actually installs.
 install -Dm0755 "${SO}" \
-    "${STAGE_RPM}/usr/lib64/mariadb/plugin/fractalsql.so"
+    "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql.so"
 install -Dm0755 "${REASONING_SO}" \
-    "${STAGE_RPM}/usr/lib64/mariadb/plugin/fractalsql-reasoning-http.so"
+    "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so"
 stage_common "${STAGE_RPM}"
 
 echo "------------------------------------------"
