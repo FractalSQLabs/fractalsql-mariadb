@@ -333,7 +333,7 @@ jobs:
           chown -R mysql:mysql /var/lib/mysql /var/log/mariadb /var/run/mariadb
           mariadb-install-db --user=mysql --datadir=/var/lib/mysql
 
-          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mariadb/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so
           export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
           export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
           export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
