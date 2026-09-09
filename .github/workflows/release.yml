@@ -249,20 +249,27 @@ jobs:
           # looks or CREATE FUNCTION ... SONAME 'fractalsql.so' silently
           # fails to load.
           #   Debian/Ubuntu:  /usr/lib/mysql/plugin/
-          #   RHEL/EL9:       /usr/lib64/mariadb/plugin/  (MariaDB 10.4+
-          #                                                uses its own
-          #                                                tree, not
-          #                                                /usr/lib64/mysql/)
+          #   RHEL/EL9:       /usr/lib64/mysql/plugin/  (the MariaDB
+          #                    Foundation packages install-test.yml
+          #                    installs report this as @@plugin_dir --
+          #                    confirmed live across 10.6/10.11/11.4/
+          #                    12.3; a distro-stock mariadb-server
+          #                    package may use /usr/lib64/mariadb/plugin/
+          #                    instead, which package.sh does not target)
           set -euo pipefail
           for deb in dist/packages/*-${{ matrix.arch }}.deb; do
               echo "=== ${deb} ==="
               dpkg-deb -c "${deb}" \
                   | grep -E 'usr/lib/mysql/plugin/fractalsql\.so$'
+              dpkg-deb -c "${deb}" \
+                  | grep -E 'usr/lib/mysql/plugin/fractalsql-reasoning-http\.so$'
           done
           for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
               echo "=== ${rpm} ==="
               rpm -qlp "${rpm}" \
-                  | grep -E '/usr/lib64/mariadb/plugin/fractalsql\.so$'
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql\.so$'
+              rpm -qlp "${rpm}" \
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql-reasoning-http\.so$'
           done
 
       - name: Upload package artifacts
