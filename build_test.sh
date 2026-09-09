@@ -2231,5 +2231,24 @@ fi
 [ "$COVERAGE" -eq 1 ] && run_coverage_report
 
 echo ""
+# On any gate FAIL, print the tails of the two diagnostic logs whose
+# contents nothing else in the run has shown: mariadbd's own stderr
+# (mysqld_safe/mariadbd-safe route it here; on Linux the datadir
+# <hostname>.err usually exists, but with --defaults-file the vendored
+# reasoning plugin's "fractalsql-reasoning-http: ..." lines can still
+# only surface through this capture) and the mock LLM's request log --
+# the only cause record for a bare-NULL UDF result. Mirrors
+# build_test.ps1's Mdb-Teardown FAIL dump 1:1.
+if [ "$FAILED" -ne 0 ]; then
+  for log in \
+    "/tmp/fractalsql_bt_server_${MDB_MAJOR//./_}.log" \
+    "/tmp/fractalsql_bt_mockllm_${MDB_MAJOR//./_}.log"; do
+    if [ -f "$log" ]; then
+      printf -- "--- tail of %s ---\n" "$log"
+      tail -40 "$log"
+      echo ""
+    fi
+  done
+fi
 if [ "$FAILED" -eq 0 ]; then printf "${G}build_test: PASS${Z}\n"; exit 0
 else printf "${R}build_test: FAIL${Z}\n"; exit 1; fi

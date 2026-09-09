@@ -262,6 +262,9 @@ function Get-MdbBin {
 $script:Bin = $null
 $script:DataDir = $null
 $script:PlugDir = $null
+$script:MariadbdLog = $null
+$script:MockLog = $null
+$script:LogsDumped = $false
 $script:Port = 0
 $script:MariadbExe = $null
 $script:MariadbdExe = $null
@@ -455,6 +458,13 @@ function Mdb-Setup {
     New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
     New-Item -ItemType Directory -Force -Path $script:PlugDir | Out-Null
 
+    # Fresh mariadbd stderr log once per setup, HERE (where $suffix is in
+    # scope): the supervisor below is re-entered from gate scope on plugin
+    # swaps and must only append, so a respawn leaves the previous
+    # attempt's diagnostics in the file for the Mdb-Teardown FAIL dump.
+    $script:MariadbdLog = "$($script:DataDir)_mariadbd.log"
+    Remove-Item -Force $script:MariadbdLog -ErrorAction SilentlyContinue
+
     Copy-Item $Dll "$script:PlugDir\fractalsql.dll" -ErrorAction Stop
 
     # Evil crash UDF -- compiled with cl.exe (MSVC), same toolchain
@@ -529,6 +539,7 @@ function Mdb-Setup {
         if ($py) {
             $script:MockLlmPort = 18300 + ([int]($Major -replace '\D', '') % 100)
             $mockLog = "$env:TEMP\fractalsql_bt_mockllm_$suffix.log"
+            $script:MockLog = $mockLog
             # Quote each argument: Start-Process -ArgumentList joins the
             # array with spaces WITHOUT quoting, and $Here contains a
             # space on real dev boxes ("C:\Users\Daniel Gardiner\..."),
@@ -653,17 +664,51 @@ function Start-MariadbSupervisor {
     # Root auth instead relies on --auth-root-authentication-method=
     # normal at mariadb-install-db time (see Mdb-Setup), the same
     # passwordless-root setup bash's mdb_setup uses.
+    #
+    # mariadbd's stderr is captured to a TEMP log, NOT Out-Null'd: on
+    # Windows (no datadir <hostname>.err by default) mariadbd's stderr
+    # is the only place the vendored reasoning plugin's own diagnostics
+    # land ("fractalsql-reasoning-http: ..."), and gate failures used to
+    # surface as bare NULLs with zero visible cause because that channel
+    # was thrown away here (mdb10.6 gate 04 burned on exactly this).
+    # Appended per (re)start with a marker line, so a respawn leaves the
+    # previous attempt's output in the file. Mdb-Teardown prints the
+    # tail of this log when any gate FAILed. Named after $script:DataDir
+    # (not $suffix): Restart-ReasoningPluginInPlace calls this function
+    # from gate scope, where Mdb-Setup's local $suffix is not in view.
+    $script:MariadbdLog = "$($script:DataDir)_mariadbd.log"
     $script:RespawnJob = Start-Job -ScriptBlock {
-        param($mariadbdExe, $dataDir, $port, $plugDir)
+        param($mariadbdExe, $dataDir, $port, $plugDir, $logFile)
         while ($true) {
+            ("--- mariadbd start $(Get-Date -Format o) ---") | Add-Content $logFile
             & $mariadbdExe --datadir=$dataDir --port=$port --plugin-dir=$plugDir `
-                --bind-address=127.0.0.1 2>&1 | Out-Null
+                --bind-address=127.0.0.1 2>&1 | Add-Content $logFile
             Start-Sleep -Milliseconds 500
         }
-    } -ArgumentList $script:MariadbdExe, $script:DataDir, $script:Port, $script:PlugDir
+    } -ArgumentList $script:MariadbdExe, $script:DataDir, $script:Port, $script:PlugDir, $script:MariadbdLog
 }
 
 function Mdb-Teardown {
+    # On any gate FAIL, print the tails of the two diagnostic logs the
+    # teardown is about to (or is the only place that) has: mariadbd's
+    # captured stderr (the vendored reasoning plugin's "fractalsql-
+    # reasoning-http: ..." lines -- the ONLY cause record for a bare-
+    # NULL gate failure, see Start-MariadbSupervisor's comment) and the
+    # mock LLM server's stderr. Done here, not at the final summary,
+    # because Mdb-Teardown runs (twice, from Run-Gates and the top-level
+    # finally) before the script exits; by then the plugin-dir/datadir
+    # deletion below would have destroyed the evidence. Run-Gates and
+    # the top-level finally BOTH call teardown, so guard the dump to
+    # fire once (the first call still has both processes alive).
+    if ($script:Failed -and -not $script:LogsDumped) {
+        $script:LogsDumped = $true
+        foreach ($log in @($script:MariadbdLog, "$script:MockLog.err")) {
+            if ($log -and (Test-Path $log)) {
+                Write-Host "`n--- tail of $log ---"
+                Get-Content $log -Tail 40 | ForEach-Object { Write-Host "  $_" }
+            }
+        }
+    }
     if ($script:RespawnJob) { Stop-Job $script:RespawnJob -ErrorAction SilentlyContinue; Remove-Job $script:RespawnJob -Force -ErrorAction SilentlyContinue }
     Get-Process mariadbd -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*$script:Bin*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     if ($script:MockLlmProc) {

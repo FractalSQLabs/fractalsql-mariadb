@@ -501,11 +501,26 @@ DELIMITER $$
 -- to what the CALLING user can see, so no separate privilege check is
 -- needed; MariaDB does that filtering for us as a property of
 -- information_schema itself.
+--
+-- Every statement below runs after "SET NAMES utf8mb4": without it,
+-- a stored routine's charset (params, DECLAREd variables, string
+-- literals) is frozen to character_set_client/character_set_connection
+-- AT CREATE TIME. A client installing this file with a legacy codepage
+-- charset (e.g. cp850, which the Windows mariadb client auto-detects
+-- from the console codepage) then bakes cp850 into every routine, and
+-- any CONCAT mixing those variables with information_schema data
+-- (utf8) fails at CALL time with "Illegal mix of collations for
+-- operation 'concat'" -- even though the identical CONCAT works when
+-- run standalone. utf8mb4 is the aggregation superset of every charset
+-- this file's routines can mix with, so pinning it makes installation
+-- charset-independent.
+SET NAMES utf8mb4;
 CREATE PROCEDURE fractal_schema_context(
     IN  table_names_json JSON,
     OUT out_context      LONGTEXT
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE done        BOOLEAN DEFAULT FALSE;
     DECLARE tbl_name     VARCHAR(64);
@@ -626,6 +641,7 @@ CREATE PROCEDURE fractal_text_to_sql(
     OUT out_error     TEXT
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_session_id   BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_cfg          TEXT;
@@ -813,6 +829,7 @@ CREATE PROCEDURE fractal_sql_agent(
     OUT p_result_json   JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_session_id   BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_max_retries  INT DEFAULT IFNULL(p_max_retries, 2);
@@ -1068,6 +1085,7 @@ CREATE FUNCTION _fractalsql_quote_ident(name VARCHAR(128)) RETURNS VARCHAR(258)
     DETERMINISTIC
     SQL SECURITY INVOKER
     NO SQL
+
 BEGIN
     RETURN CONCAT('`', REPLACE(name, '`', '``'), '`');
 END$$
@@ -1142,6 +1160,7 @@ CREATE PROCEDURE _fractalsql_vectorizer_enqueue(
     IN p_pk_val        VARCHAR(255)
 )
 SQL SECURITY DEFINER
+
 BEGIN
     DECLARE v_enabled BOOLEAN DEFAULT FALSE;
 
@@ -1184,6 +1203,7 @@ CREATE PROCEDURE fractal_vectorizer_create(
     OUT p_id            BIGINT
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_pk_col       VARCHAR(64);
     DECLARE v_pk_count     INT DEFAULT 0;
@@ -1283,6 +1303,7 @@ END$$
 -- (pausing an already-paused vectorizer is a no-op, not an error).
 CREATE PROCEDURE fractal_vectorizer_pause(IN p_vectorizer_id BIGINT)
 SQL SECURITY INVOKER
+
 BEGIN
     UPDATE fractal_vectorizers SET enabled = FALSE WHERE id = p_vectorizer_id;
     IF ROW_COUNT() = 0 THEN
@@ -1292,6 +1313,7 @@ END$$
 
 CREATE PROCEDURE fractal_vectorizer_resume(IN p_vectorizer_id BIGINT)
 SQL SECURITY INVOKER
+
 BEGIN
     UPDATE fractal_vectorizers SET enabled = TRUE WHERE id = p_vectorizer_id;
     IF ROW_COUNT() = 0 THEN
@@ -1319,6 +1341,7 @@ END$$
 -- runs with the caller's own privileges, not the definer's.
 CREATE PROCEDURE fractal_vectorizer_drop(IN p_vectorizer_id BIGINT)
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_source_table VARCHAR(128) DEFAULT NULL;
     DECLARE v_found        INT DEFAULT 0;
@@ -1374,6 +1397,7 @@ CREATE PROCEDURE fractal_vectorizer_process_queue(
     IN p_stale_after_secs INT
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_batch_size  INT DEFAULT IFNULL(p_batch_size, 100);
     DECLARE v_stale_secs  INT DEFAULT IFNULL(p_stale_after_secs, 600);
@@ -1669,6 +1693,7 @@ CREATE PROCEDURE _fractalsql_telemetry_topk(
     OUT p_result_json JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_params VARCHAR(200);
     DECLARE v_search_result TEXT;
@@ -1728,6 +1753,7 @@ CREATE PROCEDURE _fractalsql_scan_corpus(
     OUT p_ids_json    JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_pk_col   VARCHAR(64);
     DECLARE v_pk_count INT DEFAULT 0;
@@ -1835,6 +1861,7 @@ CREATE PROCEDURE _fractalsql_fetch_row_context(
     OUT p_context_json  JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_pk_col    VARCHAR(64);
     DECLARE v_pk_count  INT DEFAULT 0;
@@ -1904,6 +1931,7 @@ CREATE PROCEDURE fractal_search_telemetry(
     OUT p_result     JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_corpus JSON;
     DECLARE v_ids    JSON;
@@ -1927,6 +1955,7 @@ CREATE PROCEDURE fractal_hybrid_clinical_search(
     OUT p_result     JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_pk_col    VARCHAR(64);
     DECLARE v_pk_count  INT DEFAULT 0;
@@ -2022,6 +2051,7 @@ CREATE PROCEDURE fractal_search_trajectory(
     OUT p_result          JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_delta  TEXT;
     DECLARE v_corpus JSON;
@@ -2049,6 +2079,7 @@ CREATE PROCEDURE fractal_cross_modal_search(
     OUT p_result            JSON
 )
 SQL SECURITY INVOKER
+
 BEGIN
     DECLARE v_morph_scaled TEXT;
     DECLARE v_clin_scaled  TEXT;

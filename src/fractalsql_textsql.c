@@ -520,7 +520,11 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
     sid = (unsigned long long) *(long long *) args->args[0];
 
     ctx = fractal_session_acquire_t2s(sid, &loaded);
-    if (ctx == NULL) { *error = 1; return NULL; }
+    if (ctx == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: session acquire failed for id %llu", sid);
+        *error = 1; return NULL;
+    }
 
     if (!ensure_generate_loaded(sid, ctx, loaded, system_tag, errbuf)) {
         fractal_session_release(sid);
@@ -531,11 +535,22 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
     rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1],
                           context_json, context_len, &resp);
     if (rc != FSQL_OK || resp.rc != 0) {
+        const char *err = fsql_last_error(ctx);
+        /* Mirrored to stderr via SFS_INIT_ERROR: a plain *error=1 here
+         * surfaces only as the orchestrating procedure's generic
+         * "generate dispatch failed" NULL, hiding the plugin's actual
+         * reason (e.g. code-mode fence extraction failure). */
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: dispatch failed (rc=%d, resp.rc=%d): %s",
+            rc, resp.rc, err && *err ? err : "(no detail)");
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
     }
     if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: response %zu bytes exceeds "
+            "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
@@ -601,7 +616,11 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
     sid = (unsigned long long) *(long long *) args->args[0];
 
     ctx = fractal_session_acquire_reason(sid, &loaded);
-    if (ctx == NULL) { *error = 1; return NULL; }
+    if (ctx == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: session acquire failed for id %llu", sid);
+        *error = 1; return NULL;
+    }
 
     if (!ensure_review_loaded(sid, ctx, loaded, errbuf)) {
         fractal_session_release(sid);
@@ -626,11 +645,20 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
     memset(&resp, 0, sizeof(resp));
     rc = fsql_dispatch_ai(ctx, prompt, plen, "{}", 2, &resp);
     if (rc != FSQL_OK || resp.rc != 0) {
+        const char *err = fsql_last_error(ctx);
+        /* Same stderr mirror as fractal_t2s_generate's dispatch branch:
+         * a bare *error=1 would only ever show as a NULL review verdict. */
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: dispatch failed (rc=%d, resp.rc=%d): %s",
+            rc, resp.rc, err && *err ? err : "(no detail)");
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
     }
     if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: response %zu bytes exceeds "
+            "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
