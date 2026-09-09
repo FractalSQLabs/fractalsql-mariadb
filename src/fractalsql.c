@@ -135,8 +135,15 @@ sfs_copy_result(sfs_ctx *c, const char *json, size_t len, char *error)
     return nb;
 }
 
-#define SFS_INIT_ERROR(msg, ...) \
-    (snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__))
+/* Same stderr-mirroring SFS_INIT_ERROR as fractalsql_cognition.c
+ * (duplicated per translation unit by this repo's established
+ * precedent): on the UDF runtime path the formatted buffer would
+ * otherwise be dropped, surfacing failures as bare NULLs. */
+#define SFS_INIT_ERROR(msg, ...)                                              \
+    do {                                                                      \
+        snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__);                      \
+        fprintf(stderr, "fractalsql: %s\n", (msg));                           \
+    } while (0)
 
 /* ------------------------------------------------------------------ */
 /* Argument parsing                                                   */

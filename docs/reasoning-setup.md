@@ -20,7 +20,7 @@ agreement.
 
 ## 🧠 The Cognition Model
 
-At its core, the Cognition tier provides `fractal_reason(session_id, query
+The Cognition tier provides `fractal_reason(session_id, query
 [, context])`. Unlike traditional RAG, which relies on external
 orchestrators, FractalSQL performs the synthesis inside the backend:
 

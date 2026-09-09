@@ -93,7 +93,7 @@ These are process environment variables, read once by `mariadbd` at startup and 
 `fractal_t2s_config()` (0-arg UDF) reports the resolved values back as JSON, e.g. `{"max_attempts":2,"allowed_statements":"select","use_review":false}`, useful for confirming what a running server was actually started with, without needing shell access to it.
 
 ### Secure it: Authorization vs. Correctness
-**Crucial**: this pipeline is a *correctness* aid, not an *authorization* mechanism. The allowlist and `PREPARE` checks catch shape problems, but they do not replace MariaDB grants.
+Treat this pipeline as a *correctness* aid, not an *authorization* mechanism. The allowlist and `PREPARE` checks catch shape problems, but they do not replace MariaDB grants.
 
 To secure your Text-to-SQL implementation:
 1. **Dedicated account**: create a restricted MariaDB user with `SELECT` grants only on the tables the use case needs.

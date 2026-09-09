@@ -113,8 +113,24 @@
 
 #include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
 
-#define SFS_INIT_ERROR(msg, ...) \
-    (snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__))
+/* SFS_INIT_ERROR(msg, ...) formats `msg` for the UDF ABI's
+ * init-function `message` param -- the only channel the server reads.
+ * On a UDF *runtime* path there is no such channel: the main function
+ * can only set *error and return NULL, so a buffer formatted here on a
+ * runtime failure is a stack local the server never sees, and the
+ * failure used to surface as a bare NULL with its cause dropped
+ * entirely (exactly how a macOS-only dlopen failure of the reasoning
+ * plugin once went undiagnosable in CI: nothing in the client output,
+ * nothing in mariadbd's log). Mirror every message to stderr as a
+ * second channel -- mariadbd's stderr is the console for a foreground
+ * start and the server's own .err file under a service manager. All
+ * call sites are one-shot validation/load failures, not per-row hot
+ * paths, so this stays log-quiet. */
+#define SFS_INIT_ERROR(msg, ...)                                              \
+    do {                                                                      \
+        snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__);                      \
+        fprintf(stderr, "fractalsql: %s\n", (msg));                           \
+    } while (0)
 
 /* Same DoS-guard reasoning as fractalsql.c's MAX_QUERY_BYTES: a
  * caller-controlled string driving allocation and an outbound HTTP
@@ -456,7 +472,11 @@ fractal_reason(UDF_INIT *initid, UDF_ARGS *args, char *result,
     sid = (unsigned long long) *(long long *) args->args[0];
 
     ctx = fractal_session_acquire_reason(sid, &loaded);
-    if (ctx == NULL) { *error = 1; return NULL; }
+    if (ctx == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_reason: session acquire failed for id %llu", sid);
+        *error = 1; return NULL;
+    }
 
     if (!ensure_reason_loaded(sid, ctx, loaded, errbuf)) {
         fractal_session_release(sid);
@@ -467,11 +487,18 @@ fractal_reason(UDF_INIT *initid, UDF_ARGS *args, char *result,
     rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1],
                           ctx_json, ctx_json_len, &resp);
     if (rc != FSQL_OK || resp.rc != 0) {
+        const char *err = fsql_last_error(ctx);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_reason: dispatch failed (rc=%d, resp.rc=%d): %s",
+            rc, resp.rc, err && *err ? err : "(no detail)");
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
     }
     if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_reason: response of %zu bytes exceeds the %zu-byte cap",
+            resp.summary_len, (size_t) FRACTAL_MAX_AI_RESPONSE_BYTES);
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
@@ -535,7 +562,11 @@ fractal_embed(UDF_INIT *initid, UDF_ARGS *args, char *result,
     sid = (unsigned long long) *(long long *) args->args[0];
 
     ctx = fractal_session_acquire_embed(sid, &loaded);
-    if (ctx == NULL) { *error = 1; return NULL; }
+    if (ctx == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_embed: session acquire failed for id %llu", sid);
+        *error = 1; return NULL;
+    }
 
     if (!ensure_embed_loaded(sid, ctx, loaded, errbuf)) {
         fractal_session_release(sid);
@@ -548,11 +579,18 @@ fractal_embed(UDF_INIT *initid, UDF_ARGS *args, char *result,
      * as fractal_reason's own default. */
     rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1], "{}", 2, &resp);
     if (rc != FSQL_OK || resp.rc != 0) {
+        const char *err = fsql_last_error(ctx);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_embed: dispatch failed (rc=%d, resp.rc=%d): %s",
+            rc, resp.rc, err && *err ? err : "(no detail)");
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
     }
     if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_embed: response of %zu bytes exceeds the %zu-byte cap",
+            resp.summary_len, (size_t) FRACTAL_MAX_AI_RESPONSE_BYTES);
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;

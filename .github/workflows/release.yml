@@ -524,7 +524,12 @@ jobs:
           ZIP_NAME="fractalsql-mariadb-${{ matrix.platform_tag }}.zip"
           STAGE="$(mktemp -d)"
           cp "dist/${{ matrix.platform_tag }}/fractalsql.dylib" "${STAGE}/"
-          cp "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so" "${STAGE}/"
+          # install -m 0755, not cp: ships the plugin with the exec bit
+          # set in the zip itself so a manual "step 3" cp from an
+          # unpacked archive can't stage a non-executable .so (macOS
+          # dyld refuses to mmap(PROT_EXEC) one; install.sh below
+          # re-stages 0755 regardless, this keeps the raw zip right).
+          install -m 0755 "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so" "${STAGE}/"
           cp LICENSE "${STAGE}/"
           cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
           cp sql/install_udf.sql "${STAGE}/install_udf.sql"

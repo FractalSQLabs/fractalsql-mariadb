@@ -544,7 +544,11 @@ mdb_setup() {
   # 23 cognition) NULLs while the locally-compiled fixture gates
   # (05/07/14/15/29) still pass -- caught live on darwin-gate-matrix.
   local fsql_platform; fsql_platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
-  cp "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so" "$PLUGDIR/fractalsql-reasoning-http.so" || return 2
+  # install -m 0755, not cp: the vendored blob's mode is whatever the
+  # git tree carries, and dlopen on macOS refuses to mmap(PROT_EXEC) a
+  # .so lacking the exec bit (Linux never checks it, so only the darwin
+  # runs would break -- with a bare NULL from the UDF, no logged cause).
+  install -m 0755 "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so" "$PLUGDIR/fractalsql-reasoning-http.so" || return 2
   local mock_port=$(( 18300 + $(echo "$v" | tr -d '.') % 100 ))
   python3 "$HERE/scripts/ci/mock_llm.py" "$mock_port" \
     >/tmp/fractalsql_bt_mockllm_${v//./_}.log 2>&1 &

@@ -230,4 +230,4 @@ FractalSQL uses a pull-based queue rather than a background worker thread. You c
 
 ## When to use the Vectorizer
 
-The Vectorizer is the right choice when you need seamless semantic synchronization without standing up a separate Python/Node.js worker. If you already have a robust external ETL pipeline, skip it and call `fractal_embed()` directly to populate your embedding column on your own schedule.
+Use the Vectorizer when you want embeddings kept in sync without running a separate Python/Node.js worker. If you already run your own ETL pipeline, skip it and call `fractal_embed()` directly to populate your embedding column on your own schedule.

@@ -481,7 +481,11 @@ jobs:
           PLUGIN_DIR=$(mariadb -N -B -e "SELECT @@plugin_dir")
           echo "plugin_dir: ${PLUGIN_DIR}"
           cp dist/darwin/fractalsql.dylib "${PLUGIN_DIR}/fractalsql.so"
-          cp include/darwin-arm64/fractalsql-reasoning-http.so "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+          # install -m 0755, not cp: macOS dyld refuses to
+          # mmap(PROT_EXEC) a .so without the exec bit (Linux never
+          # checks it, so only this job would break), and the only
+          # symptom is a bare NULL from every reasoning call.
+          install -m 0755 include/darwin-arm64/fractalsql-reasoning-http.so "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
           mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
           mariadb fractalsql_ci < sql/install_udf.sql
           mariadb fractalsql_ci < sql/install_agents.sql
@@ -544,6 +548,40 @@ jobs:
           # before it's killed: BSD ps -E shows it, and it separates
           # "the exports never reached mariadbd" from everything else.
           MDB_ENV=$(ps -E -p "${MDB_PID}" -o command= 2>/dev/null || true)
+          # Diagnose BEFORE any kill -- a reachability probe after the
+          # mock is dead can only ever print "no" (caught live: this
+          # branch once ran its nc/cat after the kills and reported
+          # nothing useful).
+          echo "--- server still reachable? ---"
+          mariadb -S /tmp/fsql_install_test.sock -N -B -e \
+            "SELECT @@plugin_dir" 2>&1 || true
+          echo "--- mock still reachable? ---"
+          nc -z 127.0.0.1 18080 && echo "yes" || echo "no"
+          echo "--- mock requests seen this run (if any) ---"
+          cat /tmp/mock_llm.out 2>/dev/null || echo "(no mock output)"
+          # Standalone dlopen of the staged plugin, outside mariadbd:
+          # its dlerror text separates "this file will not load in any
+          # process" (bad mode/arch/signature/dependency) from "loads
+          # standalone but fails inside the server".
+          echo "--- standalone dlopen probe ---"
+          python3 - <<'PY' || true
+          import ctypes
+          import os
+          so = os.environ.get("FRACTALSQL_REASONING_PLUGIN", "")
+          if not so:
+              print("standalone dlopen: skipped, no FRACTALSQL_REASONING_PLUGIN")
+          else:
+              try:
+                  # RTLD_LAZY, not ctypes' RTLD_NOW default: mirrors the
+                  # server's dlopen and keeps loadability (mode/arch/
+                  # signature/dependencies) the verdict, not any lazy
+                  # undefined symbol.
+                  ctypes.CDLL(so, mode=os.RTLD_LAZY)
+                  print("standalone dlopen: OK")
+              except OSError as e:
+                  print("standalone dlopen FAILED:", e)
+          PY
+          ls -l "${PLUGIN_DIR}"
           kill "${MOCK_PID}" 2>/dev/null || true
           kill "${MDB_PID}" 2>/dev/null || true
           echo "$REPLY" | grep -qi sql \
@@ -552,12 +590,6 @@ jobs:
                    env | grep '^FRACTALSQL_' || echo "(none)"
                    echo "--- env as mariadbd sees it (ps -E) ---"
                    echo "${MDB_ENV:-(mariadbd already exited; could not read)}"
-                   echo "--- plugin dir ---"
-                   ls -l "${PLUGIN_DIR}"
-                   echo "--- mock still reachable? ---"
-                   nc -z 127.0.0.1 18080 && echo "yes" || echo "no"
-                   echo "--- mock requests seen this run (if any) ---"
-                   cat /tmp/mock_llm.out 2>/dev/null || echo "(no mock output)"
                    echo "--- datadir error log (tail) ---"
                    tail -30 "${MARIADB_DATADIR}/$(hostname).err" 2>/dev/null || true
                    exit 1; }

@@ -36,8 +36,15 @@
  * freely-tunable local knob. */
 #define FSQL_PARSE_ERRMSG_SIZE 512
 
-#define SFS_INIT_ERROR(msg, ...) \
-    (snprintf((msg), FSQL_PARSE_ERRMSG_SIZE, __VA_ARGS__))
+/* Same stderr-mirroring SFS_INIT_ERROR as fractalsql_cognition.c
+ * (duplicated per translation unit by this repo's established
+ * precedent): on the UDF runtime path the formatted buffer would
+ * otherwise be dropped, surfacing failures as bare NULLs. */
+#define SFS_INIT_ERROR(msg, ...)                                              \
+    do {                                                                      \
+        snprintf((msg), FSQL_PARSE_ERRMSG_SIZE, __VA_ARGS__);                 \
+        fprintf(stderr, "fractalsql: %s\n", (msg));                           \
+    } while (0)
 
 #ifdef FRACTAL_HAVE_VECTOR_TYPE
 /* MySQL 9.0 VECTOR values arrive as binary strings of packed

@@ -128,8 +128,15 @@
 #include <openssl/evp.h>         /* Ed25519 signature verification, see ent_verify_signature() */
 #include <openssl/crypto.h>      /* CRYPTO_memcmp: constant-time ledger MAC comparison */
 
-#define SFS_INIT_ERROR(msg, ...) \
-    (snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__))
+/* Same stderr-mirroring SFS_INIT_ERROR as fractalsql_cognition.c
+ * (duplicated per translation unit by this repo's established
+ * precedent): on the UDF runtime path the formatted buffer would
+ * otherwise be dropped, surfacing failures as bare NULLs. */
+#define SFS_INIT_ERROR(msg, ...)                                              \
+    do {                                                                      \
+        snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__);                      \
+        fprintf(stderr, "fractalsql: %s\n", (msg));                           \
+    } while (0)
 
 #define ENT_NOT_LOADED_MSG \
     "enterprise tier not loaded: set FRACTALSQL_ENTERPRISE_LIB to the " \
