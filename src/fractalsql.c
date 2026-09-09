@@ -71,7 +71,7 @@
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
  * metadata's version silently drifting apart. */
-#define FSQL_VERSION "2.0.0"
+#define FSQL_VERSION "2.0.3"
 
 /* strncasecmp is POSIX (<strings.h>), not standard C. MSVC has no
  * <strings.h> at all, only the underscore-prefixed _strnicmp. Used by

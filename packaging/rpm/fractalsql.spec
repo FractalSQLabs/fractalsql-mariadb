@@ -10,7 +10,7 @@
 # it is not exercised by any workflow in this repo.
 
 Name:           fractalsql-mariadb
-Version:        2.0.0
+Version:        2.0.3
 Release:        1%{?dist}
 Summary:        Stochastic Fractal Search UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 

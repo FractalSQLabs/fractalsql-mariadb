@@ -7,7 +7,7 @@
     -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.3 (dotted, for display)
     -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_3 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-mdb...
-    -dMSI_VERSION=2.0.0
+    -dMSI_VERSION=2.0.3
   plus the standard candle -arch x64|arm64, which populates
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 

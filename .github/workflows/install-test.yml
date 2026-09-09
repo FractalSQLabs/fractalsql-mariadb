@@ -148,7 +148,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.0"
+          test "\$VERSION" = "2.0.3"
 
           # End-to-end fractal_search smoke. Trivial 4-row corpus, query
           # equals row 0; expect a JSON document with dim/n_corpus/top_k.
@@ -370,7 +370,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.0"
+          test "\$VERSION" = "2.0.3"
 
           RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
           echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
@@ -494,7 +494,7 @@ jobs:
           VERSION=$(mariadb -N -B -e "SELECT fractalsql_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
-          test "${VERSION}" = "2.0.0"
+          test "${VERSION}" = "2.0.3"
 
           RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
           echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }

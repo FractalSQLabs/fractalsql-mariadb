@@ -96,7 +96,7 @@ CREATE FUNCTION fractal_explore   RETURNS STRING SONAME 'fractalsql.so';
 -- fractalsql_edition() -> 'Community'
 CREATE FUNCTION fractalsql_edition RETURNS STRING SONAME 'fractalsql.so';
 
--- fractalsql_version() -> '2.0.0'
+-- fractalsql_version() -> '2.0.3'
 CREATE FUNCTION fractalsql_version RETURNS STRING SONAME 'fractalsql.so';
 
 -- ---------------------------------------------------------------------

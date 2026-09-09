@@ -129,7 +129,7 @@ jobs:
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractalsql_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "2.0.0"
+              test "${VERSION}" = "2.0.3"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -543,7 +543,7 @@ jobs:
           cp sql/install_agents.sql "${STAGE}/install_agents.sql"
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
-          fractalsql-mariadb 2.0.0 Community (${{ matrix.platform_tag }})
+          fractalsql-mariadb 2.0.3 Community (${{ matrix.platform_tag }})
 
           Unsigned MariaDB UDF for macOS. Compatible with MariaDB
           10.6 / 10.11 / 11.4 LTS / 12.3 LTS via Homebrew.
