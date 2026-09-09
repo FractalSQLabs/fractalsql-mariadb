@@ -516,6 +516,14 @@ jobs:
           # with the config in its environment (see below for why that
           # restart is a direct mariadbd start, not brew services).
           PLUGIN_DIR=$(mariadb -N -B -e "SELECT @@plugin_dir")
+          # The reasoning core requires a canonical plugin path: the
+          # configured value must equal its own realpath. @@plugin_dir
+          # here is both slash-terminated (giving plugin//file.so) and,
+          # under Homebrew, a symlink to the versioned Cellar dir;
+          # resolving to the physical path is what makes it canonical
+          # (caught live: the core rejected the raw @@plugin_dir form
+          # with "reasoning plugin path is not canonical").
+          PLUGIN_DIR="$(cd "${PLUGIN_DIR}" && pwd -P)"
           brew services stop mariadb
           export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
           export FRACTALSQL_HTTP_URL="http://127.0.0.1:18080/v1/chat/completions"

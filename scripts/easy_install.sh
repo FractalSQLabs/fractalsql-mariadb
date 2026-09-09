@@ -288,6 +288,15 @@ resolve_mdb_as() {
     PLUGIN_DIR="$("${MDB_AS[@]}" -Nse 'SELECT @@plugin_dir;')"
     [[ -n "${PLUGIN_DIR}" ]] || die "SELECT @@plugin_dir returned nothing"
     PLUGIN_DIR="${PLUGIN_DIR%/}"
+    # The reasoning core requires a canonical plugin path (the
+    # configured value must equal its own realpath), and @@plugin_dir
+    # runs through Homebrew's /opt/homebrew/opt/mariadb symlink on
+    # macOS -- writing that symlinked form to the env file would be
+    # rejected at load time ("reasoning plugin path is not canonical").
+    # Resolve to the physical directory once, here.
+    RESOLVED_PLUGIN_DIR="$(cd "${PLUGIN_DIR}" && pwd -P)" \
+        || die "can't resolve plugin dir '${PLUGIN_DIR}' to a physical path"
+    PLUGIN_DIR="${RESOLVED_PLUGIN_DIR}"
 }
 
 # --- Phase B: install the package (default-on) ------------------------

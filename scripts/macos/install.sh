@@ -64,6 +64,17 @@ fi
 
 PLUGIN_DIR="$("${MARIADB_BIN}" ${MDB_AUTH} -Nse 'SELECT @@plugin_dir;' 2>/dev/null || true)"
 PLUGIN_DIR="${PLUGIN_DIR%/}"
+# Canonical (realpath-equal) form, not just slash-trimmed: the reasoning
+# core rejects symlinked plugin paths ("reasoning plugin path is not
+# canonical"), and @@plugin_dir under Homebrew is a symlink to the
+# versioned Cellar dir -- the load instructions below must hand users a
+# path that actually loads.
+if [[ -n "${PLUGIN_DIR}" ]]; then
+    PLUGIN_DIR="$(cd "${PLUGIN_DIR}" && pwd -P)" || {
+        echo "error: can't resolve plugin dir to a physical path" >&2
+        exit 1
+    }
+fi
 if [[ -z "${PLUGIN_DIR}" ]]; then
     echo "error: SELECT @@plugin_dir returned nothing." >&2
     exit 1

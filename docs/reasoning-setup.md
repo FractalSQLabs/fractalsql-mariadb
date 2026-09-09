@@ -63,7 +63,7 @@ SELECT @@plugin_dir;
 Common paths:
 - **Debian/Ubuntu (apt)**: `/usr/lib/mysql/plugin/`
 - **RHEL/Rocky (dnf)**: `/usr/lib64/mariadb/plugin/`
-- **macOS (Homebrew)**: `/opt/homebrew/opt/mariadb/lib/plugin/` (Apple Silicon) or `/usr/local/opt/mariadb/lib/plugin/` (Intel)
+- **macOS (Homebrew)**: `/opt/homebrew/Cellar/mariadb/<version>/lib/plugin/` (Apple Silicon) or `/usr/local/Cellar/mariadb/<version>/lib/plugin/` (Intel) — resolve it with `realpath "$(mariadb -N -B -e 'SELECT @@plugin_dir;')"`; see the canonical-path note in Step 1 for why the `/opt/homebrew/opt/mariadb/...` symlink form won't work
 - **Windows**: `C:\Program Files\MariaDB <major>\lib\plugin\`
 
 Copy `fractalsql-reasoning-http.so`/`.dll` there (the `.deb`/`.rpm`
@@ -90,6 +90,19 @@ once by `mariadbd` and cached for that process's entire lifetime. Set it
 # systemd EnvironmentFile, docker run -e, or your process manager's
 # equivalent. Not a server config file; plain process-environment syntax.
 FRACTALSQL_REASONING_PLUGIN=/usr/lib/mysql/plugin/fractalsql-reasoning-http.so
+```
+
+**The path must be canonical**: the reasoning core resolves the value
+with `realpath()` and refuses to load anything whose configured path
+doesn't equal its own resolution ("reasoning plugin path is not
+canonical" on the server's stderr). Symlinked directory segments never
+pass that check — on macOS/Homebrew that means the familiar
+`/opt/homebrew/opt/mariadb/...` form is rejected (it's a symlink into
+the versioned `Cellar` directory), so always resolve the real path
+first:
+
+```bash
+FRACTALSQL_REASONING_PLUGIN="$(realpath "$(mariadb -N -B -e 'SELECT @@plugin_dir;')")/fractalsql-reasoning-http.so"
 ```
 
 The plugin loads lazily on the first reasoning call in a session, but there
@@ -340,7 +353,7 @@ instruction, set `FSQL_REASONING_HTTP_SYSTEM_PROMPT`.
 
 ## 📋 Production Checklist
 
-- [ ] **Plugin Path**: `FRACTALSQL_REASONING_PLUGIN` is absolute, readable by the `mysql` user, and set in `mariadbd`'s process environment (not a config file).
+- [ ] **Plugin Path**: `FRACTALSQL_REASONING_PLUGIN` is absolute, **canonical** (it equals its own `realpath` — no symlinked segments, e.g. not Homebrew's `/opt/homebrew/opt/...` form), readable by the `mysql` user, and set in `mariadbd`'s process environment (not a config file).
 - [ ] **Auth Model**: A dedicated reasoning account is used with column-level `SELECT` grants, not `root`.
 - [ ] **No RLS fallback**: any row-level filtering the workload needs is enforced in the SQL/view itself; confirmed there is no engine-level backstop here.
 - [ ] **Egress Review**: Cloud endpoints' DPA/BAA have been reviewed for the specific data classification.
