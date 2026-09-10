@@ -12,7 +12,7 @@
 Name:           fractalsql-mariadb
 Version:        2.0.3
 Release:        1%{?dist}
-Summary:        Stochastic Fractal Search UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
+Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 
 License:        Apache-2.0
 URL:            https://github.com/FractalSQLabs/fractalsql-mariadb
@@ -59,10 +59,10 @@ install -Dm0644 sql/install_agents.sql \
 %{sharedir}/install_agents.sql
 
 %changelog
-* Sun Aug 30 2026 FractalSQLabs <ops@fractalsqlabs.io> - 2.0.0-1
-- Full v2.0.0 port: Discovery/Vector/Cognition/Text-to-SQL/Vectorizer/
+* Sun Aug 30 2026 FractalSQLabs - 2.0.0-1
+- Full v2.0.0: Discovery/Vector/Cognition/Text-to-SQL/Vectorizer/
   Agency/Enterprise-activation tiers. Single generic package (no
   per-major split -- the UDF ABI is stable across the whole 10.6-12.3
   compat range), Apache-2.0, no LuaJIT.
-* Sat Apr 18 2026 FractalSQLabs <ops@fractalsqlabs.io> - 1.0.0-1
+* Sat Apr 18 2026 FractalSQLabs - 1.0.0-1
 - Initial Factory-standardized release for MariaDB 10.6 / 10.11 / 11.4.
