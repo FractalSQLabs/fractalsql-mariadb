@@ -22,7 +22,7 @@ the container, so no local MariaDB installation or compiler is required.
 One command, no flags, gives you the bare minimum:
 
 - **MariaDB 11.4** running, database `fractalsql_demo`, with the fractalsql
-  UDF set **and** the 15 agent stored procedures registered
+  UDF set **and** the 16 agent stored procedures registered
   (`sql/install_udf.sql` / `sql/install_agents.sql` run automatically as
   `docker-entrypoint-initdb.d` scripts; MariaDB has no
   `CREATE EXTENSION`/dependent-extension mechanism to hook into).
@@ -46,7 +46,7 @@ docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
 Confirm the UDF set loaded:
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
-  "SELECT fractalsql_edition(), fractalsql_version();"
+  "SELECT fractal_edition(), fractal_version();"
 # expect: Community, 2.0.3
 ```
 
@@ -97,38 +97,70 @@ docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/d
 
 ---
 
-## 🎓 What's in `/demo/` today
+## 🎓 The Learning Path
 
-**All eleven industry starter kits are here too**: eleven runnable
-industry walkthroughs (`demo-vertical-*.sql`: quant-finance, medtech,
-recommendation-search, sovereign-edge-ai, maritime-defense,
-fleet-logistics, smart-cities-iot, cybersecurity, plus three agentic
-verticals), each run end to end against a real MariaDB server and a
-real Ollama endpoint; see
+Run the demos in this order to see the progression from a vector search tool to a
+sovereign agentic database. (Cognition/Agency demos need a model from step 2;
+Discovery demos do not.)
+
+### Level 1: Geometric Discovery
+*Focus: Using the fractal core and domain-specific geometry to find structure in noise.*
+- **Goal**: Learn to use SFS for high-precision convergence and domain-specific metrics (vascular, cortical, nerve).
+- **Demos**:
+  ```bash
+  # MedTech: Clinical Telemetry & Patient Monitoring
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-medtech-clinical.sql
+  # Maritime: AIS & Radar Tracking
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-maritime-defense.sql
+  # Fleet: Last-Mile Delivery
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-fleet-logistics.sql
+  # Smart Cities: IoT Sensor Grids
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-smart-cities-iot.sql
+  ```
+
+### Level 2: Cognitive Synthesis
+*Focus: Composing search with LLM reasoning to generate human-readable insights.*
+- **Goal**: Learn to feed Scout Discovery results into `fractal_reason` and use `fractal_text_to_sql` for safe data exploration.
+- **Demos**:
+  ```bash
+  # Recommendations: Advanced Discovery Engines
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-recommendation-search.sql
+  # Sovereign: Edge & Autonomous Systems AI
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-sovereign-edge-ai.sql
+  # BI: The Full Reasoning Loop (Question -> SQL -> Result -> Reason)
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-business-intelligence.sql
+  ```
+
+### Level 3: Autonomous Agency
+*Focus: Building self-correcting, safe, and predictive agentic workflows.*
+- **Goal**: Learn to use loop detection (DFA), trajectory prediction, and self-correcting SQL agents. The reference blueprint agents ship inline in each vertical demo; the sixteen installable agents are exercised by `demo-agents.sql` (which uses the real, already-registered `sql/install_agents.sql` product path).
+- **Demos**:
+  ```bash
+  # DevOps: Autonomous Incident Triage & Self-Healing
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-agentic-ops-devops.sql
+  # Support: Stateful Session & Churn Drift
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-agentic-customer-support.sql
+  # FinTech: MCTS Scenario Exploration & Safe Execution
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-agentic-fintech-mcts.sql
+  # Cyber: Threat Detection & Triage
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-cybersecurity-threat-detection.sql
+  # The sixteen installable agents (already registered from docker-entrypoint-initdb.d)
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-agents.sql
+  ```
+
+See [Agent Recipes](api-agency.md#which-agent-should-i-use) for what each agent
+does and when to use it.
+
+### Other demos in the image
+
+`/demo/` also contains `demo.sql` (the base walkthrough), `response-modes.sql`,
+`demo-text-to-sql.sql`, `demo-vectorizer.sql`, `demo-fractal-vector.sql`,
+`benchmark.sql`, `benchmark-api-reference.sql`, the `text-to-sql-spike-*.sql`
+series, and the enterprise-tier `enterprise-qtl-audit.sql`/`enterprise-stress.sql`
+(see [`docs/enterprise.md`](enterprise.md)). Run any the same way. See
 [demo/README.md](../demo/README.md#industry-vertical-demos) for the full
-list and run instructions. What else is here, also verified live against
-a real running MariaDB server:
-
-| File | What it shows |
-| --- | --- |
-| `demo.sql` | Five-minute walkthrough: Sniper Search, seed data, Scout Discovery feeding a reasoning call. |
-| `response-modes.sql` | `text` / `code` / `json` response-mode behavior of the reasoning plugin. |
-| `demo-text-to-sql.sql` | `fractal_text_to_sql` against a three-table schema with real foreign keys. |
-| `demo-vectorizer.sql` | Automatic embedding pipeline: `fractal_vectorizer_create`/`_process_queue`. |
-| `demo-fractal-vector.sql` | The `fractal_vector_*` portable path, plus native `VECTOR(n)` interop (11.7+). |
-| `demo-agents.sql` | All 15 installable agents, end to end. |
-| `demo-business-intelligence.sql` | The full reasoning loop: question → SQL → result → reason. |
-| `benchmark.sql` | Sniper/Scout/vectorizer comparison, in-database. |
-| `benchmark-api-reference.sql` | Coverage pass over the full UDF/procedure surface. |
-| `text-to-sql-spike-1..4.sql` | GENERATE → REVIEW → EXPLAIN-validate → negative-control, run by hand against one configured model at a time (see each file's header: this repo's env-var-only config means one model per `mariadbd` process, not the interactive model-switching the file names might suggest). |
-| `enterprise-qtl-audit.sql` / `enterprise-stress.sql` | Enterprise-tier ledger and audit surface, verified in both dormant and active states; see [`docs/enterprise.md`](enterprise.md) for the full reference. |
-
-`demo/demo-workload.sh`, a sustained-load p50/p95/p99 harness, has been run end to end against a live model.
-
-See [`docs/starter-kits.md`](starter-kits.md) for the full industry-vertical
-list and the problem→agent mapping, and
-[Agent Recipes](api-agency.md#which-agent-should-i-use) for what each agent
-does.
+industry-vertical list, including the eight non-agentic verticals not called
+out above.
 
 ---
 
@@ -138,7 +170,7 @@ does.
 See how Scout Discovery captures more distinct clusters than a plain
 indexed top-K search, and how much slower it is for that diversity. It's the
 classic index-vs-Scout tradeoff, at a
-scale sized for `fractal_explore`'s inline-corpus-per-call architecture
+scale sized for `fractal_search_explore`'s inline-corpus-per-call architecture
 (see [`docs/features.md`](features.md#-benchmarks--scaling) for why the
 workable scale here is comparatively small):
 ```bash
@@ -164,7 +196,7 @@ docker compose exec mariadb python3 /bench/data_gen.py --host 127.0.0.1 --databa
 docker compose exec mariadb python3 /bench/head_to_head.py --host 127.0.0.1 --database fractalsql_bench
 ```
 See `bench/README.md` for the exact output shape, the chosen default
-scale (comparatively small, since `fractal_explore`
+scale (comparatively small, since `fractal_search_explore`
 has no server-side index to lean on, see [features.md](features.md)), and the
 tuning knobs.
 

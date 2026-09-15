@@ -25,20 +25,15 @@
 -- into sql/install_agents.sql as plain stored procedures since MariaDB
 -- has no extension-dependency system to hook agents into.
 --
--- Agents exercised: 12 cognition agents call fractal_reason internally,
--- 3 are pure retrieval/analytics with no LLM call (fractal_dimension_
--- drift, fractal_reason, fractal_optimize_portfolio, fractal_search_
--- telemetry, fractal_hybrid_clinical_search, fractal_diversify_enable,
--- fractal_sql_agent, fractal_search_trajectory, fractal_detect_collapse,
--- fractal_dimension_boxcount, fractal_dimension_dfa,
--- fractal_morphological_complexity).
+-- Agents exercised: 13 cognition agents call fractal_reason internally,
+-- 3 are pure retrieval/analytics with no LLM call.
 --
 -- Prerequisites:
 --   1. SOURCE sql/install_udf.sql;      (the base UDF set)
 --   2. SOURCE sql/install_agents.sql;   (the sixteen agents)
 --   3. Reasoning configured (FRACTALSQL_REASONING_PLUGIN/HTTP_URL/
 --      HTTP_MODEL/HTTP_ALLOW_PLAINTEXT in mariadbd's environment).
---      The twelve cognition agents call fractal_reason internally;
+--      The thirteen cognition agents call fractal_reason internally;
 --      the 3 retrieval/analytics agents need no endpoint. Confirm
 --      before running:
 --        SELECT fractal_reason(CONNECTION_ID(), 'reply with a short confirmation');

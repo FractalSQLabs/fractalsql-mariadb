@@ -69,9 +69,9 @@ fi
 # dlsym(fractal_search) fails at CREATE FUNCTION time.
 echo "--- dynsym UDF entry points ---"
 for sym in fractal_search fractal_search_init fractal_search_deinit \
-           fractal_explore fractal_explore_init fractal_explore_deinit \
-           fractalsql_edition fractalsql_edition_init fractalsql_edition_deinit \
-           fractalsql_version fractalsql_version_init fractalsql_version_deinit; do
+           fractal_search_explore fractal_search_explore_init fractal_search_explore_deinit \
+           fractal_edition fractal_edition_init fractal_edition_deinit \
+           fractal_version fractal_version_init fractal_version_deinit; do
     if ! nm -D "${SO}" 2>/dev/null | awk '{print $NF}' | grep -Fx "${sym}" >/dev/null; then
         echo "FAIL: ${sym} missing from .dynsym" >&2
         exit 1

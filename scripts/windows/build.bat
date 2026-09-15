@@ -143,8 +143,8 @@ REM   the static .lib has plain fsql_* symbols, not __imp_ thunks
 REM   (confirmed directly: LNK2001 on 33 __imp_fsql_* externals on the
 REM   first real Windows run without it).
 REM
-REM The UDF entry points (fractal_search / fractalsql_edition /
-REM fractalsql_version / ... plus their _init/_deinit) carry
+REM The UDF entry points (fractal_search / fractal_edition /
+REM fractal_version / ... plus their _init/_deinit) carry
 REM __declspec(dllexport) via the FRACTAL_EXPORT macro in
 REM src/fractalsql.c, so no .def file is needed and candle/light
 REM downstream won't need to play with export tables.

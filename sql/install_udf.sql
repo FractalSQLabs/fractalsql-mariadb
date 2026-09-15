@@ -16,9 +16,9 @@
 -- across them.
 
 DROP FUNCTION IF EXISTS fractal_search;
-DROP FUNCTION IF EXISTS fractal_explore;
-DROP FUNCTION IF EXISTS fractalsql_edition;
-DROP FUNCTION IF EXISTS fractalsql_version;
+DROP FUNCTION IF EXISTS fractal_search_explore;
+DROP FUNCTION IF EXISTS fractal_edition;
+DROP FUNCTION IF EXISTS fractal_version;
 DROP FUNCTION IF EXISTS fractal_dimension_dfa;
 DROP FUNCTION IF EXISTS fractal_dimension_boxcount;
 DROP FUNCTION IF EXISTS fractal_dimension_drift;
@@ -74,6 +74,8 @@ DROP PROCEDURE IF EXISTS fractal_search_telemetry;
 DROP PROCEDURE IF EXISTS fractal_hybrid_clinical_search;
 DROP PROCEDURE IF EXISTS fractal_search_trajectory;
 DROP PROCEDURE IF EXISTS fractal_cross_modal_search;
+DROP PROCEDURE IF EXISTS fractal_store_morphology;
+DROP PROCEDURE IF EXISTS fractal_mine_topology_negatives;
 DROP PROCEDURE IF EXISTS fractal_sql_agent;
 DROP FUNCTION IF EXISTS fractal_ledger_flush;
 DROP FUNCTION IF EXISTS fractal_ledger_load;
@@ -89,15 +91,15 @@ DROP FUNCTION IF EXISTS fractal_audit_unpack;
 -- fractal_search(vector_csv, query_csv, k, params) -> JSON STRING
 CREATE FUNCTION fractal_search    RETURNS STRING SONAME 'fractalsql.so';
 
--- Scout Mode: fractal_explore(corpus, query, params) -> JSON STRING
+-- Scout Mode: fractal_search_explore(corpus, query, params) -> JSON STRING
 -- (walk=0 dispersion; result JSON carries the additive "population")
-CREATE FUNCTION fractal_explore   RETURNS STRING SONAME 'fractalsql.so';
+CREATE FUNCTION fractal_search_explore   RETURNS STRING SONAME 'fractalsql.so';
 
--- fractalsql_edition() -> 'Community'
-CREATE FUNCTION fractalsql_edition RETURNS STRING SONAME 'fractalsql.so';
+-- fractal_edition() -> 'Community'
+CREATE FUNCTION fractal_edition RETURNS STRING SONAME 'fractalsql.so';
 
--- fractalsql_version() -> '2.0.3'
-CREATE FUNCTION fractalsql_version RETURNS STRING SONAME 'fractalsql.so';
+-- fractal_version() -> '2.0.3'
+CREATE FUNCTION fractal_version RETURNS STRING SONAME 'fractalsql.so';
 
 -- ---------------------------------------------------------------------
 -- Analytics tier (fractal dimension / geometry / portfolio)
@@ -227,7 +229,7 @@ CREATE FUNCTION fractal_morphological_complexity RETURNS STRING SONAME 'fractals
 -- ---------------------------------------------------------------------
 -- Discovery tier
 --
--- fractal_explore covers table/column-scan discovery, using the same
+-- fractal_search_explore covers table/column-scan discovery, using the same
 -- "Scout" walk=0 dispersion and corpus-as-argument convention
 -- fractal_search itself uses. MariaDB UDFs cannot scan a table or
 -- column directly, so the caller builds the corpus and passes it in.
@@ -249,7 +251,7 @@ CREATE FUNCTION fractal_morphological_complexity RETURNS STRING SONAME 'fractals
 -- process serving every connection, so per-connection Diversify tuning
 -- (and its rolling D_q/overhead stats) needs an explicit key rather
 -- than a single shared static. Convention: pass CONNECTION_ID() as
--- session_id. fractal_search / fractal_explore pick up that same
+-- session_id. fractal_search / fractal_search_explore pick up that same
 -- session's ctx via an optional "session_id" key in their own params
 -- JSON, so Diversify settings actually affect real searches:
 --
@@ -816,7 +818,9 @@ END$$
 -- row data, for the same "do not silently return whatever columns an
 -- LLM decided to select" reason). INSERT/UPDATE gets its row count from
 -- ROW_COUNT() after a plain EXECUTE instead (no result set to worry
--- about for those statement types at all).
+-- about for those statement types at all), wrapped in a SAVEPOINT so a
+-- failed execution rolls back cleanly instead of leaving a partial
+-- write or an aborted-transaction ambiguity for the caller to sort out.
 DELIMITER $$
 
 CREATE PROCEDURE fractal_sql_agent(
@@ -962,6 +966,15 @@ BEGIN
                 END IF;
                 SET v_row_count = @_fractalsql_sa_rowcount;
             ELSE
+                -- Subtransaction-equivalent safety net (fractalsql-postgresql
+                -- wraps this same auto_execute step in an SPI subtransaction;
+                -- MariaDB/InnoDB has no such implicit wrapper, but does
+                -- support SAVEPOINT/ROLLBACK TO SAVEPOINT here). SAVEPOINT
+                -- implicitly starts a transaction if none is active yet, so
+                -- this is safe under autocommit. Scoped to the mutating
+                -- (INSERT/UPDATE/...) branch only: the SELECT branch above
+                -- never writes, so it has nothing to roll back.
+                SAVEPOINT fractal_sql_agent_sp;
                 SET @_fractalsql_sa_exec_sql = v_candidate;
                 PREPARE _fractalsql_sa_exec_stmt FROM @_fractalsql_sa_exec_sql;
                 IF v_exec_ok THEN
@@ -979,12 +992,27 @@ BEGIN
                     SET v_row_count = ROW_COUNT();
                     DEALLOCATE PREPARE _fractalsql_sa_exec_stmt;
                 END IF;
+                IF v_exec_ok THEN
+                    RELEASE SAVEPOINT fractal_sql_agent_sp;
+                ELSE
+                    ROLLBACK TO SAVEPOINT fractal_sql_agent_sp;
+                END IF;
             END IF;
         END;
 
         IF v_exec_ok THEN
             SET p_status = 'executed';
-            SET p_result_json = JSON_OBJECT('status', 'executed', 'rows', v_row_count);
+            -- "+ 0", not v_row_count bare: JSON_OBJECT() serializes a
+            -- stored-procedure local variable's value as a JSON STRING
+            -- (confirmed live, MariaDB 11.4 and 12.3) even though
+            -- v_row_count is declared INT -- a real quoted-vs-numeric
+            -- literal type distinction only affects SP-local variables,
+            -- not table columns or arithmetic expressions. Forcing
+            -- through an arithmetic expression is the standard,
+            -- minimal workaround; CAST(x AS JSON) isn't available here
+            -- (MariaDB's JSON type is an alias for LONGTEXT, no CAST
+            -- target).
+            SET p_result_json = JSON_OBJECT('status', 'executed', 'rows', v_row_count + 0);
         ELSE
             SET p_status = 'execution_failed';
             SET p_result_json = JSON_OBJECT('status', 'execution_failed', 'error', v_check_err);
@@ -2103,6 +2131,96 @@ BEGIN
     CALL _fractalsql_telemetry_topk(v_corpus, v_ids, v_combined, p_k, p_result);
 END$$
 
+-- ---------------------------------------------------------------------
+-- Named feature store (Community tier)
+--
+-- fractal_store_morphology / fractal_mine_topology_negatives, matching
+-- fractalsql-postgresql's own Community-tier feature store (see that
+-- repo's src/fractalsql.c: implemented there via SPI against a plain
+-- table, not a core-library primitive -- fsql_ledger_* is whole-ledger
+-- admin plus two counters, not a per-item put/get). A plain table
+-- holding one caller-supplied vector per doc_id, upserted by
+-- fractal_store_morphology and brute-force k-NN-scanned (squared
+-- Euclidean distance via fractal_vector_l2_squared, no index -- this
+-- table is expected to hold curated per-item features/negative
+-- examples, not a full corpus) by fractal_mine_topology_negatives.
+-- Independent of core's ledger/repulsion mechanism, same as in
+-- fractalsql-postgresql.
+--
+-- Unlike the table-backed search compositions above, this table's name
+-- is fixed (not caller-supplied), so no dynamic SQL/PREPARE is needed
+-- here: ordinary static SQL against fractalsql_feature_store suffices.
+-- CREATE TABLE IF NOT EXISTS (not DROP+CREATE), same convention as the
+-- Vectorizer's own bookkeeping tables above: a reinstall must not
+-- discard previously stored feature vectors.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS fractalsql_feature_store (
+    doc_id     BIGINT PRIMARY KEY,
+    features   TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) COMMENT = 'One named feature vector per doc_id, written by fractal_store_morphology and scanned by fractal_mine_topology_negatives. Caller decides what a doc_id''s vector represents (a computed morphology feature, a flagged negative example, etc.) -- this table is a generic per-item store, not specific to any one function''s original name.';
+
+-- fractal_store_morphology(doc_id, feature_array)
+-- Upserts feature_array (a JSON-array-string vector, same convention as
+-- fractal_search's vector_csv/query_csv) against doc_id.
+CREATE PROCEDURE fractal_store_morphology(
+    IN p_doc_id        BIGINT,
+    IN p_feature_array TEXT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    IF p_doc_id IS NULL OR p_doc_id < 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_store_morphology: doc_id must be >= 0';
+    END IF;
+    IF p_feature_array IS NULL OR JSON_VALID(p_feature_array) = 0 OR JSON_LENGTH(p_feature_array) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_store_morphology: feature_array must be a non-empty JSON array';
+    END IF;
+
+    INSERT INTO fractalsql_feature_store (doc_id, features, updated_at)
+    VALUES (p_doc_id, p_feature_array, CURRENT_TIMESTAMP)
+    ON DUPLICATE KEY UPDATE features = VALUES(features), updated_at = VALUES(updated_at);
+END$$
+
+-- fractal_mine_topology_negatives(surrogate_vector, k, OUT result)
+-- Brute-force k-NN (squared-Euclidean distance, via
+-- fractal_vector_l2_squared) over fractalsql_feature_store: the k
+-- stored vectors closest to surrogate_vector, ascending by distance.
+-- O(n) per call, no index -- same semantics as fractalsql-postgresql's
+-- version. Result objects use the key "dist", the same convention as
+-- the table-backed search procedures above. p_k is an IN parameter
+-- referenced directly in LIMIT: MariaDB/MySQL SQL/PSM has always
+-- allowed a routine parameter (not an arbitrary expression) there.
+CREATE PROCEDURE fractal_mine_topology_negatives(
+    IN  p_surrogate_vector TEXT,
+    IN  p_k                INT,
+    OUT p_result           JSON
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    IF p_k IS NULL OR p_k < 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_mine_topology_negatives: k must be >= 1';
+    END IF;
+    IF p_surrogate_vector IS NULL OR JSON_VALID(p_surrogate_vector) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_mine_topology_negatives: surrogate_vector must be a JSON array';
+    END IF;
+
+    SELECT JSON_ARRAYAGG(JSON_OBJECT('doc_id', doc_id, 'dist', dist))
+      INTO p_result
+    FROM (
+        SELECT doc_id, fractal_vector_l2_squared(features, p_surrogate_vector) AS dist
+        FROM fractalsql_feature_store
+        ORDER BY dist ASC
+        LIMIT p_k
+    ) ranked;
+
+    IF p_result IS NULL THEN
+        SET p_result = JSON_ARRAY();
+    END IF;
+END$$
+
 DELIMITER ;
 
 -- ---------------------------------------------------------------------
@@ -2187,7 +2305,7 @@ CREATE FUNCTION fractal_audit_unpack RETURNS STRING SONAME 'fractalsql.so';
 
 -- Verify installation:
 --   SELECT name, dl FROM mysql.func;
---   SELECT fractalsql_edition(), fractalsql_version();
+--   SELECT fractal_edition(), fractal_version();
 --
 -- Example call + JSON_EXTRACT slice:
 --

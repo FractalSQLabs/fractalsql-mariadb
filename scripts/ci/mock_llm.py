@@ -35,7 +35,9 @@ build_test.sh's reasoning-gates header comment for the split).
 
 Usage: python3 mock_llm.py [port]   (default port 18080)
 
-Not for production use -- no auth, no TLS, one canned reply per mode.
+Not for production use -- no auth, no TLS, one canned reply per mode
+(plus a marker-routed second chat reply for gate_31_sql_agent_savepoint,
+see GATE31_MARKER below).
 """
 import json
 import sys
@@ -44,20 +46,32 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 CHAT_REPLY = "```sql\nSELECT 1\n```"
 EMBED_VECTOR = [0.1, 0.2, 0.3]
 
+# build_test.sh's gate_31_sql_agent_savepoint needs fractal_sql_agent's
+# GENERATE step to come back with a real, allowlist-passing INSERT (not
+# the default SELECT 1) so it can drive the auto_execute mutating
+# branch and its SAVEPOINT safety net. Routed on a marker string the
+# gate embeds in its own p_question, which ends up verbatim in the
+# chat-completions request body -- every other gate's question never
+# contains this marker, so their reply is completely unaffected.
+GATE31_MARKER = "FRACTALSQL_BT_GATE31_MARKER"
+GATE31_REPLY = "```sql\nINSERT INTO bt_sql_agent_sp (id, val) VALUES (1, 'x')\n```"
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
+        body_text = ""
         if length:
-            self.rfile.read(length)
+            body_text = self.rfile.read(length).decode("utf-8", "ignore")
 
         if "embed" in self.path:
             body = json.dumps(
                 {"data": [{"embedding": EMBED_VECTOR}]}
             ).encode("utf-8")
         else:
+            reply = GATE31_REPLY if GATE31_MARKER in body_text else CHAT_REPLY
             body = json.dumps(
-                {"choices": [{"message": {"role": "assistant", "content": CHAT_REPLY}}]}
+                {"choices": [{"message": {"role": "assistant", "content": reply}}]}
             ).encode("utf-8")
 
         self.send_response(200)

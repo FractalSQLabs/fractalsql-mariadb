@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""tests/test_scout.py: Scout Mode (fractal_explore) e2e gate.
+"""tests/test_scout.py: Scout Mode (fractal_search_explore) e2e gate.
 
 This repo
 has no server-side table access and no table-returning UDFs (MariaDB's
 C UDF ABI can't run SQL against the calling session), so
-fractal_explore(corpus, query, params) takes the corpus as an inline
+fractal_search_explore(corpus, query, params) takes the corpus as an inline
 argument instead, the same
 convention as fractal_search itself. So this test builds the 3-island
 corpus as a JSON string client-side and passes it directly, rather than
@@ -16,7 +16,7 @@ Asserts the Scout enablement properties:
   (3)     discovery: the particles disperse across more than one island.
 
 Skips cleanly (exit 0) if the mariadb connector is missing, no DB is
-reachable, or fractal_explore isn't deployed.
+reachable, or fractal_search_explore isn't deployed.
 
 Usage:
     python3 tests/test_scout.py
@@ -56,16 +56,16 @@ def main():
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT fractal_explore(?, ?, ?)",
+            "SELECT fractal_search_explore(?, ?, ?)",
             (json.dumps(corpus), json.dumps(query), opts))
         result = json.loads(cur.fetchone()[0])
     except Exception as e:
-        print(f"SKIP: fractal_explore unavailable / errored: {e}")
+        print(f"SKIP: fractal_search_explore unavailable / errored: {e}")
         return 0
 
     population = result.get("population")
     if not population:
-        print("SKIP: fractal_explore returned no 'population' key "
+        print("SKIP: fractal_search_explore returned no 'population' key "
               "(pre-Scout build? stub result?)")
         return 0
 

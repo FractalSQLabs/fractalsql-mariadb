@@ -9,7 +9,7 @@
 # trend.
 #
 # Sizes span 500-50000 --
-# see bench/data_gen.py's own docstring for why: fractal_explore()
+# see bench/data_gen.py's own docstring for why: fractal_search_explore()
 # (Scout Mode here) takes its ENTIRE corpus as one client-supplied
 # inline string on every call (no server-side table scan is possible
 # for it at all -- MariaDB's C UDF ABI has no server-side table

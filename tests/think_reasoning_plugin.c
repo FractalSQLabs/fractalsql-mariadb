@@ -38,7 +38,7 @@
 #include <string.h>
 
 #ifdef _WIN32
-#  include <windows.h>  /* GetEnvironmentVariableA -- see think_env below */
+#  include <Windows.h>  /* GetEnvironmentVariableA -- see think_env below */
 #endif
 
 static int g_embed_probe = 0;

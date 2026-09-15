@@ -107,7 +107,7 @@
 #include <time.h>
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-#  include <windows.h>
+#  include <Windows.h>
 #  include <io.h>                /* _commit: flush the ledger write through to disk */
 #  define FRACTAL_EXPORT __declspec(dllexport)
 #else
@@ -201,7 +201,6 @@ static ent_portfolio_multimodal_ex_fn g_ent_portfolio_multimodal_ex;
 static ent_portfolio_multimodal_pareto_fn g_ent_portfolio_multimodal_pareto;
 
 #if defined(_WIN32)
-static INIT_ONCE        g_ent_once  = INIT_ONCE_STATIC_INIT;
 static CRITICAL_SECTION g_ent_lock;
 static INIT_ONCE        g_ent_lock_once = INIT_ONCE_STATIC_INIT;
 
@@ -284,6 +283,7 @@ ent_dlopen_verified_copy(const char *orig_path,
 
 #if defined(_WIN32)
     {
+        (void) orig_path;  /* temp dir comes from GetTempPathA here */
         char tmpdir[MAX_PATH];
         if (GetTempPathA(sizeof tmpdir, tmpdir) == 0) return NULL;
         ent_clean_stale_copies(tmpdir);
@@ -292,6 +292,7 @@ ent_dlopen_verified_copy(const char *orig_path,
             >= (int) sizeof tmp_path)
             return NULL;
         f = fopen(tmp_path, "wb");   /* pid-recycled overwrite, see above */
+        if (f == NULL) return NULL;
     }
 #else
     {
@@ -404,7 +405,13 @@ ent_verify_signature(const char *so_path,
 
     f = fopen(so_path, "rb");
     if (f == NULL) return ENT_SIG_IOERROR;
-    if (fseek(f, 0, SEEK_END) != 0 || (so_len = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0)
+    if (fseek(f, 0, SEEK_END) != 0)
+    {
+        fclose(f);
+        return ENT_SIG_IOERROR;
+    }
+    so_len = ftell(f);
+    if (so_len < 0 || fseek(f, 0, SEEK_SET) != 0)
     {
         fclose(f);
         return ENT_SIG_IOERROR;
@@ -1260,7 +1267,7 @@ ledger_verify_latest_file(uint32_t kind)
     int  rc = ledger_scan_latest_two(fp, kind, &latest, &have_latest, &prior, &have_prior);
     fclose(fp);
     if (rc < 0) { ent_unlock(); return FSQL_ESTORAGE_INTEGRITY; }
-    if (!have_latest) { if (have_prior) free(prior.blob); ent_unlock(); return FSQL_OK; }
+    if (!have_latest) { if (have_prior) { free(prior.blob); } ent_unlock(); return FSQL_OK; }
 
     const char *key         = ledger_key();
     bool        require_mac = (key != NULL);
@@ -1705,7 +1712,10 @@ ent_json_well_formed(const char *s, size_t len)
         if (after_value) return false;
         if (c == 't' || c == 'f' || c == 'n')
         {
-            const char *lit = (c == 't') ? "true" : (c == 'f') ? "false" : "null";
+            const char *lit;
+            if (c == 't')      lit = "true";
+            else if (c == 'f') lit = "false";
+            else               lit = "null";
             size_t ll = strlen(lit);
             if (len - i < ll || memcmp(s + i, lit, ll) != 0) return false;
             i += ll - 1;
@@ -1807,11 +1817,11 @@ fractal_audit_log(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
     size_t esc_cap = type_len * 6 + 1;
     if (esc_cap > sizeof esc_stack) { esc = (char *) malloc(esc_cap); if (esc == NULL) { *error = 1; return 0; } }
     size_t esc_len = ent_json_escape(type_s, type_len, esc, esc_cap);
-    if (esc_len == (size_t) -1) { if (esc != esc_stack) free(esc); *error = 1; return 0; }
+    if (esc_len == (size_t) -1) { if (esc != esc_stack) { free(esc); } *error = 1; return 0; }
 
     size_t buflen = esc_len + payload_len + 32;
     char  *buf = (char *) malloc(buflen);
-    if (buf == NULL) { if (esc != esc_stack) free(esc); *error = 1; return 0; }
+    if (buf == NULL) { if (esc != esc_stack) { free(esc); } *error = 1; return 0; }
 
     int n = snprintf(buf, buflen, "{\"type\":\"%.*s\",\"entry\":%.*s}",
                      (int) esc_len, esc, (int) payload_len, payload);
@@ -1875,17 +1885,25 @@ fractal_audit_unpack(UDF_INIT *initid, UDF_ARGS *args, char *result,
     if (args->args[0] == NULL) { *is_null = 1; return NULL; }
     if (!ensure_enterprise_lib()) { *error = 1; return NULL; }
 
+    /* Allocate one byte beyond the logical capacity so a NUL terminator
+     * always has a home: the result is returned as a C string and the
+     * core-reported length is untrusted (see the guard below). */
     cap = 8192;
     for (;;) {
         char  *nb;
         size_t need = cap;
 
-        nb = realloc(so->buf, cap);
+        nb = realloc(so->buf, cap + 1);
         if (nb == NULL) { *error = 1; return NULL; }
         so->buf = nb; so->cap = cap;
 
         rc = g_ent_audit_unpack(args->args[0], args->lengths[0], so->buf, &need);
         if (rc == FSQL_OK) {
+            /* Core-reported length is untrusted: refuse a "success"
+             * that claims more space than the buffer holds rather than
+             * letting strnlen() read past the allocation. */
+            if (need > cap) { *error = 1; return NULL; }
+            so->buf[need] = '\0';
             *length  = (unsigned long) strnlen(so->buf, need);
             *is_null = 0;
             return so->buf;
@@ -2131,6 +2149,12 @@ fractal_optimize_portfolio_multimodal(UDF_INIT *initid, UDF_ARGS *args, char *re
         *error = 1;
         return NULL;
     }
+    /* Core-reported result count is untrusted: clamp it to the buffer
+     * bounds validated above so the emit loop below can never index
+     * past the weights/sharpes allocations, whatever the library
+     * reports. */
+    if (n_found > n_restarts) n_found = n_restarts;
+    if (n_found < 0) n_found = 0;
 
     if (!ent_jsonbuf_init(&jb)) {
         free(mu); free(cov); free(weights); free(sharpes);
@@ -2336,6 +2360,12 @@ fractal_optimize_portfolio_multimodal_ex(UDF_INIT *initid, UDF_ARGS *args, char 
         *error = 1;
         return NULL;
     }
+    /* Core-reported result count is untrusted: clamp it to the buffer
+     * bounds validated above so the emit loop below can never index
+     * past the weights/sharpes allocations, whatever the library
+     * reports. */
+    if (n_found > n_restarts) n_found = n_restarts;
+    if (n_found < 0) n_found = 0;
 
     if (!ent_jsonbuf_init(&jb)) {
         free(mu); free(cov); free(weights); free(sharpes);
@@ -2553,6 +2583,12 @@ fractal_optimize_portfolio_multimodal_pareto(UDF_INIT *initid, UDF_ARGS *args, c
         *error = 1;
         return NULL;
     }
+    /* Core-reported result count is untrusted: clamp it to the buffer
+     * bounds validated above so the emit loop below can never index
+     * past the weights/returns/risks allocations, whatever the library
+     * reports. */
+    if (n_found > max_front) n_found = max_front;
+    if (n_found < 0) n_found = 0;
 
     if (!ent_jsonbuf_init(&jb)) {
         free(mu); free(cov); free(weights); free(returns); free(risks);

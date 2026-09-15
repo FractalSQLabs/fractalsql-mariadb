@@ -35,9 +35,12 @@
     19 sfs_bounds, 20 analytics, 21 diversify, 22 vector_tier,
     23 cognition, 24 agents, 25 enterprise (dormant-path),
     26 enterprise_active, 27 enterprise_connect, 28 enterprise_signature,
-    29 think (FRACTALSQL_HTTP_THINK* -> FSQL_REASONING_HTTP_THINK* bridge)
-    -- full parity with build_test.sh's DEFAULT_GATES (01-25 and 29, all
-    of 05/07/08/14-18 included and unconditional there too) plus its
+    29 think (FRACTALSQL_HTTP_THINK* -> FSQL_REASONING_HTTP_THINK* bridge),
+    31 sql_agent_savepoint (fractal_sql_agent's auto_execute SAVEPOINT/
+    ROLLBACK TO SAVEPOINT safety net, via a marker-routed mock_llm.py
+    reply)
+    -- full parity with build_test.sh's DEFAULT_GATES (01-25, 29, and 31,
+    all of 05/07/08/14-18 included and unconditional there too) plus its
     three opt-in enterprise gates (26-28). Gate 09 (a non-
     superuser SQL-SET privilege-escalation check against a server
     system variable) is intentionally NOT
@@ -186,7 +189,7 @@ Set-Location $Here
 # ("[SKIP] N enterprise*: skipped (community edition; no fractalsql-
 # enterprise-sovereign-c.* shared lib in include/)"), instead of
 # silently omitting the opt-in gates from the transcript.
-$DefaultGates = @("01","02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29")
+$DefaultGates = @("01","02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31")
 $QuickGates   = @("01", "02")
 $FuzzGates    = @("30")
 
@@ -974,10 +977,10 @@ function Gate-02-Smoke {
     $verLine = Select-String -Path "$Here\src\fractalsql.c" -Pattern '#define FSQL_VERSION "(.*)"' | Select-Object -First 1
     $wantVer = if ($verLine) { $verLine.Matches[0].Groups[1].Value } else { "" }
     $wantVer = if ($verLine) { $verLine.Matches[0].Groups[1].Value } else { "" }
-    $ver = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractalsql_version();" 2>&1
+    $ver = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_version();" 2>&1
     if ($ver -eq $wantVer) { Pass "02 smoke: version=$ver" } else { Fail "02 smoke: version='$ver' (want $wantVer)" }
 
-    $ed = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractalsql_edition();" 2>&1
+    $ed = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_edition();" 2>&1
     if ($ed -and $ed -notmatch "ERROR") { Pass "02 smoke: edition=$ed" } else { Fail "02 smoke: edition='$ed'" }
 
     $r = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e `
@@ -1190,8 +1193,8 @@ function Gate-10-DosAndInjection {
 function Gate-11-Scout {
     $corpus = "[" + (("[1,0,0]," * 20) + ("[0,1,0]," * 20) + ("[0,0,1]," * 20)).TrimEnd(",") + "]"
     $r = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e `
-        "SELECT fractal_explore('$corpus', '[1,0,0]', '{\`"population_size\`":24,\`"iterations\`":12}');" 2>&1
-    if ($r -match '"population"') { Pass "11 scout: fractal_explore returns a population array" } else { Fail "11 scout: fractal_explore='$r'" }
+        "SELECT fractal_search_explore('$corpus', '[1,0,0]', '{\`"population_size\`":24,\`"iterations\`":12}');" 2>&1
+    if ($r -match '"population"') { Pass "11 scout: fractal_search_explore returns a population array" } else { Fail "11 scout: fractal_search_explore='$r'" }
     # NOTE: no jq-equivalent population-size/dispersion check on Windows
     # yet (build_test.sh uses `jq`, conditionally skipped if absent; the
     # same skip-if-absent behavior would apply here via ConvertFrom-Json,
@@ -1579,6 +1582,71 @@ function Gate-20-Analytics {
 
     $opt = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_optimize_portfolio('[0.1,0.15]', '[0.04,0.01,0.01,0.03]', 2, '{}');" 2>&1
     if ($opt -match '"sharpe"') { Pass "20 analytics: fractal_optimize_portfolio returned a real result" } else { Fail "20 analytics: fractal_optimize_portfolio='$opt'" }
+
+    # Named Feature Store: fractal_store_morphology (upsert) +
+    # fractal_mine_topology_negatives (brute-force k-NN via the
+    # existing fractal_vector_l2_squared UDF). No LLM.
+    & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e @"
+DELETE FROM fractalsql_feature_store WHERE doc_id IN (1,2,3);
+CALL fractal_store_morphology(1, '[0,0,0]');
+CALL fractal_store_morphology(2, '[1,1,1]');
+CALL fractal_store_morphology(3, '[5,5,5]');
+"@ 2>&1 | Out-Null
+
+    $knn = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_mine_topology_negatives('[0.9,0.9,0.9]', 2, @r);
+SELECT @r;
+"@ 2>&1
+    $knnJoined = ($knn -join "`n")
+    if ($knnJoined -match '"doc_id":\s*2') {
+        Pass "20 analytics: fractal_mine_topology_negatives ranks the nearest stored vector (doc_id=2) first"
+    } else {
+        Fail "20 analytics: fractal_mine_topology_negatives='$knnJoined'"
+    }
+    $docIdCount = ([regex]::Matches($knnJoined, '"doc_id"')).Count
+    if ($docIdCount -eq 2) {
+        Pass "20 analytics: fractal_mine_topology_negatives honors k=2 (returned exactly 2 rows)"
+    } else {
+        Fail "20 analytics: expected 2 result rows, got: $knnJoined"
+    }
+
+    # Upsert: re-store doc_id 3 with a vector identical to the surrogate
+    # -- it must now rank first, proving ON DUPLICATE KEY UPDATE
+    # actually overwrote the row rather than leaving [5,5,5] in place.
+    $knn2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_store_morphology(3, '[0.9,0.9,0.9]');
+CALL fractal_mine_topology_negatives('[0.9,0.9,0.9]', 1, @r2);
+SELECT @r2;
+"@ 2>&1
+    $knn2Joined = ($knn2 -join "`n")
+    if ($knn2Joined -match '"doc_id":\s*3') {
+        Pass "20 analytics: fractal_store_morphology upsert overwrites an existing doc_id's features"
+    } else {
+        Fail "20 analytics: expected doc_id=3 after upsert, got: $knn2Joined"
+    }
+
+    $badDoc = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "CALL fractal_store_morphology(-1, '[1,2,3]');" 2>&1
+    if (($badDoc -join "`n") -match "doc_id must be") {
+        Pass "20 analytics: fractal_store_morphology rejects a negative doc_id"
+    } else {
+        Fail "20 analytics: expected a doc_id rejection, got: $badDoc"
+    }
+
+    $badArr = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "CALL fractal_store_morphology(4, 'not json');" 2>&1
+    if (($badArr -join "`n") -match "must be a non-empty JSON array") {
+        Pass "20 analytics: fractal_store_morphology rejects a malformed feature_array"
+    } else {
+        Fail "20 analytics: expected a feature_array rejection, got: $badArr"
+    }
+
+    $badK = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "CALL fractal_mine_topology_negatives('[0,0,0]', 0, @r3);" 2>&1
+    if (($badK -join "`n") -match "k must be") {
+        Pass "20 analytics: fractal_mine_topology_negatives rejects k < 1"
+    } else {
+        Fail "20 analytics: expected a k rejection, got: $badK"
+    }
+
+    & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e "DELETE FROM fractalsql_feature_store WHERE doc_id IN (1,2,3);" 2>&1 | Out-Null
 }
 
 function Gate-21-Diversify {
@@ -1667,6 +1735,112 @@ SELECT JSON_LENGTH(JSON_EXTRACT(@rg, '$.cohort_matches'));
 '@ 2>&1
     $rgTrim = ($rg -join "").Trim()
     if ($rgTrim -eq "2") { Pass "24 agents: patient_deterioration_triage (H) cohort_matches now honors p_k (got 2 of 2 qualifying rows)" } else { Fail "24 agents: patient_deterioration_triage cohort_matches length='$rgTrim'" }
+}
+
+# Regression test for fractal_sql_agent's SAVEPOINT/ROLLBACK TO
+# SAVEPOINT safety net around its auto_execute INSERT/UPDATE branch
+# (sql/install_udf.sql, CREATE PROCEDURE fractal_sql_agent): MariaDB's
+# PREPARE/EXECUTE has no equivalent to Postgres's SPI-subtransaction
+# wrap, so a failed auto_execute previously had no partial-write safety
+# net beyond a CONTINUE HANDLER that only catches the error after the
+# fact. This is the only gate in this suite that drives
+# fractal_sql_agent -- one of the six C-level "Universal Agent"
+# primitives -- through a real INSERT via the actual GENERATE ->
+# ALLOWLIST -> auto_execute pipeline; Gate-24-Agents above exercises
+# the PL/SQL-recipe agents built on top of them, not this layer itself.
+#
+# FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update is
+# required for fractal_t2s_check_allowlist to accept an INSERT
+# candidate at all (select-only by default) -- a restart-based env var
+# (read once at mysqld/mariadbd startup), so this gate does its own
+# Mdb-Teardown/Mdb-Setup restart. Deliberately NOT Swap-ReasoningPlugin:
+# that helper also overrides FRACTALSQL_REASONING_PLUGIN, and this gate
+# needs the REAL HTTP plugin against scripts/ci/mock_llm.py to stay
+# active -- mock_llm.py has been taught a marker-routed canned INSERT
+# reply for exactly this gate (see its own GATE31_MARKER), not a fake
+# reasoning-VFS plugin.
+function Gate-31-SqlAgentSavepoint {
+    $env:FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS = 'select_insert_update'
+    Mdb-Teardown
+    $rc = Mdb-Setup $MdbMajor
+    if ($rc -ne 0) {
+        Fail "31 sql_agent_savepoint: could not restart cluster with FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update set"
+        Remove-Item Env:\FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS -ErrorAction SilentlyContinue
+        Restore-ReasoningPlugin
+        return
+    }
+
+    & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e @"
+DROP TABLE IF EXISTS bt_sql_agent_sp;
+CREATE TABLE bt_sql_agent_sp (id INT PRIMARY KEY, val VARCHAR(20));
+INSERT INTO bt_sql_agent_sp (id, val) VALUES (99, 'prior');
+"@ 2>&1 | Out-Null
+
+    # One connection, one open transaction: a real prior COMMITted write
+    # (id=99, above), then three fractal_sql_agent calls whose GENERATE
+    # step always comes back with the SAME candidate ("INSERT ... VALUES
+    # (1, 'x')", via mock_llm.py's marker route) -- the first succeeds
+    # (id=1 doesn't exist yet), the second and third both collide with
+    # the PRIMARY KEY id=1 already wrote and must each roll back to the
+    # SAVEPOINT cleanly, proving the fixed savepoint name can be reused
+    # repeatedly within one transaction after a prior ROLLBACK, not just
+    # after a RELEASE.
+    $out = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+START TRANSACTION;
+CALL fractal_sql_agent('FRACTALSQL_BT_GATE31_MARKER insert one canary row', '["bt_sql_agent_sp"]', 1, TRUE, @sql1, @status1, @result1);
+CALL fractal_sql_agent('FRACTALSQL_BT_GATE31_MARKER insert one canary row', '["bt_sql_agent_sp"]', 1, TRUE, @sql2, @status2, @result2);
+CALL fractal_sql_agent('FRACTALSQL_BT_GATE31_MARKER insert one canary row', '["bt_sql_agent_sp"]', 1, TRUE, @sql3, @status3, @result3);
+SELECT @status1, @result1, @status2, @result2, @status3, @result3;
+COMMIT;
+"@ 2>&1
+
+    $joined = ($out -join "`n")
+    if ($joined -match '(?m)^ERROR') {
+        Fail "31 sql_agent_savepoint: a raw SQL error escaped the procedure instead of a reported status: $joined"
+    }
+
+    $fields = $joined.Trim() -split "`t"
+    $status1 = if ($fields.Length -ge 1) { $fields[0] } else { "" }
+    $result1 = if ($fields.Length -ge 2) { $fields[1] } else { "" }
+    $status2 = if ($fields.Length -ge 3) { $fields[2] } else { "" }
+    $result2 = if ($fields.Length -ge 4) { $fields[3] } else { "" }
+    $status3 = if ($fields.Length -ge 5) { $fields[4] } else { "" }
+    $result3 = if ($fields.Length -ge 6) { $fields[5] } else { "" }
+
+    if ($status1 -eq "executed" -and $result1 -match '"rows":\s*1') {
+        Pass "31 sql_agent_savepoint: first INSERT executed cleanly (rows:1)"
+    } else {
+        Fail "31 sql_agent_savepoint: first call expected status=executed/rows:1, got status='$status1' result='$result1'"
+    }
+
+    if ($status2 -eq "execution_failed") {
+        Pass "31 sql_agent_savepoint: second (colliding) INSERT reported execution_failed via ROLLBACK TO SAVEPOINT, not a raw error"
+    } else {
+        Fail "31 sql_agent_savepoint: second call expected status=execution_failed, got status='$status2' result='$result2'"
+    }
+
+    if ($status3 -eq "execution_failed") {
+        Pass "31 sql_agent_savepoint: third call reused the same fixed SAVEPOINT name after the second call's rollback, no 'savepoint does not exist'"
+    } else {
+        Fail "31 sql_agent_savepoint: third call expected status=execution_failed, got status='$status3' result='$result3'"
+    }
+
+    # The actual SAVEPOINT proof: id=99 (committed before any of the
+    # three calls) AND id=1 (the first call's own successful write, same
+    # transaction as the second/third calls' failures) BOTH survive --
+    # ROLLBACK TO SAVEPOINT scoped each failed call's rollback to just
+    # its own statement, never the whole transaction.
+    $cnt = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT COUNT(*) FROM bt_sql_agent_sp;" 2>&1
+    $cntTrim = ($cnt -join "").Trim()
+    if ($cntTrim -eq "2") {
+        Pass "31 sql_agent_savepoint: both the prior commit (id=99) and the first call's write (id=1) survive -- no phantom rows from the two rolled-back calls"
+    } else {
+        Fail "31 sql_agent_savepoint: expected exactly 2 surviving rows (id=1,99), COUNT(*)=$cntTrim"
+    }
+
+    & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e "DROP TABLE IF EXISTS bt_sql_agent_sp;" 2>&1 | Out-Null
+    Remove-Item Env:\FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS -ErrorAction SilentlyContinue
+    Restore-ReasoningPlugin
 }
 
 function Gate-25-Enterprise {
@@ -1910,7 +2084,7 @@ function Run-Gates([string[]]$Gates) {
     # src\fractalsql_parse.c directly, no extension DLL, no mariadbd.exe,
     # no cluster at all.
     if ($Gates -contains "30") { Gate-30-FuzzSmoke }
-    $needDb = $Gates | Where-Object { $_ -in @("02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29") }
+    $needDb = $Gates | Where-Object { $_ -in @("02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31") }
     if ($needDb) {
         $rc = Mdb-Setup $MdbMajor
         if ($rc -eq 1) { Skip "MariaDB $MdbMajor runtime gates (mariadbd.exe not found, pass -MdbDir)"; return }
@@ -1944,6 +2118,7 @@ function Run-Gates([string[]]$Gates) {
                 "27" { Gate-27-EnterpriseConnect }
                 "28" { Gate-28-EnterpriseSignature }
                 "29" { Gate-29-Think }
+                "31" { Gate-31-SqlAgentSavepoint }
             }
         }
         Mdb-Teardown

@@ -83,7 +83,7 @@ REM hopping to GitHub.
   echo.
   echo After install, activate the UDFs once per server:
   echo     mysql -u root -p ^< "C:\Program Files\MariaDB %MARIADB_MAJOR%\share\doc\fractalsql-mariadb\install_udf.sql"
-  echo     mysql -u root -p -e "SELECT fractalsql_edition^(^), fractalsql_version^(^);"
+  echo     mysql -u root -p -e "SELECT fractal_edition^(^), fractal_version^(^);"
 ) > "%STAGE%\README.txt"
 
 if not exist obj mkdir obj

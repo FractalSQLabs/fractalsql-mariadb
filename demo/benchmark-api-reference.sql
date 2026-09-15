@@ -1,10 +1,14 @@
 -- demo/benchmark-api-reference.sql
 --
 -- Real, structural details worth knowing before reading this file:
---   - fractal_search_debug, fractal_store_morphology, and
---     fractal_mine_topology_negatives (Section 8, "Named feature
---     store") don't exist in this extension's function catalog. Those
---     calls are replaced with plain notices below, not fabricated.
+--   - fractal_search_debug is not a separate function here: its
+--     capability (a "trace" object with the converged best point/fit)
+--     is a "debug":true flag on fractal_search's own params instead
+--     (see docs/api-discovery.md), demonstrated in Section 1 below.
+--   - fractal_store_morphology and fractal_mine_topology_negatives
+--     (Section 8, "Named feature store") are stored PROCEDUREs here
+--     (CALL + OUT param), not the C-level SPI-backed functions
+--     fractalsql-postgresql has; see docs/api-analytics.md.
 --   - fractal_search_telemetry/_hybrid_clinical_search/
 --     _search_trajectory/_cross_modal_search are PROCEDUREs with a
 --     trailing OUT p_result JSON here (sql/install_udf.sql), not
@@ -13,8 +17,9 @@
 --     objects use the key "dist".
 --
 -- A coverage pass over every callable function in sql/install_udf.sql
--- (roughly 34 functions: 9 core, a 4-function vectorizer group, and 21
--- v2.x additions), grouped by area. Distinct from demo/benchmark.sql (a
+-- (roughly 36 functions: 9 core, a 4-function vectorizer group, 21
+-- v2.x additions, and the 2-procedure Named Feature Store), grouped by
+-- area. Distinct from demo/benchmark.sql (a
 -- narrower Sniper/Scout/vectorizer head-to-head), this one's job is
 -- coverage, not comparison.
 --
@@ -57,9 +62,9 @@ END$$
 DELIMITER ;
 
 -- === 0. Meta (2 functions): fractal_edition, fractal_version ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
--- === 1. Search (3 functions): fractal_search, fractal_search_debug, fractal_search_explore ===
+-- === 1. Search (2 functions): fractal_search (plain + debug-trace modes), fractal_search_explore ===
 DROP TABLE IF EXISTS bmk_corpus;
 CREATE TABLE bmk_corpus (id INT AUTO_INCREMENT PRIMARY KEY, emb_arr JSON);
 INSERT INTO bmk_corpus (emb_arr)
@@ -67,16 +72,21 @@ SELECT JSON_ARRAY(RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1, RA
 FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 100) SELECT n FROM seq) s;
 
 -- fractal_search is 4-arg (corpus, query, k, params); corpus=''+k=1
--- converges with no real corpus (see demo.sql Section 2). No
--- debug-mode variant exists here, so a plain notice replaces the call.
+-- converges with no real corpus (see demo.sql Section 2).
 SELECT fractal_search('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 30}');
-SELECT 'fractal_search_debug: not available in fractalsql-mariadb' AS notice;
 
--- fractal_explore(corpus, query, params) takes the corpus inline
+-- Debug-trace mode: no separate fractal_search_debug function here,
+-- it's a "debug":true params flag instead (see docs/api-discovery.md).
+SELECT JSON_EXTRACT(
+    fractal_search('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 10, "debug": true}'),
+    '$.trace.best_fit'
+) AS debug_trace_best_fit;
+
+-- fractal_search_explore(corpus, query, params) takes the corpus inline
 -- rather than as a table/column reference (see demo.sql Section 4).
 SET @bmk_scout_corpus = (SELECT JSON_ARRAYAGG(emb_arr) FROM bmk_corpus);
 SELECT COUNT(*) AS scout_population FROM JSON_TABLE(
-    (SELECT fractal_explore(@bmk_scout_corpus, '[0,0,0,0,0,0,0,0]',
+    (SELECT fractal_search_explore(@bmk_scout_corpus, '[0,0,0,0,0,0,0,0]',
         '{"population_size": 6, "iterations": 6, "walk": 0}')),
     '$.population[*]' COLUMNS (p JSON PATH '$')
 ) AS jt;
@@ -238,11 +248,18 @@ SELECT fractal_morphological_complexity(
     2
 ) AS morphology;
 
--- === 8. Named feature store (2 functions) ===
--- fractal_store_morphology / fractal_mine_topology_negatives don't
--- exist in this extension: no named-feature-store surface is
--- implemented here. Plain notice, not a fabricated call.
-SELECT 'fractal_store_morphology / fractal_mine_topology_negatives: not available in fractalsql-mariadb (no named feature-store surface exists here)' AS notice;
+-- === 8. Named feature store (2 procedures) ===
+-- fractal_store_morphology / fractal_mine_topology_negatives are
+-- stored PROCEDUREs here (CALL + OUT param), composing the existing
+-- fractal_vector_l2_squared UDF over a fixed internal table
+-- (fractalsql_feature_store), not the C-level SPI-backed functions
+-- fractalsql-postgresql has. See docs/api-analytics.md.
+CALL fractal_store_morphology(1, '[0.1,0.2,0.3]');
+CALL fractal_store_morphology(2, '[0.9,0.8,0.7]');
+CALL fractal_store_morphology(3, '[0.15,0.22,0.28]');
+CALL fractal_mine_topology_negatives('[0.1,0.2,0.3]', 2, @bmk_feat);
+SELECT JSON_VALUE(r, '$.doc_id') AS doc_id, JSON_VALUE(r, '$.dist') AS dist
+FROM JSON_TABLE(@bmk_feat, '$[*]' COLUMNS (r JSON PATH '$')) t;
 
 -- === 9. Table-backed telemetry search family (4 functions) ===
 -- All four are PROCEDUREs here (trailing OUT p_result JSON), not
@@ -277,5 +294,5 @@ FROM JSON_TABLE(@bmk_r4, '$[*]' COLUMNS (r JSON PATH '$')) t;
 -- place for inspection. Clean up with:
 --   DELETE FROM fractal_vectorizers WHERE source_table = 'bmk_docs';
 --   DROP TABLE bmk_corpus, bmk_docs, bmk_modal;
---   DELETE FROM fractalsql_feature_store WHERE doc_id BETWEEN 1 AND 10;
+--   DELETE FROM fractalsql_feature_store WHERE doc_id BETWEEN 1 AND 3;
 --   DROP PROCEDURE bmk_safe_call;

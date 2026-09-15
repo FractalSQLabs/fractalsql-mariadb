@@ -5,7 +5,7 @@ bench/head_to_head.py: native VECTOR(n) index vs FractalSQL Scout Mode.
 This repo's own
 native ANN index is MariaDB's own built-in VECTOR(n) column type + its
 VECTOR INDEX (GA 11.7+) -- see bench/data_gen.py --with-native-vector.
-Scout Mode here is `fractal_explore(corpus, query, params)`, defined in
+Scout Mode here is `fractal_search_explore(corpus, query, params)`, defined in
 `sql/install_udf.sql` -- see the "Scout Mode" comment there
 for why it takes the corpus as one inline client-supplied string
 (MariaDB's C UDF ABI has no server-side table access and no
@@ -114,7 +114,7 @@ def main() -> int:
         print(f"Benchmark: {n_total} stored vectors, {K} clusters, dim={dim}")
         print(f"  Native VECTOR(n) index: {'available' if has_native else 'NOT AVAILABLE '
               '(run data_gen.py --with-native-vector on MariaDB 11.7+)'}, LIMIT {args.top_k}")
-        print(f"  Scout (fractal_explore): population={args.top_k}, "
+        print(f"  Scout (fractal_search_explore): population={args.top_k}, "
               f"iterations={args.sfs_iter}, mdn={args.sfs_mdn}, walk=0.0 "
               f"(brute-force relevance scan + MMR)")
         print()
@@ -170,7 +170,7 @@ def main() -> int:
             "walk":             0.0,
         })
         with timed() as clk:
-            cur.execute("SELECT fractal_explore(?, ?, ?)", (corpus_json, q_txt, opts))
+            cur.execute("SELECT fractal_search_explore(?, ?, ?)", (corpus_json, q_txt, opts))
             result = json.loads(cur.fetchone()[0])
         sfs_ms = clk()
         sfs_pts = np.array(result["population"], dtype=np.float64)

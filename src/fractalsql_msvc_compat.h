@@ -72,7 +72,7 @@
  * all do, under the same _WIN32 guard); this is idempotent armor, not a
  * new dependency, so the header stays safe standalone. */
 #if defined(_WIN32)
-#  include <windows.h>
+#  include <Windows.h>
 #endif
 
 #if defined(_MSC_VER)

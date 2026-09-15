@@ -63,7 +63,7 @@ This is different from the table-backed procedures below: `fractal_search` takes
 
 ## Table-backed search: `fractal_search_telemetry` and its siblings
 
-`fractal_search`/`fractal_explore` take their corpus as an inline argument. The four procedures below instead scan a real table directly. They are stored procedures, not functions, because a MariaDB C UDF cannot run a query against the calling session's tables. Each takes `table_name` (a bare, non-schema-qualified name in the current database, with exactly one single-column `PRIMARY KEY`) and `vector_col` (a `TEXT` column holding a JSON-array-string vector such as `'[0.1,0.2,...]'`, or a MariaDB 11.7+ native `VECTOR(n)` column, auto-detected via `INFORMATION_SCHEMA` and read through `VEC_TOTEXT()` transparently). Call one, then read its `OUT` parameter:
+`fractal_search`/`fractal_search_explore` take their corpus as an inline argument. The four procedures below instead scan a real table directly. They are stored procedures, not functions, because a MariaDB C UDF cannot run a query against the calling session's tables. Each takes `table_name` (a bare, non-schema-qualified name in the current database, with exactly one single-column `PRIMARY KEY`) and `vector_col` (a `TEXT` column holding a JSON-array-string vector such as `'[0.1,0.2,...]'`, or a MariaDB 11.7+ native `VECTOR(n)` column, auto-detected via `INFORMATION_SCHEMA` and read through `VEC_TOTEXT()` transparently). Call one, then read its `OUT` parameter:
 
 ```sql
 CALL fractal_search_telemetry('documents', 'embedding', '[0.1,0.2,0.3]', 5, @result);
@@ -151,14 +151,14 @@ fractal_cross_modal_search(
 
 ---
 
-## `fractal_explore`
+## `fractal_search_explore`
 **Scout Mode: population dispersion**
 
-There is no table/column-scanning set-returning function here: MariaDB's C UDF ABI cannot query the calling session's tables, and there are no table-returning UDFs. `fractal_explore` takes the corpus inline instead, the same convention `fractal_search` uses.
+There is no table/column-scanning set-returning function here: MariaDB's C UDF ABI cannot query the calling session's tables, and there are no table-returning UDFs. `fractal_search_explore` takes the corpus inline instead, the same convention `fractal_search` uses.
 
 ### Signature
 ```sql
-fractal_explore(
+fractal_search_explore(
     corpus_csv TEXT,   -- same formats as fractal_search's vector_csv
     query_csv  TEXT,
     params     TEXT    -- same SFS knobs as fractal_search's params
@@ -177,7 +177,7 @@ fractal_explore(
 
 MariaDB is one shared multithreaded process for *every* connection, so a single file-static ctx would leak one session's Diversify tuning (and its rolling D_q/overhead stats) into every other concurrent session's queries. Every function below instead takes an explicit `session_id BIGINT` as its first argument, backed by a connection-scoped ctx registry (`src/fractalsql_session.c`). Convention: pass `CONNECTION_ID()`.
 
-`fractal_search`/`fractal_explore` pick up that same session's ctx via the optional `"session_id"` key in their own `params` JSON. Diversify settings only affect a search that opts in that way:
+`fractal_search`/`fractal_search_explore` pick up that same session's ctx via the optional `"session_id"` key in their own `params` JSON. Diversify settings only affect a search that opts in that way:
 
 ```sql
 SELECT fractal_diversify_enable(CONNECTION_ID());
@@ -223,7 +223,16 @@ Current D_q (diversity metric). `NULL` if Diversify is disabled or no Diversify-
 Explicit early cleanup of a session's registry entry; see the idle-TTL note above.
 
 ### `fractal_feedback_report(session_id, result_handle, kind [, dwell_ms])` → `INT` (0)
-`kind`: `'dwell'` | `'positive'` | `'negative'`. Writes into the same per-session rolling state `fractal_detect_collapse`/`fractal_explain_result` read. Inert until `fractal_diversify_enable()` has been called on this session.
+Reports engagement on a prior search result, feeding the shadow store when Diversify is enabled (inert otherwise). Writes into the same per-session rolling state `fractal_detect_collapse`/`fractal_explain_result` read.
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `session_id` | `BIGINT` | `CONNECTION_ID()`, same convention as every function in this section. |
+| `result_handle` | `BIGINT` | The 0-based corpus row index the result came from (matches the `doc_id` returned by the telemetry search functions). Must be `>= 0`; a negative value fails the call. |
+| `kind` | `TEXT` | One of `'dwell'`, `'positive'`, `'negative'` (case-insensitive). Anything else fails the call. |
+| `dwell_ms` | `BIGINT` | Optional dwell time in ms (omitted, or `0`, for a bare positive/negative report). A negative value is clamped to `0`, not cast/wrapped. |
+
+Unlike `fractal_text_to_sql`/the table-backed search procedures (which `SIGNAL` a specific `MESSAGE_TEXT`), this is a plain scalar UDF: the classic MariaDB UDF ABI gives the main call function no custom-error-message hook (only `_init` has one, via `SFS_INIT_ERROR`), so an invalid `result_handle`/`kind` here fails the call with MariaDB's own generic UDF error text, not a `fractal_feedback_report: ...`-prefixed message.
 
 ### `fractal_isolate_background(session_id, result_handle)` → `INT` (0)
 Convenience wrapper: `fractal_feedback_report(session_id, result_handle, 'negative', 0)`.

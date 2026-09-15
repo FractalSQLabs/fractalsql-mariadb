@@ -42,7 +42,7 @@
 -- Section markers below are plain comments, not executed statements.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 30 vessels, each with a BASELINE track vector (their filed/typical
@@ -131,7 +131,7 @@ UPDATE vmd_vessels
 --  ORDER BY jt.dist;
 
 -- ------------------------------------------------------------------
--- 3. fractal_search_telemetry / fractal_explore: nearest-track lookup
+-- 3. fractal_search_telemetry / fractal_search_explore: nearest-track lookup
 -- (who's near a contact-of-interest position) and diverse-track
 -- clustering (representative traffic patterns across the whole fleet).
 --
@@ -153,12 +153,12 @@ SELECT v.mmsi, jt.dist AS distance
 -- --- Preset: fractal_agent_recommend_diverse (raw explore form preserved below) ---
 
 -- Blueprint (raw primitive): returns a diverse representative set of
--- the fleet's traffic-pattern embeddings. fractal_explore takes the
+-- the fleet's traffic-pattern embeddings. fractal_search_explore takes the
 -- corpus inline rather than as a table/column reference, so the
 -- corpus has to be assembled first, same approach as
 -- demo-business-intelligence.sql's own Scout Discovery section.
 -- SET @corpus = (SELECT JSON_ARRAYAGG(current_pos) FROM vmd_vessels);
--- SELECT fractal_explore(@corpus, '[0,0,0,0]',
+-- SELECT fractal_search_explore(@corpus, '[0,0,0,0]',
 --     '{"population_size": 6, "iterations": 8, "walk": 0}') AS p;
 
 -- Productized preset: the shipped engine returns real vessel ids

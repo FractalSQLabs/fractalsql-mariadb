@@ -2,6 +2,9 @@
 dist/
 tmp_check/
 results/
+coverage_html/
+node_modules/
+scripts/confidence/out/
 *.deb
 *.rpm
 packaging/debian/.debhelper/

@@ -144,8 +144,8 @@ jobs:
           mariadb fractalsql_ci < /work/sql/install_udf.sql
           mariadb fractalsql_ci < /work/sql/install_agents.sql
 
-          EDITION=\$(mariadb -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
-          VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
+          EDITION=\$(mariadb -N -B -e "SELECT fractal_edition()" | tr -d '\r')
+          VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
           test "\$VERSION" = "2.0.3"
@@ -280,8 +280,8 @@ jobs:
           grep -qi 'select 1' /tmp/easy-install.log \
               || { echo "FAIL: reasoning round-trip via easy_install.sh didn't reach the mock reply"; exit 1; }
 
-          EDITION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractalsql_edition();")
-          VERSION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractalsql_version();")
+          EDITION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractal_edition();")
+          VERSION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractal_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
 
@@ -366,8 +366,8 @@ jobs:
           mariadb fractalsql_ci < /work/sql/install_udf.sql
           mariadb fractalsql_ci < /work/sql/install_agents.sql
 
-          EDITION=\$(mariadb -N -B -e "SELECT fractalsql_edition()" | tr -d '\r')
-          VERSION=\$(mariadb -N -B -e "SELECT fractalsql_version()" | tr -d '\r')
+          EDITION=\$(mariadb -N -B -e "SELECT fractal_edition()" | tr -d '\r')
+          VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
           test "\$VERSION" = "2.0.3"
@@ -490,8 +490,8 @@ jobs:
           mariadb fractalsql_ci < sql/install_udf.sql
           mariadb fractalsql_ci < sql/install_agents.sql
 
-          EDITION=$(mariadb -N -B -e "SELECT fractalsql_edition();")
-          VERSION=$(mariadb -N -B -e "SELECT fractalsql_version();")
+          EDITION=$(mariadb -N -B -e "SELECT fractal_edition();")
+          VERSION=$(mariadb -N -B -e "SELECT fractal_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
           test "${VERSION}" = "2.0.3"
@@ -665,8 +665,8 @@ jobs:
           MDB_BINDIR="$(brew --prefix mariadb)/bin" \
             ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --provider skip | tee /tmp/easy-install.log
 
-          EDITION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractalsql_edition();')
-          VERSION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractalsql_version();')
+          EDITION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractal_edition();')
+          VERSION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractal_version();')
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
 
@@ -835,11 +835,11 @@ jobs:
               exit 1
           }
 
-          $edition = Select-String -Path easy-install.log -Pattern 'fractalsql_edition\(\) = (\S+),' |
+          $edition = Select-String -Path easy-install.log -Pattern 'fractal_edition\(\) = (\S+),' |
               ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
           Write-Host "edition=$edition"
           if ($edition -ne 'Community') {
-              Write-Host "FAIL: fractalsql_edition() line not found or unexpected in easy-install.log"
+              Write-Host "FAIL: fractal_edition() line not found or unexpected in easy-install.log"
               exit 1
           }
           Write-Host "ok: easy_install.ps1 end-to-end (Windows, mdb11.4)"

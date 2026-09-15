@@ -28,7 +28,7 @@
 --     anywhere in this file: host 7's UPDATE relocating its row does
 --     not affect doc_id at all, since doc_id is always the row's own
 --     primary key.
---   - fractal_explore(corpus, query, params) takes the corpus inline
+--   - fractal_search_explore(corpus, query, params) takes the corpus inline
 --     as a JSON array rather than as a table/column reference (see
 --     demo-business-intelligence.sql Section 6).
 --   - There is no fixed-width vector column type here with a
@@ -66,7 +66,7 @@
 -- limitation, not a silent omission.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 35 hosts across 3 zones (dmz, internal, guest), each with a
@@ -133,15 +133,15 @@ UPDATE vcy_hosts
 -- just return 50 near-duplicates of whichever profile is most common
 -- and miss the one host that looks different.
 -- ------------------------------------------------------------------
--- === 2. fractal_explore: diverse traffic-profile clustering ===
+-- === 2. fractal_search_explore: diverse traffic-profile clustering ===
 -- --- Preset: fractal_agent_recommend_diverse (raw explore form preserved below) ---
 
 -- Blueprint (raw primitive): returns a diverse representative set of the
 -- fleet's traffic-profile embeddings -- surfaces the one host that looks
 -- different instead of K near-duplicates of the most common profile.
--- fractal_explore takes its corpus inline (a JSON array), not a
+-- fractal_search_explore takes its corpus inline (a JSON array), not a
 -- table/column pair.
--- SELECT fractal_explore(
+-- SELECT fractal_search_explore(
 --     (SELECT JSON_ARRAYAGG(current_pos) FROM vcy_hosts), '[0,0,0,0]',
 --     '{"population_size": 6, "iterations": 8, "walk": 0}');
 

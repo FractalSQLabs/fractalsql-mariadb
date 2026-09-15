@@ -9,8 +9,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Read-only by default; publish jobs grant contents: write below.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -122,12 +123,12 @@ jobs:
               docker exec -i "${M}" ${MC} -D fractalsql_ci < sql/install_udf.sql
 
               EDITION=$(docker exec "${M}" ${MC} -N -B -e \
-                  "SELECT fractalsql_edition();")
+                  "SELECT fractal_edition();")
               echo "[${TAG}] edition: ${EDITION}"
               test "${EDITION}" = "Community"
 
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
-                  "SELECT fractalsql_version();")
+                  "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
               test "${VERSION}" = "2.0.3"
 
@@ -176,6 +177,8 @@ jobs:
     name: package ${{ matrix.arch }}
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # action-gh-release upload
     strategy:
       fail-fast: false
       matrix:
@@ -314,6 +317,8 @@ jobs:
   # ------------------------------------------------------------------
   build-macos:
     name: macos ${{ matrix.platform_tag }}
+    permissions:
+      contents: write  # action-gh-release upload
     strategy:
       fail-fast: false
       matrix:
@@ -472,9 +477,9 @@ jobs:
           # this list whenever sql/install_udf.sql adds a new
           # CREATE FUNCTION entry.
           for sym in _fractal_search _fractal_search_init _fractal_search_deinit \
-                     _fractal_explore _fractal_explore_init _fractal_explore_deinit \
-                     _fractalsql_edition _fractalsql_edition_init _fractalsql_edition_deinit \
-                     _fractalsql_version _fractalsql_version_init _fractalsql_version_deinit \
+                     _fractal_search_explore _fractal_search_explore_init _fractal_search_explore_deinit \
+                     _fractal_edition _fractal_edition_init _fractal_edition_deinit \
+                     _fractal_version _fractal_version_init _fractal_version_deinit \
                      _fractal_dimension_dfa _fractal_dimension_dfa_init _fractal_dimension_dfa_deinit \
                      _fractal_dimension_boxcount _fractal_dimension_boxcount_init _fractal_dimension_boxcount_deinit \
                      _fractal_dimension_drift _fractal_dimension_drift_init _fractal_dimension_drift_deinit \
@@ -584,7 +589,7 @@ jobs:
                  mariadb -uroot -p mydb < install_agents.sql
 
           6. Verify:
-                 mariadb -uroot -p -e "SELECT fractalsql_edition(), fractalsql_version();"
+                 mariadb -uroot -p -e "SELECT fractal_edition(), fractal_version();"
           EOF
           ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
           rm -rf "${STAGE}"
@@ -629,6 +634,8 @@ jobs:
   # download step.
   # ------------------------------------------------------------------
   build-windows-msi:
+    permissions:
+      contents: write  # action-gh-release upload
     strategy:
       fail-fast: false
       matrix:
@@ -779,9 +786,9 @@ jobs:
           # list above.
           foreach ($sym in @(
                 'fractal_search','fractal_search_init','fractal_search_deinit',
-                'fractal_explore','fractal_explore_init','fractal_explore_deinit',
-                'fractalsql_edition','fractalsql_edition_init','fractalsql_edition_deinit',
-                'fractalsql_version','fractalsql_version_init','fractalsql_version_deinit',
+                'fractal_search_explore','fractal_search_explore_init','fractal_search_explore_deinit',
+                'fractal_edition','fractal_edition_init','fractal_edition_deinit',
+                'fractal_version','fractal_version_init','fractal_version_deinit',
                 'fractal_dimension_dfa','fractal_dimension_dfa_init','fractal_dimension_dfa_deinit',
                 'fractal_dimension_boxcount','fractal_dimension_boxcount_init','fractal_dimension_boxcount_deinit',
                 'fractal_dimension_drift','fractal_dimension_drift_init','fractal_dimension_drift_deinit',

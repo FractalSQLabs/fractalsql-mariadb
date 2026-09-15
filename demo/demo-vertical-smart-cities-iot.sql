@@ -44,7 +44,7 @@
 -- executed statements.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 400 sensors: a jittered 20x20 grid placement (lat/lon-style x,y
@@ -212,17 +212,17 @@ SELECT JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,
 -- have" (quiet-residential vs. high-traffic-commercial vs. ...) rather
 -- than scanning all 400 sensors by hand.
 -- ------------------------------------------------------------------
--- === 4. fractal_explore / recommend_diverse: diverse zone reading-profiles ===
+-- === 4. fractal_search_explore / recommend_diverse: diverse zone reading-profiles ===
 -- --- Preset: fractal_agent_recommend_diverse (raw explore form preserved below) ---
 
 -- Blueprint (raw primitive): returns a diverse representative set of
 -- reading-profile embeddings -- "what KINDS of zones do we have".
--- fractal_explore(corpus, query, params) takes the corpus inline
+-- fractal_search_explore(corpus, query, params) takes the corpus inline
 -- rather than as a table/column reference, so the corpus has to be
 -- assembled first, same approach as demo-business-intelligence.sql's
 -- own Scout Discovery section.
 -- SET @corpus = (SELECT JSON_ARRAYAGG(reading) FROM vsc_sensors);
--- SELECT fractal_explore(@corpus, '[0,0,0]',
+-- SELECT fractal_search_explore(@corpus, '[0,0,0]',
 --     '{"population_size": 6, "iterations": 8, "walk": 0}') AS p;
 
 -- Productized preset: the shipped engine returns real sensor ids

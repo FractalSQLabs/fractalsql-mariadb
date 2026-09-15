@@ -21,7 +21,7 @@ exposes whichever capability tiers that edition includes.
 
 | Tier | Focus | Key Capabilities | Build / Requirement |
 | --- | --- | --- | --- |
-| **Community** | Discovery, Cognition, Agency | SFS Core, Sniper Search, Scout Discovery, In-DB Reasoning, Embeddings, 16 Agents | Base UDF set (`fractalsql.so`), everything most installs need |
+| **Community** | Discovery, Cognition, Agency | SFS Core, Sniper Search, Scout Discovery, In-DB Reasoning, Embeddings, 15 of the 16 Agents | Base UDF set (`fractalsql.so`), everything most installs need |
 | **Enterprise** | Governance | Activation gating plus a real, tamper-evident ledger storage layer. See [Enterprise Tier](enterprise.md) for the full scope |
 
 ---
@@ -38,7 +38,7 @@ a query. Also the corpus top-k search: pass a real inline corpus for top-k,
 or an empty one (`''`) to run pure convergence with no corpus at all. It is
 a "precision" tool for finding the absolute global minimum.
 
-### Scout Discovery (`fractal_explore`)
+### Scout Discovery (`fractal_search_explore`)
 An SFS population search blended with **Maximal Marginal Relevance (MMR)**
 re-ranking, so the results cover the data's distinct basins of attraction
 instead of the "mode collapse" common in top-K search. Scout Mode takes its
@@ -101,36 +101,49 @@ pipeline:
 ## 🤖 Tier 3: Agency
 
 The Agency tier composes the Discovery and Cognition primitives into
-autonomous routines: **15 installable agent stored procedures** plus 5
-Universal Agent compositions, each a productized recipe for a
-recurring pattern.
+autonomous routines: 16 installable agent stored procedures, each a
+productized recipe for a recurring pattern, built on 6 reusable Universal
+Agent procedures you can also call directly. See
+[`docs/api-agency.md`](api-agency.md) for the full argument reference,
+examples, and notes.
 
-> **No separate "Universal Agent" C-level tier; all six are available
-> as stored procedures.** Six intermediate functions
-> (`fractal_search_agent`, `fractal_rag_agent`, `fractal_sql_agent`,
-> `fractal_agent_plan_explore`, `fractal_agent_trajectory_predict`,
-> `fractal_agent_detect_loop`) sit underneath the recipes above. None
-> exist here as C-level primitives (a C UDF can't run SQL against the
-> calling session), but a MariaDB stored
-> PROCEDURE reaches the same table access via dynamic SQL
-> (`PREPARE`/`EXECUTE`) instead, the same mechanism the table-backed
-> Discovery primitives already use. All six are implemented this way
-> (`fractal_sql_agent` in `sql/install_udf.sql`, the other five in
-> `sql/install_agents.sql`) and are callable directly, not just
-> internal to the 15 recipes. See [`docs/api-agency.md`](api-agency.md)
-> for the full building-blocks list.
+### Agents
 
-### Agent Sample
-
-| Agent Procedure | Composes | Capability Provided |
+| Agent Procedure | Recipe | Reasoning |
 | --- | --- | --- |
-| `fractal_agent_data_analyst` | `fractal_text_to_sql` → `fractal_reason` | NL question over your tables, with a reasoned summary. |
-| `fractal_agent_route_task` | `fractal_search_telemetry` → `fractal_reason` | Match an incoming task to the best capable sub-agent. |
-| `fractal_agent_regime_triage` | `fractal_dimension_dfa`/`_drift` → `fractal_reason` | Flag a series drifting into a new regime. |
-| `fractal_agent_recommend_diverse` | Diversify-aware `fractal_search_telemetry` | Repulsion-diverse top-k, avoiding recently-rejected items. |
-| `fractal_agent_patient_deterioration_triage` | `fractal_hybrid_clinical_search` → `fractal_search_trajectory` → `fractal_reason` | Cohort search + baseline→current drift. |
+| `fractal_agent_anomaly_triage` | drift exponent on one entity's series → reasoning triage | ✓ |
+| `fractal_agent_regime_triage` | DFA + drift over one series → reasoning triage | ✓ |
+| `fractal_agent_track_anomaly` | trajectory deviation + heading DFA → reasoning triage | ✓ |
+| `fractal_agent_detour_classify` | trajectory deviation + box-counting → reasoning classify | ✓ |
+| `fractal_agent_network_coverage_alert` | spatial morphology + telemetry drift → reasoning alert | ✓ |
+| `fractal_agent_allocate` | SFS Sharpe optimizer → reasoning rationale | ✓ |
+| `fractal_agent_rebalance_sibling` | optimizer + trajectory search → reasoning rationale | ✓ |
+| `fractal_agent_diverse_portfolios` (enterprise) | multi-restart SFS + diverse-select → reasoning rationale | ✓ |
+| `fractal_agent_route_task` | nearest-capability search + budget accounting → reasoning rationale | ✓ |
+| `fractal_agent_schedule_workload` | `fractal_search` refine + nearest node → reasoning rationale | ✓ |
+| `fractal_agent_outlier_intercept` | distance-to-bad-state safety barrier → reasoning justification | ✓ |
+| `fractal_agent_patient_deterioration_triage` | cohort search + trajectory drift → reasoning triage | ✓ |
+| `fractal_agent_data_analyst` | NL → SQL → execute → reasoning analysis | ✓ |
+| `fractal_agent_recall_hybrid` | cohort-restricted vector recall | — |
+| `fractal_agent_recommend_diverse` | repulsion-diverse top-k | — |
+| `fractal_agent_feedback_audit` | diversify loop + collapse detection | — |
 
-Full table of all 15 in [`docs/api-agency.md`](api-agency.md#which-agent-should-i-use).
+### Universal Agents
+
+The six building blocks the agents above compose. Every one is a plain
+stored PROCEDURE with a trailing `OUT` parameter (a MariaDB C UDF can't run
+SQL against the calling session), reaching its target table the same way
+the table-backed Discovery primitives do. Call them directly to build your
+own recipe.
+
+| Procedure | What it does |
+| --- | --- |
+| `fractal_search_agent` | Embed a query, Scout-search a table, and reason over the matched rows. |
+| `fractal_rag_agent` | Focused single-turn RAG: embed, Scout-search, and reason over the result. |
+| `fractal_sql_agent` | Self-correcting NL-to-SQL, retrying on validation failure, with an optional auto-execute step. |
+| `fractal_agent_plan_explore` | Scout-search-driven exploration of multiple non-overlapping strategy branches. |
+| `fractal_agent_trajectory_predict` | Forecasts future state from a delta against a table's historical rows. |
+| `fractal_agent_detect_loop` | Flags infinite/repetitive agent loops via a DFA scaling exponent. |
 
 ### Safe Agency & Guardrails
 
@@ -184,7 +197,7 @@ large universe without the exponential cost of a brute-force search.
 
 At 5000 vectors across 50 Gaussian clusters, dim=128, a **comparatively
 small** default, and deliberately so: Scout
-Mode (`fractal_explore`) has no server-side scan at all, every call
+Mode (`fractal_search_explore`) has no server-side scan at all, every call
 re-sends the whole corpus as a client-supplied string; at large row counts
 that string would be hundreds of megabytes per query. See
 `bench/README.md` for the full methodology and reasoning. This is a
@@ -228,7 +241,7 @@ detailed per-tier references.)
 
 **Discovery**
 - `fractal_search(vector_csv, query_csv, k, params)`: Sniper Mode convergence, or corpus top-k. → **[api-discovery.md](api-discovery.md)**
-- `fractal_explore(corpus, query, params)`: Scout Mode diverse exploration. → **[api-discovery.md](api-discovery.md)**
+- `fractal_search_explore(corpus, query, params)`: Scout Mode diverse exploration. → **[api-discovery.md](api-discovery.md)**
 - `fractal_search_telemetry(table, col, query, k, OUT result)`: Ground-truth row retrieval. → **[api-discovery.md](api-discovery.md)**
 
 **Cognition**

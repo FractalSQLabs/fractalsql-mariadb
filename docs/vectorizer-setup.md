@@ -136,7 +136,7 @@ export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
 export FRACTALSQL_HTTP_EMBED_URL='http://127.0.0.1:11434/v1/embeddings'
 export FRACTALSQL_HTTP_EMBED_MODEL='nomic-embed-text'
 ```
-*Note: `ollama pull nomic-embed-text` (or your chosen embedding model) is a separate step. `FRACTALSQL_HTTP_EMBED_MODEL` is a distinct variable from `FRACTALSQL_HTTP_MODEL`, with no fallback between them: if it's unset, embed calls go out with no model field at all, so set it explicitly whenever your embedding model differs from your chat model (it almost always does).*
+*Note: `ollama pull nomic-embed-text` (or your chosen embedding model) is a separate step. `FRACTALSQL_HTTP_EMBED_MODEL` is a distinct variable from `FRACTALSQL_HTTP_MODEL`, with no fallback to the chat model between them: if it's unset, the reasoning plugin falls back to its own embedding-mode default (`text-embedding-3-small`, an OpenAI model), not to whatever `FRACTALSQL_HTTP_MODEL` is set to. Against a local Ollama server that default won't resolve, so set `FRACTALSQL_HTTP_EMBED_MODEL` explicitly whenever your embedding model differs from your chat model (it almost always does).*
 
 ### OpenAI-Compatible (OpenAI, Together AI, Fireworks, vLLM)
 ```bash

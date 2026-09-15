@@ -98,7 +98,7 @@
 #
 # Gates (see the header of each gate_* function below for full detail):
 #   01  build            compile fractalsql.so via `make`             ~5s
-#   02  smoke            install + fractalsql_version/_edition +      ~5s
+#   02  smoke            install + fractal_version/_edition +      ~5s
 #                        fractal_search convergence
 #   03  schema_context   fractal_schema_context: real table/column/     ~1s
 #                        comment/FK introspection
@@ -116,7 +116,7 @@
 #                        grant on a table can't see its structure
 #   10  dos_and_injection allowlist: stacked statements, INTO OUTFILE,  ~1s
 #                        CTE-feeding-DELETE all rejected
-#   11  scout            fractal_explore: full population returned,   ~2s
+#   11  scout            fractal_search_explore: full population returned,   ~2s
 #                        disperses across the 3-cluster inline corpus
 #   12  soak             30x fractal_search in a row, no crash          ~3s
 #   13  vectorizer_embed real INSERT -> trigger -> enqueue ->            ~2s
@@ -173,6 +173,15 @@
 #                        cluster needed. Requires a libFuzzer-capable
 #                        clang (set FSQL_FUZZ_CC to override
 #                        auto-detection); skips cleanly if none is found.
+#   31  sql_agent_savepoint  fractal_sql_agent's auto_execute INSERT/    ~10s
+#                        UPDATE branch: SAVEPOINT/ROLLBACK TO SAVEPOINT
+#                        scopes a failed execution's rollback to just
+#                        that call, not the whole transaction, and the
+#                        same fixed savepoint name is reusable across
+#                        repeated calls in one transaction (restarts
+#                        with FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=
+#                        select_insert_update; drives GENERATE through
+#                        the real mock_llm.py via a marker-routed reply)
 #
 # NOT ported, each for its own documented reason (see the architecture-
 # differences block above, not a TODO backlog):
@@ -188,7 +197,7 @@
 # Gate sets:
 #   QUICK   = 01 02
 #   DEFAULT = 01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20
-#             21 22 23 24 25 29
+#             21 22 23 24 25 29 31
 #   FUZZ    = 30                                       --fuzz, not part of DEFAULT (adds real wall-time)
 #   (26/27/28 stay opt-in: each needs a real, licensed enterprise .so
 #   this public repo doesn't ship -- see gate_26_enterprise_active's own
@@ -205,7 +214,8 @@
 #   ./build_test.sh --coverage       # gcov-instrumented build; DEFAULT gates;
 #                                    # lcov/genhtml report after (needs lcov+genhtml on PATH)
 #   ./build_test.sh --asan           # ASan-instrumented fractalsql.so, LD_PRELOADed
-#                                    # into mariadbd (see docker/Dockerfile.test)
+#                                    # into mariadbd (skips the cluster gates on
+#                                    # Darwin -- see mdb_setup's ASan branch)
 #   ./build_test.sh --ubsan
 #
 # Environment:
@@ -235,7 +245,7 @@ cd "$HERE"
 
 TMPROOT="$(cd /tmp && pwd -P)"
 
-DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 29)
+DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 29 31)
 QUICK_GATES=(01 02)
 FUZZ_GATES=(30)
 
@@ -485,7 +495,9 @@ mdb_sibling() {
 # datadir, and starts mariadbd against it (via mysqld_safe if
 # available, else a manual respawn-loop supervisor; see gate 06's own
 # header comment for why this distinction matters). Returns 1 (skip) if
-# mariadbd for this major cannot be found at all.
+# mariadbd for this major cannot be found at all, or 3 (skip, message
+# printed by this function) for --asan on Darwin against a
+# non-instrumented mariadbd -- see the ASan branch's own comment.
 mdb_setup() {
   local v="$1"
   BIN="$(mdb_bindir "$v")"
@@ -622,13 +634,49 @@ mdb_setup() {
   # from the target major's own package/image) has to be told to load
   # the matching sanitizer runtime BEFORE it starts, or the dlopen'd
   # instrumented code fails with undefined __asan_*/__ubsan_* symbols.
-  # LD_PRELOAD, exported here (function-scoped, not global -- so the
-  # fixture `cc` compiles just above are never preloaded with it),
-  # reaches mariadbd through mysqld_safe's own exec chain below.
+  # LD_PRELOAD does that on Linux (exported here, function-scoped -- so
+  # the fixture `cc` compiles just above are never preloaded with it,
+  # and it reaches mariadbd through mysqld_safe's own exec chain below).
+  #
+  # Darwin is different twice over:
+  #   * dyld ignores LD_PRELOAD entirely; its equivalent is
+  #     DYLD_INSERT_LIBRARIES (a Homebrew mariadbd lives outside
+  #     SIP-protected paths, so the var should not be silently stripped).
+  #   * Even with the right variable, injecting ASan into a host binary
+  #     that was NOT itself compiled with -fsanitize=address does not
+  #     work on modern macOS: dyld's chained fixups bind libSystem calls
+  #     before a late-injected runtime can install ASan's malloc/free
+  #     interceptors, and the ASan runtime then aborts the host with
+  #     "Interceptors are not working ... loaded too late" -- killing
+  #     the whole (single, threaded) mariadbd process, which surfaces to
+  #     the client as ERROR 2013 Lost connection at the first CREATE
+  #     FUNCTION (caught live on the darwin-asan CI cell, 2026-09). The
+  #     dylib loads fine; only the interceptors are the problem, and
+  #     code signing has nothing to do with it. So: detect a plain
+  #     (non-instrumented) mariadbd up front and skip the cluster gates
+  #     cleanly instead of hard-failing cluster setup. Full-cluster ASan
+  #     on macOS requires a source-built ASan mariadbd; the Linux and
+  #     Windows ASan cells cover this same portable C source.
+  #   * UBSan needs none of this: Apple's -fsanitize=undefined links its
+  #     trapping runtime statically into the instrumented objects, so no
+  #     preloaded dylib is required. The ubsan branch below therefore
+  #     deliberately keeps its "missing dylib on Darwin = nothing to
+  #     preload" posture rather than growing this same injection logic
+  #     (verified green end-to-end on the darwin-ubsan CI cell) -- do
+  #     not consistency-fix it back.
   if [ "$ASAN" -eq 1 ]; then
+    if [ "$(uname -s)" = "Darwin" ] \
+       && ! otool -L "$mariadbd_bin" 2>/dev/null | grep -qi 'libclang_rt\.asan\|libasan'; then
+      skip "MariaDB $v cluster setup (Darwin ASan needs mariadbd itself built with -fsanitize=address; run against a source-built ASan mariadbd to exercise the cluster gates here -- Linux/Windows ASan CI already cover this same portable C source)"
+      return 3
+    fi
     local asan_rt; asan_rt="$(resolve_san_rt libasan.so)"
     [ -n "$asan_rt" ] && [ -f "$asan_rt" ] || { echo "ERROR: could not resolve libasan.so runtime" >&2; return 2; }
-    export LD_PRELOAD="$asan_rt"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      export DYLD_INSERT_LIBRARIES="$asan_rt"
+    else
+      export LD_PRELOAD="$asan_rt"
+    fi
     export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
   elif [ "$UBSAN" -eq 1 ]; then
     local ubsan_rt; ubsan_rt="$(resolve_san_rt libubsan.so)"
@@ -710,6 +758,18 @@ mdb_teardown() {
   sleep 1
   pkill -f "mariadbd.*$DATADIR" >/dev/null 2>&1 || true
   [ -n "$MOCK_LLM_PID" ] && kill "$MOCK_LLM_PID" >/dev/null 2>&1
+  # Preserve mariadbd's own stderr log before the wipe: mysqld_safe/
+  # mariadbd-safe route mariadbd's stderr into the datadir <hostname>.err,
+  # which is the ONLY place a sanitizer report (e.g. an ASan abort inside
+  # mariadbd) or a UDF crash backtrace lands -- the captured server log
+  # above carries only the supervisor's own output. Copied out with the
+  # same <major-with-underscores> naming the other /tmp logs use, because
+  # the run-level FAIL dump at the bottom of this script executes after
+  # every run_major's teardown, when the datadir is already gone.
+  local err_file
+  for err_file in "$DATADIR"/*.err; do
+    [ -f "$err_file" ] && cp "$err_file" "/tmp/fractalsql_bt_mariadbd_err_${DATADIR##*_}.log"
+  done
   [ -n "$DATADIR" ] && rm -rf "$DATADIR"
   [ -n "$SOCK" ] && rm -rf "$(dirname "$SOCK")"
   [ -n "$PLUGDIR" ] && rm -rf "$PLUGDIR"
@@ -821,10 +881,10 @@ gate_01_build() {
 
 gate_02_smoke() {
   local want_ver; want_ver="$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' src/fractalsql.c | head -1)"
-  local ver; ver=$("${MARIADB[@]}" -N -e "SELECT fractalsql_version();" 2>&1)
+  local ver; ver=$("${MARIADB[@]}" -N -e "SELECT fractal_version();" 2>&1)
   [ "$ver" = "$want_ver" ] && pass "02 smoke: version=$ver" || fail "02 smoke: version='$ver' (want $want_ver)"
 
-  local ed; ed=$("${MARIADB[@]}" -N -e "SELECT fractalsql_edition();" 2>&1)
+  local ed; ed=$("${MARIADB[@]}" -N -e "SELECT fractal_edition();" 2>&1)
   [ -n "$ed" ] && ! grep <<< "$ed" -q "ERROR" && pass "02 smoke: edition=$ed" || fail "02 smoke: edition='$ed'"
 
   # fractal_search(vector_csv, query_csv, k, params) -> JSON string.
@@ -900,9 +960,9 @@ gate_06_crash_recovery() {
 }
 
 gate_11_scout() {
-  # 3-cluster inline corpus, shaped for fractal_explore's
+  # 3-cluster inline corpus, shaped for fractal_search_explore's
   # inline-CSV-corpus signature rather than a
-  # table+column scan. fractal_explore(corpus_csv, query_csv, params)
+  # table+column scan. fractal_search_explore(corpus_csv, query_csv, params)
   # has no table-scan mode in this repo's architecture by design.
   local corpus="["
   local i
@@ -912,14 +972,14 @@ gate_11_scout() {
   corpus="${corpus%,}]"
 
   local r; r=$("${MARIADB[@]}" -N -e "
-    SELECT fractal_explore('$corpus', '[1,0,0]', '{\"population_size\":24,\"iterations\":12}');" 2>&1)
+    SELECT fractal_search_explore('$corpus', '[1,0,0]', '{\"population_size\":24,\"iterations\":12}');" 2>&1)
 
   local n; n=$(echo "$r" | grep -oE '"population"\s*:\s*\[' >/dev/null 2>&1 && \
                echo "$r" | tr ',' '\n' | grep -c '\[' || echo 0)
   if echo "$r" | grep -q '"population"'; then
-    pass "11 scout: fractal_explore returns a population array"
+    pass "11 scout: fractal_search_explore returns a population array"
   else
-    fail "11 scout: fractal_explore='$r'"
+    fail "11 scout: fractal_search_explore='$r'"
   fi
 
   if command -v jq >/dev/null 2>&1; then
@@ -941,7 +1001,7 @@ gate_11_scout() {
 # MAX_QUERY_BYTES (4 MiB) rejection -- a bounds-check gate, scoped to
 # what fractal_search
 # actually validates today (see the bounds check in
-# fractal_search()/fractal_explore() in src/fractalsql.c).
+# fractal_search()/fractal_search_explore() in src/fractalsql.c).
 gate_19_sfs_bounds() {
   local r; r=$("${MARIADB[@]}" -N -e "
     SELECT fractal_search('[[1,0]]', '[1,0]', 0, '{}');" 2>&1)
@@ -1666,6 +1726,54 @@ gate_20_analytics() {
   local opt; opt=$("${MARIADB[@]}" -N -e "SELECT fractal_optimize_portfolio('[0.1,0.15]', '[0.04,0.01,0.01,0.03]', 2, '{}');" 2>&1)
   echo "$opt" | grep -q '"sharpe"' && pass "20 analytics: fractal_optimize_portfolio returned a real result" \
                                     || fail "20 analytics: fractal_optimize_portfolio='$opt'"
+
+  # Named Feature Store: fractal_store_morphology (upsert) +
+  # fractal_mine_topology_negatives (brute-force k-NN via the existing
+  # fractal_vector_l2_squared UDF). No LLM.
+  "${MARIADB[@]}" -e "
+    DELETE FROM fractalsql_feature_store WHERE doc_id IN (1,2,3);
+    CALL fractal_store_morphology(1, '[0,0,0]');
+    CALL fractal_store_morphology(2, '[1,1,1]');
+    CALL fractal_store_morphology(3, '[5,5,5]');
+  " >/tmp/fractalsql_bt_gate20_fs.log 2>&1
+
+  local knn; knn=$("${MARIADB[@]}" -N -e "
+    CALL fractal_mine_topology_negatives('[0.9,0.9,0.9]', 2, @r);
+    SELECT @r;" 2>&1)
+  echo "$knn" | grep -q '"doc_id": *2' \
+    && pass "20 analytics: fractal_mine_topology_negatives ranks the nearest stored vector (doc_id=2) first" \
+    || fail "20 analytics: fractal_mine_topology_negatives='$knn'"
+  [ "$(echo "$knn" | grep -o '"doc_id"' | wc -l)" = "2" ] \
+    && pass "20 analytics: fractal_mine_topology_negatives honors k=2 (returned exactly 2 rows)" \
+    || fail "20 analytics: expected 2 result rows, got: $knn"
+
+  # Upsert: re-store doc_id 3 with a vector identical to the surrogate --
+  # it must now rank first, proving ON DUPLICATE KEY UPDATE actually
+  # overwrote the row rather than leaving the original [5,5,5] in place.
+  local knn2; knn2=$("${MARIADB[@]}" -N -e "
+    CALL fractal_store_morphology(3, '[0.9,0.9,0.9]');
+    CALL fractal_mine_topology_negatives('[0.9,0.9,0.9]', 1, @r2);
+    SELECT @r2;" 2>&1)
+  echo "$knn2" | grep -q '"doc_id": *3' \
+    && pass "20 analytics: fractal_store_morphology upsert overwrites an existing doc_id's features" \
+    || fail "20 analytics: expected doc_id=3 after upsert, got: $knn2"
+
+  local bad_doc; bad_doc=$("${MARIADB[@]}" -N -e "CALL fractal_store_morphology(-1, '[1,2,3]');" 2>&1)
+  echo "$bad_doc" | grep -qi "doc_id must be" \
+    && pass "20 analytics: fractal_store_morphology rejects a negative doc_id" \
+    || fail "20 analytics: expected a doc_id rejection, got: $bad_doc"
+
+  local bad_arr; bad_arr=$("${MARIADB[@]}" -N -e "CALL fractal_store_morphology(4, 'not json');" 2>&1)
+  echo "$bad_arr" | grep -qi "must be a non-empty JSON array" \
+    && pass "20 analytics: fractal_store_morphology rejects a malformed feature_array" \
+    || fail "20 analytics: expected a feature_array rejection, got: $bad_arr"
+
+  local bad_k; bad_k=$("${MARIADB[@]}" -N -e "CALL fractal_mine_topology_negatives('[0,0,0]', 0, @r3);" 2>&1)
+  echo "$bad_k" | grep -qi "k must be" \
+    && pass "20 analytics: fractal_mine_topology_negatives rejects k < 1" \
+    || fail "20 analytics: expected a k rejection, got: $bad_k"
+
+  "${MARIADB[@]}" -e "DELETE FROM fractalsql_feature_store WHERE doc_id IN (1,2,3);" >/dev/null 2>&1
 }
 
 # Diversify/Repulsion controls. No LLM.
@@ -1763,6 +1871,100 @@ gate_24_agents() {
     SELECT JSON_LENGTH(JSON_EXTRACT(@rg, '\$.cohort_matches'));" 2>&1)
   [ "$rg" = "2" ] && pass "24 agents: patient_deterioration_triage (H) cohort_matches now honors p_k (got 2 of 2 qualifying rows)" \
                    || fail "24 agents: patient_deterioration_triage cohort_matches length='$rg'"
+}
+
+# Regression test for fractal_sql_agent's SAVEPOINT/ROLLBACK TO
+# SAVEPOINT safety net around its auto_execute INSERT/UPDATE branch
+# (sql/install_udf.sql, CREATE PROCEDURE fractal_sql_agent): MariaDB's
+# PREPARE/EXECUTE has no equivalent to Postgres's SPI-subtransaction
+# wrap, so a failed auto_execute previously had no partial-write safety
+# net beyond a CONTINUE HANDLER that only catches the error after the
+# fact. This is the only gate in this suite that drives
+# fractal_sql_agent -- one of the six C-level "Universal Agent"
+# primitives -- through a real INSERT via the actual GENERATE ->
+# ALLOWLIST -> auto_execute pipeline; gate 24 above exercises the
+# PL/SQL-recipe agents built on top of them, not this layer itself.
+#
+# FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update is
+# required for fractal_t2s_check_allowlist to accept an INSERT
+# candidate at all (select-only by default) -- a restart-based env var
+# (read once at mysqld startup), so this gate does its own
+# mdb_teardown/mdb_setup restart. Deliberately NOT
+# mdb_swap_reasoning_plugin: that helper also overrides
+# FRACTALSQL_REASONING_PLUGIN, and this gate needs the REAL HTTP
+# plugin against scripts/ci/mock_llm.py to stay active -- mock_llm.py
+# has been taught a marker-routed canned INSERT reply for exactly this
+# gate (see its own GATE31_MARKER), not a fake reasoning-VFS plugin.
+gate_31_sql_agent_savepoint() {
+  export FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update
+  mdb_teardown
+  if ! mdb_setup "$MDB_MAJOR" >/tmp/fractalsql_bt_gate31_restart.log 2>&1; then
+    fail "31 sql_agent_savepoint: could not restart cluster with FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=select_insert_update set"
+    unset FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS
+    mdb_restore_reasoning_plugin >/dev/null 2>&1
+    return
+  fi
+
+  "${MARIADB[@]}" -e "
+    DROP TABLE IF EXISTS bt_sql_agent_sp;
+    CREATE TABLE bt_sql_agent_sp (id INT PRIMARY KEY, val VARCHAR(20));
+    INSERT INTO bt_sql_agent_sp (id, val) VALUES (99, 'prior');
+  " >/tmp/fractalsql_bt_gate31.log 2>&1
+
+  # One connection, one open transaction: a real prior COMMITted write
+  # (id=99, above), then three fractal_sql_agent calls whose GENERATE
+  # step always comes back with the SAME candidate ("INSERT ... VALUES
+  # (1, 'x')", via mock_llm.py's marker route) -- the first succeeds
+  # (id=1 doesn't exist yet), the second and third both collide with
+  # the PRIMARY KEY id=1 already wrote and must each roll back to the
+  # SAVEPOINT cleanly, proving the fixed savepoint name can be reused
+  # repeatedly within one transaction after a prior ROLLBACK, not just
+  # after a RELEASE.
+  local out; out=$("${MARIADB[@]}" -N -e "
+    START TRANSACTION;
+    CALL fractal_sql_agent('FRACTALSQL_BT_GATE31_MARKER insert one canary row', '[\"bt_sql_agent_sp\"]', 1, TRUE, @sql1, @status1, @result1);
+    CALL fractal_sql_agent('FRACTALSQL_BT_GATE31_MARKER insert one canary row', '[\"bt_sql_agent_sp\"]', 1, TRUE, @sql2, @status2, @result2);
+    CALL fractal_sql_agent('FRACTALSQL_BT_GATE31_MARKER insert one canary row', '[\"bt_sql_agent_sp\"]', 1, TRUE, @sql3, @status3, @result3);
+    SELECT @status1, @result1, @status2, @result2, @status3, @result3;
+    COMMIT;
+  " 2>&1)
+
+  echo "$out" | grep -qi "^ERROR" \
+    && fail "31 sql_agent_savepoint: a raw SQL error escaped the procedure instead of a reported status: $out"
+
+  local status1 result1 status2 result2 status3 result3
+  status1=$(printf '%s\n' "$out" | awk -F'\t' 'NR==1{print $1}')
+  result1=$(printf '%s\n' "$out" | awk -F'\t' 'NR==1{print $2}')
+  status2=$(printf '%s\n' "$out" | awk -F'\t' 'NR==1{print $3}')
+  result2=$(printf '%s\n' "$out" | awk -F'\t' 'NR==1{print $4}')
+  status3=$(printf '%s\n' "$out" | awk -F'\t' 'NR==1{print $5}')
+  result3=$(printf '%s\n' "$out" | awk -F'\t' 'NR==1{print $6}')
+
+  [ "$status1" = "executed" ] && echo "$result1" | grep -q '"rows": *1' \
+    && pass "31 sql_agent_savepoint: first INSERT executed cleanly (rows:1)" \
+    || fail "31 sql_agent_savepoint: first call expected status=executed/rows:1, got status='$status1' result='$result1'"
+
+  [ "$status2" = "execution_failed" ] \
+    && pass "31 sql_agent_savepoint: second (colliding) INSERT reported execution_failed via ROLLBACK TO SAVEPOINT, not a raw error" \
+    || fail "31 sql_agent_savepoint: second call expected status=execution_failed, got status='$status2' result='$result2'"
+
+  [ "$status3" = "execution_failed" ] \
+    && pass "31 sql_agent_savepoint: third call reused the same fixed SAVEPOINT name after the second call's rollback, no 'savepoint does not exist'" \
+    || fail "31 sql_agent_savepoint: third call expected status=execution_failed, got status='$status3' result='$result3'"
+
+  # The actual SAVEPOINT proof: id=99 (committed before any of the three
+  # calls) AND id=1 (the first call's own successful write, same
+  # transaction as the second/third calls' failures) BOTH survive --
+  # ROLLBACK TO SAVEPOINT scoped each failed call's rollback to just its
+  # own statement, never the whole transaction.
+  local cnt; cnt=$("${MARIADB[@]}" -N -e "SELECT COUNT(*) FROM bt_sql_agent_sp;" 2>&1)
+  [ "$cnt" = "2" ] \
+    && pass "31 sql_agent_savepoint: both the prior commit (id=99) and the first call's write (id=1) survive -- no phantom rows from the two rolled-back calls" \
+    || fail "31 sql_agent_savepoint: expected exactly 2 surviving rows (id=1,99), COUNT(*)=$cnt"
+
+  "${MARIADB[@]}" -e "DROP TABLE IF EXISTS bt_sql_agent_sp;" >/dev/null 2>&1
+  unset FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS
+  mdb_restore_reasoning_plugin >/dev/null 2>&1
 }
 
 # Enterprise tier: with FRACTALSQL_ENTERPRISE_LIB unset (the
@@ -2175,11 +2377,14 @@ run_major() {
 
   local need_db=0
   for g in "${gates[@]}"; do
-    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28) need_db=1 ;; esac
+    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|31) need_db=1 ;; esac
   done
   if [ "$need_db" -eq 1 ]; then
     mdb_setup "$v"; local rc=$?
     if [ "$rc" -eq 1 ]; then skip "MariaDB $v runtime gates (mariadbd not found for this major)"; return; fi
+    # rc=3: mdb_setup printed its own [SKIP] message (darwin-asan against
+    # a non-instrumented mariadbd) -- nothing more to add here.
+    if [ "$rc" -eq 3 ]; then return; fi
     if [ "$rc" -ne 0 ]; then fail "MariaDB $v cluster setup"; return; fi
     for g in "${gates[@]}"; do
       case "$g" in
@@ -2210,6 +2415,7 @@ run_major() {
         27) gate_27_enterprise_connect ;;
         28) gate_28_enterprise_signature ;;
         29) gate_29_think ;;
+        31) gate_31_sql_agent_savepoint ;;
       esac
     done
     mdb_teardown
@@ -2231,18 +2437,20 @@ fi
 [ "$COVERAGE" -eq 1 ] && run_coverage_report
 
 echo ""
-# On any gate FAIL, print the tails of the two diagnostic logs whose
-# contents nothing else in the run has shown: mariadbd's own stderr
-# (mysqld_safe/mariadbd-safe route it here; on Linux the datadir
-# <hostname>.err usually exists, but with --defaults-file the vendored
-# reasoning plugin's "fractalsql-reasoning-http: ..." lines can still
-# only surface through this capture) and the mock LLM's request log --
-# the only cause record for a bare-NULL UDF result. Mirrors
+# On any gate FAIL, print the tails of the diagnostic logs whose
+# contents nothing else in the run has shown: the captured server log
+# (supervisor output; with --defaults-file the vendored reasoning
+# plugin's "fractalsql-reasoning-http: ..." lines can only surface
+# here), mariadbd's own stderr (preserved from the datadir .err by
+# mdb_teardown -- the only place a sanitizer report or UDF crash
+# backtrace lands) and the mock LLM's request log -- the only cause
+# record for a bare-NULL UDF result. Mirrors
 # build_test.ps1's Mdb-Teardown FAIL dump 1:1.
 if [ "$FAILED" -ne 0 ]; then
   for log in \
     "/tmp/fractalsql_bt_server_${MDB_MAJOR//./_}.log" \
-    "/tmp/fractalsql_bt_mockllm_${MDB_MAJOR//./_}.log"; do
+    "/tmp/fractalsql_bt_mockllm_${MDB_MAJOR//./_}.log" \
+    "/tmp/fractalsql_bt_mariadbd_err_${MDB_MAJOR//./_}.log"; do
     if [ -f "$log" ]; then
       printf -- "--- tail of %s ---\n" "$log"
       tail -40 "$log"

@@ -40,7 +40,7 @@ docker compose up -d
 ```
 
 That starts a MariaDB 11.4 container (database `fractalsql_demo`) with the
-fractalsql UDF set **and** the 15 agent procedures already registered (run
+fractalsql UDF set **and** the 16 agent procedures already registered (run
 automatically as `docker-entrypoint-initdb.d` scripts on first start) plus
 an Ollama container with **no model pulled** (you add a model when you want
 reasoning, see [step 3](#3-turn-on-reasoning)). All the demo SQL ships
@@ -50,7 +50,7 @@ Verify FractalSQL is alive:
 
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo \
-  -e "SELECT fractalsql_edition(), fractalsql_version();"
+  -e "SELECT fractal_edition(), fractal_version();"
 ```
 
 You should see:
@@ -80,12 +80,12 @@ two flavours that solve different problems:
 
 - **Sniper** (`fractal_search`): converge to the single best point in a
   continuous space.
-- **Scout** (`fractal_explore`): discover the *diverse* structure of your
+- **Scout** (`fractal_search_explore`): discover the *diverse* structure of your
   own data, finding distinct "islands" instead of collapsing to one
   nearest neighbour.
 
 Scout is what makes FractalSQL different from a plain vector DB, and it runs
-with **no model connected**. `fractal_explore` takes the whole corpus as one
+with **no model connected**. `fractal_search_explore` takes the whole corpus as one
 inline argument, since MariaDB's C UDF ABI can't run SQL against the
 calling session and has no table-returning
 UDFs at all, a hard architecture constraint (see
@@ -94,7 +94,7 @@ a tiny toy corpus:
 
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e "
-SELECT fractal_explore(
+SELECT fractal_search_explore(
     '[[0.1,0.1,0.1],[0.9,0.9,0.9],[0.2,0.8,0.2]]',
     '[0.5,0.5,0.5]',
     '{\"population_size\": 20, \"iterations\": 10, \"walk\": 0}'
@@ -273,13 +273,14 @@ above. See the release asset's own `README.txt` for the exact paths.
 
 ## Where next
 
-The documentation is a linear path. You just finished this guide.
+The documentation is a linear path. You just finished this guide, step 2 of
+the path in the [README](../README.md#from-zero-to-your-first-agent).
 
 | Step | Question | Go to |
 |------|----------|-------|
-| Next | *"How do I apply this to **my** industry?"* | **[docs/starter-kits.md](starter-kits.md)** |
-| Then | *"How does a specific agent work, and what are its inputs?"* | **[docs/api-agency.md](api-agency.md)** |
-| Then | *"How do I build a proprietary agent that isn't in the box?"* | **[docs/composition-guide.md](composition-guide.md)** |
+| 3 | *"How do I apply this to **my** industry?"* | **[docs/starter-kits.md](starter-kits.md)** |
+| 4 | *"How does a specific agent work, and what are its inputs?"* | **[docs/api-agency.md](api-agency.md)** |
+| 5 | *"How do I build a proprietary agent that isn't in the box?"* | **[docs/composition-guide.md](composition-guide.md)** |
 
 If you want the full Docker walkthrough (what's baked into the image,
 cleanup), it's in **[docs/docker-demo.md](docker-demo.md)**.

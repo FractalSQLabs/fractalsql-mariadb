@@ -33,7 +33,7 @@
 -- rationale, just without the now-removed function wrapper.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. Schema + seed data. 18 months of orders across 60 customers, with
@@ -240,7 +240,7 @@ SELECT fractal_search('', '[-0.7, 0.7, 0.7]', 1, '{"iterations": 50}') AS ideal_
 -- fractal_reason() name them in business language.
 -- ------------------------------------------------------------------
 -- === 6. Scout Discovery: find and name real customer segments ===
--- fractal_explore(corpus, query, params) takes the corpus inline
+-- fractal_search_explore(corpus, query, params) takes the corpus inline
 -- rather than as a table/column reference (same
 -- as demo.sql Section 4). Aggregate bi_customer_features.feature_vec
 -- into that shape first, then explode the "population" array in the
@@ -251,7 +251,7 @@ SET @bi_scout_corpus = (SELECT JSON_ARRAYAGG(feature_vec) FROM bi_customer_featu
 INSERT INTO bi_scout_result (particle_id, feature_vec)
 SELECT ROW_NUMBER() OVER (), p
 FROM JSON_TABLE(
-    (SELECT fractal_explore(
+    (SELECT fractal_search_explore(
         @bi_scout_corpus, '[0, 0, 0]',
         '{"population_size": 8, "iterations": 10, "walk": 0}')),
     '$.population[*]' COLUMNS (p JSON PATH '$')

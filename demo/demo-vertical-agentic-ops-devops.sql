@@ -82,7 +82,7 @@ DELETE FROM fractal_vectorizers WHERE source_table = 'vao_incident_logs';
 DROP TABLE IF EXISTS vao_incident_logs, vao_agent_capabilities, vao_known_bad_states;
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. Setup synthetic incident telemetry.

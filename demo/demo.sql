@@ -25,7 +25,7 @@
 -- read the script if you want the narration to show alongside output.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- === 1. Set up a small alerts table with something worth noticing ===
 DROP TABLE IF EXISTS demo_alerts;
@@ -90,7 +90,7 @@ WITH RECURSIVE seq(n) AS (
 )
 SELECT JSON_ARRAY(RAND(), RAND(), RAND()) FROM seq;
 
--- Scout Mode, fractal_explore(corpus, query, params), takes the corpus
+-- Scout Mode, fractal_search_explore(corpus, query, params), takes the corpus
 -- as an inline JSON-array-of-arrays argument rather than a table
 -- reference (see sql/install_udf.sql's own comment near "Scout Mode").
 -- Aggregate demo_embeddings' rows into that shape with JSON_ARRAYAGG
@@ -100,7 +100,7 @@ SET @scout_corpus = (SELECT JSON_ARRAYAGG(emb_arr) FROM demo_embeddings);
 SELECT fractal_reason(
     CONNECTION_ID(),
     'these are points from a 3D embedding space sampled by Scout Discovery, describe the spread',
-    (SELECT fractal_explore(
+    (SELECT fractal_search_explore(
         @scout_corpus, '[0,0,0]',
         '{"population_size": 10, "iterations": 8, "walk": 0}'
     ))

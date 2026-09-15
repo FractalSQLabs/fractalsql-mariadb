@@ -1,15 +1,15 @@
 // bench/tester/scout_test.js
 //
-// Scout Mode (fractal_explore) e2e acceptance gate. Builds a 3-island
-// clustered corpus, calls fractal_explore, and asserts the Scout
+// Scout Mode (fractal_search_explore) e2e acceptance gate. Builds a 3-island
+// clustered corpus, calls fractal_search_explore, and asserts the Scout
 // enablement properties:
 //   (1)+(2) returns the population: population_size particles, each
 //           of the corpus dim (not best_point alone);
 //   (3)     discovery: particles disperse across more than one island;
-//   (4)     Scout != Sniper: fractal_explore spans more islands than
+//   (4)     Scout != Sniper: fractal_search_explore spans more islands than
 //           fractal_search's top-k (which collapses into one basin).
 //
-// Exits non-zero on failure. Skips cleanly (exit 0) if fractal_explore
+// Exits non-zero on failure. Skips cleanly (exit 0) if fractal_search_explore
 // is not registered, so it is safe before the Scout drop is deployed.
 //
 //   node scout_test.js     (against the docker-compose.test.yml MySQL)
@@ -65,8 +65,8 @@ async function main() {
     database: env.MYSQL_DATABASE ?? "fractal",
   });
 
-  if (!await registered(conn, "fractal_explore")) {
-    console.log("SKIP: fractal_explore not registered (Scout drop not deployed?)");
+  if (!await registered(conn, "fractal_search_explore")) {
+    console.log("SKIP: fractal_search_explore not registered (Scout drop not deployed?)");
     await conn.end();
     return;
   }
@@ -76,13 +76,13 @@ async function main() {
   const params = JSON.stringify({ population_size: POP, iterations: 12, diffusion_factor: 2 });
 
   // Scout: full population
-  const [er] = await conn.query("SELECT fractal_explore(?, ?, ?) AS r", [corpus, query, params]);
+  const [er] = await conn.query("SELECT fractal_search_explore(?, ?, ?) AS r", [corpus, query, params]);
   const res  = JSON.parse(er[0].r);
   const pop  = res.population;
   // Skip-safe: a pre-Scout core returns the result JSON without a
   // "population" array. Skip rather than fail until the Scout drop lands.
   if (!Array.isArray(pop)) {
-    console.log("SKIP: fractal_explore result has no 'population' (pre-Scout core)");
+    console.log("SKIP: fractal_search_explore result has no 'population' (pre-Scout core)");
     await conn.end();
     return;
   }
@@ -103,7 +103,7 @@ async function main() {
 
   if (scoutIslands < 2)
     throw new Error(`Scout discovered only ${scoutIslands} island(s); expected >= 2 (no dispersion)`);
-  if (!(scoutIslands > sniperIslands))
+  if (scoutIslands <= sniperIslands)
     throw new Error(`Scout (${scoutIslands}) not broader than Sniper (${sniperIslands})`);
 
   console.log("OK: scout gate passed");

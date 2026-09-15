@@ -62,7 +62,7 @@ Depending on your role, you'll want to start in different places:
 Four tiers of SQL-callable primitives, composable into agents with plain
 MariaDB stored procedures.
 
-- **Discovery**: diverse, mode-collapse-free retrieval: `fractal_search` (Sniper), `fractal_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`).
+- **Discovery**: diverse, mode-collapse-free retrieval: `fractal_search` (Sniper), `fractal_search_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`).
 - **Cognition**: in-database LLM integration: `fractal_reason` (Bedrock, Azure OpenAI, Vertex, Ollama), `fractal_embed`, `fractal_text_to_sql`, plus an automatic **Vectorizer** pipeline (trigger-driven, MariaDB 11.7+ native `VECTOR(n)` aware).
 - **Agency**: self-correcting stored procedures: **sixteen installable agents** spanning anomaly triage, portfolio allocation, hybrid recall, route planning, deterioration triage, regime detection, and more. See the [Agent Reference](docs/api-agency.md).
 - **Analytics**: fractal/dimension primitives: `fractal_dimension_dfa`, `fractal_dimension_boxcount`, `fractal_optimize_portfolio`, and more.

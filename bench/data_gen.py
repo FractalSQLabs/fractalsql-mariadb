@@ -43,7 +43,7 @@ Usage:
 Defaults: 5000 points, dim=128, 50 clusters -- MUCH smaller than the
 100k/dim=768 scale a large-corpus ANN benchmark would use. See
 bench/README.md's "Why such a small default N" section:
-fractal_explore() (this repo's Scout Mode UDF) takes its ENTIRE corpus
+fractal_search_explore() (this repo's Scout Mode UDF) takes its ENTIRE corpus
 as one client-supplied inline string argument (MariaDB's C UDF ABI has
 no server-side table access and no table-returning UDFs, so no
 server-side table scan is possible for it at all, see sql/

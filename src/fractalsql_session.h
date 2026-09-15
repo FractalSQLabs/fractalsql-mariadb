@@ -89,8 +89,19 @@ fsql_ctx *fractal_session_acquire_embed(unsigned long long session_id, bool *out
  * reasoning as reason_ctx vs embed_ctx above. */
 fsql_ctx *fractal_session_acquire_t2s(unsigned long long session_id, bool *out_loaded);
 
+/* Same contract again, for fractal_t2s_review()'s ctx. A fifth,
+ * separate slot: RESPONSE_MODE is read once at plugin-load time and
+ * baked into a ctx for its whole lifetime (no per-dispatch override in
+ * the reasoning-http plugin's ABI), so if review shared reason_ctx, an
+ * operator setting FSQL_REASONING_HTTP_RESPONSE_MODE=json/code for
+ * fractal_reason() would silently break review's hardcoded PASS/FAIL
+ * text parsing too. review_ctx always loads with RESPONSE_MODE unset
+ * (see apply_review_env_locked, src/fractalsql_textsql.c), independent
+ * of whatever reason_ctx is configured with. */
+fsql_ctx *fractal_session_acquire_review(unsigned long long session_id, bool *out_loaded);
+
 /* Exclusive-use acquire of session_id's Diversify/search ctx, for
- * fractal_search()/fractal_explore() only. Same contract as
+ * fractal_search()/fractal_search_explore() only. Same contract as
  * fractal_session_acquire plus a per-entry busy pin: a second concurrent
  * exclusive acquire of the SAME session_id fails with *out_busy = true
  * (and NULL) instead of handing out the same ctx to two threads, since
@@ -109,12 +120,14 @@ fsql_ctx *fractal_session_acquire_exclusive(unsigned long long session_id,
  * on an id with no live entry (no-op, defensive only). */
 void fractal_session_release_exclusive(unsigned long long session_id);
 
-/* Mark session_id's reason/embed/t2s ctx as having a reasoning plugin
- * successfully attached (see fractal_session_acquire_reason/_embed/
- * _t2s's *out_loaded). No-op if session_id has no live entry. */
+/* Mark session_id's reason/embed/t2s/review ctx as having a reasoning
+ * plugin successfully attached (see fractal_session_acquire_reason/
+ * _embed/_t2s/_review's *out_loaded). No-op if session_id has no live
+ * entry. */
 void fractal_session_mark_reason_loaded(unsigned long long session_id);
 void fractal_session_mark_embed_loaded(unsigned long long session_id);
 void fractal_session_mark_t2s_loaded(unsigned long long session_id);
+void fractal_session_mark_review_loaded(unsigned long long session_id);
 
 /* Release a reference obtained from fractal_session_acquire. Safe to
  * call on an id with no live entry (no-op, defensive only, should not

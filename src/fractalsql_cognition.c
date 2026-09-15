@@ -95,7 +95,7 @@
 #include <string.h>
 
 #if defined(_WIN32)
-#  include <windows.h>
+#  include <Windows.h>
 #else
 #  include <pthread.h>
 #endif
@@ -268,6 +268,7 @@ typedef struct {
     char *http_think_provider;
     char *http_native_url;
     char *http_num_ctx;
+    char *http_response_mode;
 } cognition_config;
 
 static cognition_config g_cfg;
@@ -302,6 +303,15 @@ load_cfg_once(void)
     g_cfg.http_think_provider = dup_env("FRACTALSQL_HTTP_THINK_PROVIDER");
     g_cfg.http_native_url     = dup_env("FRACTALSQL_HTTP_NATIVE_URL");
     g_cfg.http_num_ctx        = dup_env("FRACTALSQL_HTTP_NUM_CTX");
+    /* No FRACTALSQL_* bridge for this one, by design -- matches
+     * fractalsql-postgresql's own g_response_mode_boot, which likewise
+     * reads the plugin's raw FSQL_REASONING_HTTP_RESPONSE_MODE directly
+     * rather than through a fractalsql.* GUC. Captured once here so
+     * apply_reason_env_locked() can assert this value on every reason-ctx
+     * (re)load instead of trusting whatever fractal_t2s_generate's own
+     * RESPONSE_MODE=code left in the process environment -- see that
+     * function's own comment. */
+    g_cfg.http_response_mode = dup_env("FSQL_REASONING_HTTP_RESPONSE_MODE");
 #if defined(_WIN32)
     return TRUE;
 #endif
@@ -319,8 +329,15 @@ ensure_env_config(void)
 
 /* Bridge FRACTALSQL_* config into the FSQL_REASONING_HTTP_* names the
  * reasoning-http plugin itself reads. Caller MUST hold g_load_lock.
- * "reason" mode: chat completions, no RESPONSE_MODE override. Explicitly
- * unsets vars a different purpose may have set earlier in this process. */
+ * "reason" mode: chat completions. RESPONSE_MODE is ASSERTED from the
+ * boot-captured g_cfg.http_response_mode on every load (set if the
+ * operator configured one, unset otherwise) rather than trusted from
+ * whatever the process environment currently holds -- fractal_t2s_generate
+ * (apply_generate_env_locked, fractalsql_textsql.c) sets a temporary
+ * RESPONSE_MODE=code for its own dispatch; without this assert, a reason
+ * ctx (re)load happening after a generate call in the same backend could
+ * silently inherit that leftover value instead of the operator's own
+ * setting (or none at all). */
 static void
 apply_reason_env_locked(void)
 {
@@ -333,7 +350,10 @@ apply_reason_env_locked(void)
     if (g_cfg.http_native_url)     setenv("FSQL_REASONING_HTTP_NATIVE_URL",     g_cfg.http_native_url,     1);
     if (g_cfg.http_num_ctx)        setenv("FSQL_REASONING_HTTP_NUM_CTX",        g_cfg.http_num_ctx,        1);
     unsetenv("FSQL_REASONING_HTTP_MODE");
-    unsetenv("FSQL_REASONING_HTTP_RESPONSE_MODE");
+    if (g_cfg.http_response_mode)
+        setenv("FSQL_REASONING_HTTP_RESPONSE_MODE", g_cfg.http_response_mode, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_RESPONSE_MODE");
     unsetenv("FSQL_REASONING_HTTP_SYSTEM_TAG");
 }
 
@@ -503,6 +523,17 @@ fractal_reason(UDF_INIT *initid, UDF_ARGS *args, char *result,
         fractal_session_release(sid);
         *error = 1; return NULL;
     }
+    /* The rc==0 dispatch contract says summary is non-NULL, but the
+     * copy below would crash on a contract-violating plugin -- a
+     * plugin bug gets a clean error, not a segfault. */
+    if (resp.summary == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_reason: reasoning plugin returned a NULL summary on a "
+            "success status -- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
 
     if (!str_out_ensure(so, resp.summary_len + 1)) {
         fsql_ai_response_free(&resp);
@@ -591,6 +622,17 @@ fractal_embed(UDF_INIT *initid, UDF_ARGS *args, char *result,
         SFS_INIT_ERROR(errbuf,
             "fractal_embed: response of %zu bytes exceeds the %zu-byte cap",
             resp.summary_len, (size_t) FRACTAL_MAX_AI_RESPONSE_BYTES);
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+    /* The rc==0 dispatch contract says summary is non-NULL; the parse
+     * below would memcpy from NULL on a contract-violating plugin --
+     * a plugin bug gets a clean error, not undefined behavior. */
+    if (resp.summary == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_embed: reasoning plugin returned a NULL summary on a "
+            "success status -- likely a plugin bug");
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;

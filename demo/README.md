@@ -65,7 +65,7 @@ there's no stale-state cleanup to do between runs.
 
 ## What each section shows
 
-- **0 — Sanity check.** `fractalsql_edition()` / `fractalsql_version()`
+- **0 — Sanity check.** `fractal_edition()` / `fractal_version()`
   confirm the UDFs are actually registered before anything else runs.
 - **1 — Setup.** A small `demo_alerts` table with a deliberate story in
   it: a login-attempt count that escalates (3 → 3 → 17) and a latency
@@ -78,7 +78,7 @@ there's no stale-state cleanup to do between runs.
   serialized to JSON via a subquery — rather than an empty ping. Expect
   the model to notice the login-attempt escalation and the latency
   spike; exact wording varies by model and provider.
-- **4 — Scout Discovery feeding reasoning.** `fractal_explore()`
+- **4 — Scout Discovery feeding reasoning.** `fractal_search_explore()`
   samples a diversity-spread population from `demo_embeddings`, and
   that population is handed to `fractal_reason()` as context in the
   same statement. This is the differentiator pattern: diversity-sampled
@@ -255,7 +255,7 @@ mariadb -u root -p <your_database> < demo/demo-vertical-quant-finance.sql
 - **[demo-vertical-recommendation-search.sql](demo-vertical-recommendation-search.sql)** —
   Advanced Recommendation, Search & Discovery Engines. A 300-item, 6-genre
   catalog for diverse "you might also like" discovery
-  (`fractal_explore`), table-backed top-k
+  (`fractal_search_explore`), table-backed top-k
   (`fractal_search_telemetry`), and the **full stateful-diversity
   loop**: enable Diversify, search, report negative feedback on the
   top result, re-search the same query, confirm it's now avoided — the
@@ -303,7 +303,7 @@ mariadb -u root -p <your_database> < demo/demo-vertical-quant-finance.sql
   compromise pattern — outbound connections, destination ports, and DNS
   query volume all spike while failed-auth stays flat, not a brute-force
   signature. Diverse traffic-profile clustering for threat hunting
-  (`fractal_explore`), a zone-restricted search ("DMZ hosts
+  (`fractal_search_explore`), a zone-restricted search ("DMZ hosts
   only" — the same cohort-then-search composition
   `fractal_hybrid_clinical_search` uses), compromise detection via
   `fractal_search_trajectory`, and connection-rate regime-change

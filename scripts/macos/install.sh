@@ -119,7 +119,7 @@ echo "fractal_schema_context stored procedure, and CREATE PROCEDURE needs"
 echo "a database selected):"
 echo "  ${MARIADB_BIN} ${MDB_AUTH} mydb < ${HERE}/install_udf.sql"
 echo "  ${MARIADB_BIN} ${MDB_AUTH} mydb < ${HERE}/install_agents.sql"
-echo "  ${MARIADB_BIN} ${MDB_AUTH} -e 'SELECT fractalsql_edition(), fractalsql_version();'"
+echo "  ${MARIADB_BIN} ${MDB_AUTH} -e 'SELECT fractal_edition(), fractal_version();'"
 echo
 echo "Reasoning is opt-in and set via a process environment variable, not"
 echo "a SQL statement -- MariaDB has no GUC/sysvar surface for this (see"

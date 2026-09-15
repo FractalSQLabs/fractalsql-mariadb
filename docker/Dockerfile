@@ -159,9 +159,9 @@ FROM mariadb:11.4 AS demo
 # instead of surfacing "libcurl.so.4: cannot open shared object file".
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
+        libcurl4 \
         python3 \
         python3-venv \
-        libcurl4 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /fractalsql.so /usr/lib/mysql/plugin/fractalsql.so

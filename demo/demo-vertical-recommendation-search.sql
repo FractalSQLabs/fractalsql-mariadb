@@ -26,7 +26,7 @@
 --     serving every connection: the ctx registry needs an explicit
 --     session key to tell connections apart. See sql/install_udf.sql's
 --     own header on this.
---   - fractal_explore(corpus, query, params) takes the corpus inline
+--   - fractal_search_explore(corpus, query, params) takes the corpus inline
 --     rather than as a table/column reference, so the corpus has to be
 --     assembled by the caller first (see Section 2's blueprint below).
 --
@@ -52,7 +52,7 @@
 -- executed statements.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 300-item catalog, 6 genre clusters x 50 items in R^8. Centers
@@ -117,12 +117,12 @@ SELECT COUNT(*) AS items, COUNT(DISTINCT genre_id) AS genres FROM vrs_catalog;
 
 -- Blueprint (raw primitive): returns a diverse spread of representative
 -- catalog embeddings across distinct genre basins (not K near-duplicates
--- from one genre). fractal_explore takes the corpus inline rather than
+-- from one genre). fractal_search_explore takes the corpus inline rather than
 -- as a table/column reference, so the corpus has to be assembled
 -- first, same approach as demo-business-intelligence.sql's own Scout
 -- Discovery section.
 -- SET @vrs_corpus = (SELECT JSON_ARRAYAGG(emb_arr) FROM vrs_catalog);
--- SELECT fractal_explore(@vrs_corpus, '[0,0,0,0,0,0,0,0]',
+-- SELECT fractal_search_explore(@vrs_corpus, '[0,0,0,0,0,0,0,0]',
 --     '{"population_size": 6, "iterations": 8, "walk": 0}') AS p;
 
 -- Productized preset: the shipped engine returns real catalog ids + scores

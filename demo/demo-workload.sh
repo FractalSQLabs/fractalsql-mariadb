@@ -52,7 +52,7 @@ DBPASS="${WORKLOAD_DBPASS:-fractalsql}"
 OLLAMA_HOST=""
 MODEL=""
 
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --duration)     DURATION="$2"; shift ;;
     --concurrency)  CONCURRENCY="$2"; shift ;;
@@ -77,7 +77,7 @@ log() { printf "%b\n" "$*"; }
 # --------------------------------------------------------------------
 COMPOSE_EDITED=0
 revert_compose_overrides() {
-  [ "$COMPOSE_EDITED" -eq 1 ] || return 0
+  [[ "$COMPOSE_EDITED" -eq 1 ]] || return 0
   log "\n${Y}Reverting docker-compose.yml overrides...${Z}"
   sed -i \
     -e "s|FRACTALSQL_HTTP_URL: http://${OLLAMA_HOST}/v1/chat/completions|FRACTALSQL_HTTP_URL: http://ollama:11434/v1/chat/completions|" \
@@ -89,15 +89,15 @@ revert_compose_overrides() {
 }
 trap revert_compose_overrides EXIT INT TERM
 
-if [ -n "$OLLAMA_HOST" ] || [ -n "$MODEL" ]; then
-  [ -n "$OLLAMA_HOST" ] && log "Pointing reasoning/text-to-sql/embed at $OLLAMA_HOST for this run..."
-  [ -n "$MODEL" ] && log "Using chat model $MODEL for reason/text-to-sql this run..."
+if [[ -n "$OLLAMA_HOST" || -n "$MODEL" ]]; then
+  [[ -n "$OLLAMA_HOST" ]] && log "Pointing reasoning/text-to-sql/embed at $OLLAMA_HOST for this run..."
+  [[ -n "$MODEL" ]] && log "Using chat model $MODEL for reason/text-to-sql this run..."
   sed_args=()
-  if [ -n "$OLLAMA_HOST" ]; then
+  if [[ -n "$OLLAMA_HOST" ]]; then
     sed_args+=(-e "s|FRACTALSQL_HTTP_URL: http://ollama:11434/v1/chat/completions|FRACTALSQL_HTTP_URL: http://${OLLAMA_HOST}/v1/chat/completions|")
     sed_args+=(-e "s|FRACTALSQL_HTTP_EMBED_URL: http://ollama:11434/v1/embeddings|FRACTALSQL_HTTP_EMBED_URL: http://${OLLAMA_HOST}/v1/embeddings|")
   fi
-  if [ -n "$MODEL" ]; then
+  if [[ -n "$MODEL" ]]; then
     sed_args+=(-e "s|FRACTALSQL_HTTP_MODEL: gpt-oss:20b|FRACTALSQL_HTTP_MODEL: ${MODEL}|")
   fi
   sed -i "${sed_args[@]}" docker-compose.yml
@@ -112,7 +112,7 @@ if [ -n "$OLLAMA_HOST" ] || [ -n "$MODEL" ]; then
     "${MDB[@]}" -e "SELECT 1;" >/dev/null 2>&1 && { ready=1; break; }
     sleep 1
   done
-  if [ "$ready" -ne 1 ]; then
+  if [[ "$ready" -ne 1 ]]; then
     log "\n${Y}mariadb never became reachable within 30s of starting --"
     log "aborting before running the workload against a dead container."
     log "Check: docker logs $CONTAINER${Z}"
@@ -213,13 +213,13 @@ worker() {
     local wid="$1" end_at op t0 t1 out lat
     end_at=$(( $(date +%s) + DURATION ))
     : > "$RESULTS_DIR/worker_$wid.log"
-    while [ "$(date +%s)" -lt "$end_at" ]; do
+    while [[ "$(date +%s)" -lt "$end_at" ]]; do
         local r=$(( RANDOM % 100 ))
-        if   [ "$r" -lt 40 ]; then op=sniper
-        elif [ "$r" -lt 55 ]; then op=scout
-        elif [ "$r" -lt 70 ]; then op=embed
-        elif [ "$r" -lt 80 ]; then op=insert
-        elif [ "$r" -lt 90 ]; then op=t2s
+        if   [[ "$r" -lt 40 ]]; then op=sniper
+        elif [[ "$r" -lt 55 ]]; then op=scout
+        elif [[ "$r" -lt 70 ]]; then op=embed
+        elif [[ "$r" -lt 80 ]]; then op=insert
+        elif [[ "$r" -lt 90 ]]; then op=t2s
         else                       op=reason
         fi
 
@@ -234,7 +234,7 @@ worker() {
                         (SELECT JSON_ARRAYAGG(RAND()*2-1) FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<128) SELECT n FROM seq) s),
                         1, '{\"iterations\":30,\"population_size\":30}');" 2>&1) ;;
             scout)
-                # fractal_explore(corpus, query, params) takes the whole
+                # fractal_search_explore(corpus, query, params) takes the whole
                 # corpus inline (no table-scanning UDF exists in MariaDB's
                 # C ABI). Aggregate wl_vectors into that shape first,
                 # same pattern benchmark.sql's @bench_corpus uses. Both
@@ -244,7 +244,7 @@ worker() {
                     SET @wl_corpus = (SELECT JSON_ARRAYAGG(emb_arr) FROM wl_vectors);
                     SET @wl_query  = (SELECT JSON_ARRAYAGG(RAND()*2-1) FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<128) SELECT n FROM seq) s);
                     SELECT p FROM JSON_TABLE(
-                        (SELECT fractal_explore(@wl_corpus, @wl_query,
+                        (SELECT fractal_search_explore(@wl_corpus, @wl_query,
                             '{\"population_size\": 20, \"iterations\": 8, \"walk\": 0}')),
                         '\$.population[*]' COLUMNS (p JSON PATH '\$')
                     ) jt LIMIT 20;" 2>&1) ;;
@@ -263,6 +263,7 @@ worker() {
             reason)
                 local p="${REASON_PROMPTS[$((RANDOM % ${#REASON_PROMPTS[@]}))]}"
                 out=$("${MDB[@]}" -e "SELECT fractal_reason(CONNECTION_ID(), '$p');" 2>&1) ;;
+            *)  out="ERROR unknown op: $op" ;;  # defensive: op is set by the if/elif above
         esac
         t1=$(date +%s%3N)
         lat=$(( t1 - t0 ))
@@ -284,7 +285,7 @@ worker() {
 # (see docs/vectorizer-setup.md for the BYO-scheduler options).
 scheduler() {
     local end_at=$(( $(date +%s) + DURATION ))
-    while [ "$(date +%s)" -lt "$end_at" ]; do
+    while [[ "$(date +%s)" -lt "$end_at" ]]; do
         sleep 5
         "${MDB[@]}" -e "SELECT fractal_vectorizer_process_queue();" >/dev/null 2>&1
     done
@@ -308,10 +309,10 @@ for p in "${pids[@]}"; do wait "$p"; done
 percentile() {
     local file="$1" p="$2" n idx
     n=$(wc -l < "$file")
-    [ "$n" -eq 0 ] && { echo "-"; return; }
+    [[ "$n" -eq 0 ]] && { echo "-"; return; }
     idx=$(( (p * n + 99) / 100 ))
-    [ "$idx" -lt 1 ] && idx=1
-    [ "$idx" -gt "$n" ] && idx="$n"
+    [[ "$idx" -lt 1 ]] && idx=1
+    [[ "$idx" -gt "$n" ]] && idx="$n"
     sed -n "${idx}p" "$file"
 }
 
@@ -325,7 +326,7 @@ total_calls=0
 total_failed=0
 for op in sniper scout embed insert t2s reason; do
     n=$(awk -v o="$op" '$1==o' "$RESULTS_DIR/all.log" | wc -l)
-    [ "$n" -eq 0 ] && continue
+    [[ "$n" -eq 0 ]] && continue
     nfail=$(awk -v o="$op" '$1==o && $2=="fail"' "$RESULTS_DIR/all.log" | wc -l)
     awk -v o="$op" '$1==o && $2=="ok" {print $3}' "$RESULTS_DIR/all.log" | sort -n > "$RESULTS_DIR/$op.sorted"
     p50=$(percentile "$RESULTS_DIR/$op.sorted" 50)
@@ -338,7 +339,7 @@ done
 
 log ""
 log "Total: $total_calls calls, $total_failed failed, $(( total_calls / DURATION )) calls/sec aggregate throughput"
-if [ "$total_failed" -eq 0 ]; then
+if [[ "$total_failed" -eq 0 ]]; then
     log "${G}No failures under this load.${Z}"
 else
     log "${Y}$total_failed calls failed, if reasoning wasn't configured, that's expected"

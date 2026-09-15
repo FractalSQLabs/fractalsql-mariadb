@@ -11,7 +11,11 @@
 --     with an optional auto-execute step; a thrown exception during
 --     auto-execute is caught and surfaced as execution_status=
 --     'execution_failed' in result_json, never propagated to abort the
---     whole CALL.
+--     whole CALL. The INSERT/UPDATE execute step is additionally
+--     wrapped in a SAVEPOINT: a failed statement rolls back to it
+--     cleanly, so a prior successful write earlier in the same
+--     transaction (or this call's own generated statement, on a later
+--     retry) is never touched by the failure.
 --   * fractal_agent_rebalance_sibling -- portfolio rebalance (SFS
 --     optimizer + trajectory search) composition.
 --   * fractal_reason                  -- rationale synthesis (called
@@ -41,7 +45,11 @@
 --     HANDLER FOR SQLEXCEPTION around the execute step: a failing
 --     generated statement is caught and reported as
 --     execution_status='execution_failed' with the error text in
---     result_json, never aborts this script.
+--     result_json, never aborts this script. For INSERT/UPDATE
+--     candidates the execute step also runs inside a SAVEPOINT,
+--     rolled back to on failure -- MariaDB/InnoDB's nearest equivalent
+--     to fractalsql-postgresql's SPI-subtransaction wrap for this same
+--     call, since PREPARE/EXECUTE has no such wrapper of its own.
 --   - fractal_agent_rebalance_sibling's trailing args are (seed BIGINT,
 --     context TEXT), see sql/install_agents.sql's own Engine K comment
 --     and demo-vertical-quant-finance.sql's identical note.
@@ -82,7 +90,7 @@ DELETE FROM fractal_vectorizers WHERE source_table = 'vfm_trade_strategies';
 DROP TABLE IF EXISTS vfm_trade_strategies, vfm_portfolios, vfm_assets, vfm_restrictions, vfm_historical_allocations;
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. Setup financial strategy space.
@@ -192,10 +200,13 @@ ORDER BY branch.score DESC;
 -- === 6. Self-correcting Text-to-SQL for regulatory audit ===
 -- Ask for a complex regulatory report, with auto-execution and
 -- retries. On a working model this returns execution_status='executed'
--- and the row count in result_json; on a rejected/failing candidate it
--- returns execution_status='execution_failed' with the error captured
--- by the CONTINUE HANDLER described in this file's header, rather than
--- aborting this script.
+-- and the row count in result_json (a real JSON number, not a quoted
+-- string -- MariaDB's JSON_OBJECT() otherwise stringifies a stored-
+-- procedure-local variable's value even when it's declared INT, a real
+-- quirk fixed in this same install_udf.sql); on a rejected/failing
+-- candidate it returns execution_status='execution_failed' with the
+-- error captured by the CONTINUE HANDLER + SAVEPOINT rollback
+-- described in this file's header, rather than aborting this script.
 CALL fractal_sql_agent(
     'Calculate the total exposure to ESG-restricted assets across all portfolios',
     '["vfm_portfolios", "vfm_assets", "vfm_restrictions"]',
@@ -228,7 +239,10 @@ SELECT JSON_VALUE(@r, '$.sharpe') AS sharpe,
 -- auto_execute path -- the CONTINUE HANDLER wrapped around the execute
 -- step in Section 6 ensures a late-stage constraint violation or
 -- generated-SQL error surfaces as execution_status='execution_failed'
--- in result_json instead of aborting this whole script or session.
+-- in result_json instead of aborting this whole script or session, and
+-- (for an INSERT/UPDATE candidate) the SAVEPOINT taken around that same
+-- step means the failure rolls back cleanly rather than leaving a
+-- partial write behind.
 -- ------------------------------------------------------------------
 -- === 8. Safe execution: absorbed into the Section 6 result ===
 

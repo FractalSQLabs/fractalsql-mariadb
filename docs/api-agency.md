@@ -38,7 +38,7 @@ down.
 ```sql
 USE mydb;                        -- CREATE PROCEDURE needs a selected database
 SOURCE sql/install_udf.sql;      -- the base UDF set (prerequisite)
-SOURCE sql/install_agents.sql;   -- the 15 agent procedures below
+SOURCE sql/install_agents.sql;   -- the 16 agent recipes below, plus 5 more Universal Agent procedures
 ```
 
 Both scripts are idempotent (`DROP ... IF EXISTS` then `CREATE`) plain SQL.
@@ -791,7 +791,7 @@ so each is a plain stored PROCEDURE that reaches its target table via
 dynamic SQL (`PREPARE`/`EXECUTE`), the same mechanism the table-backed
 search compositions below use. All six are plain stored procedures,
 living in `sql/install_agents.sql` (five of them) and `sql/install_udf.sql`
-(`fractal_sql_agent`) alongside the 15 recipes above:
+(`fractal_sql_agent`) alongside the 16 recipes above:
 
 - `fractal_agent_trajectory_predict(table_name, vector_col, baseline_id, forecast_steps, risk_threshold, OUT result)`:
   baseline-to-current drift prediction against a table's own latest row.
@@ -820,9 +820,9 @@ living in `sql/install_agents.sql` (five of them) and `sql/install_udf.sql`
 
 Each of these six is a MariaDB stored PROCEDURE with a trailing `OUT`
 parameter, called with `CALL ...(..., @result); SELECT @result;`, the
-same convention as the 15 recipes above.
+same convention as the 16 recipes above.
 
-- **Search**: `fractal_search`, `fractal_explore` (inline-corpus Scout mode),
+- **Search**: `fractal_search`, `fractal_search_explore` (inline-corpus Scout mode),
   see [`api-discovery.md`](api-discovery.md).
 - **Table-backed search compositions**: `fractal_search_telemetry`,
   `fractal_hybrid_clinical_search`, `fractal_search_trajectory`,
@@ -850,22 +850,48 @@ Every one of these is an ordinary function or procedure you can `CALL`/
 `SELECT` directly and compose into your own stored procedure: a custom
 agent is just a `CREATE PROCEDURE ... SQL SECURITY INVOKER BEGIN ... END`
 that calls them in sequence and returns a shaped `OUT` result, exactly like
-the 15 recipes above.
+the 16 recipes above.
 
 ---
 
-## Reference blueprints: industry verticals
+## Reference blueprints: Domain Agents
 
-Eleven runnable industry walkthroughs ship as `demo/demo-vertical-*.sql`:
-three agentic verticals (DevOps/SRE, FinTech, Customer Support) plus eight
-further industry-vertical demos covering quant finance, MedTech, and
-others. Every one has been run end-to-end against a real MariaDB server
-and a real Ollama endpoint. See
-[demo/README.md](../demo/README.md#industry-vertical-demos) for the exact
-list. The 15 recipes above, the six Universal Agent procedures in
-[Building blocks](#building-blocks-the-primitives-agents-compose) above,
-and the primitives in [Composing your own](#composing-your-own) below, are
-the same building blocks those blueprints compose.
+The three agentic-vertical demos (`demo/demo-vertical-agentic-ops-devops.sql` for DevOps/SRE, `-fintech-mcts.sql` for FinTech, `-customer-support.sql` for Customer Support) are reference blueprints for the shipped agent procedures in a concrete domain: SOC incident triage and task routing, portfolio rebalancing with scenario exploration, and churn-drift forecasting with hybrid memory recall and diverse retention offers. Unlike fractalsql-postgresql, there's no separate hand-written blueprint layer to keep as a comment here — `sql/install_agents.sql`'s sixteen recipes were the agent layer from the start, so each demo just calls them directly against real tables and data. To try them: run `SOURCE sql/install_udf.sql;` then `SOURCE sql/install_agents.sql;`, configure reasoning (see [reasoning-setup.md](reasoning-setup.md)) and, for the DevOps/SRE and FinTech demos, an embeddings endpoint (see [vectorizer-setup.md](vectorizer-setup.md)), then run a demo end to end (`mariadb -u root -p <your_database> < demo/demo-vertical-agentic-customer-support.sql`) and read its own header comment and `CALL fractal_agent_x(...)` calls to see exactly how each one is composed. Eight further industry-vertical demos ship alongside these three; see [demo/README.md](../demo/README.md#industry-vertical-demos) for the full list.
+
+### DevOps / SRE — `demo/demo-vertical-agentic-ops-devops.sql`
+
+| Agent Procedure | Composes | Purpose |
+| --- | --- | --- |
+| `fractal_agent_route_task(task_desc, budget, cost_per_route, OUT result)` | `agent_capabilities` table scan + `fractal_reason` | Sub-agent dispatcher: matches an incoming task to the best capable sub-agent (`routed_to` is the real `capability_name` PK), plus token-budget accounting. |
+| `fractal_agent_outlier_intercept(state_vec, history_table, vector_col, threshold, OUT result)` | `fractal_search_telemetry` | Pre-commit safety barrier: screens a proposed action's state vector against known-bad state clusters, intercepting it when the nearest bad state is within `threshold`. |
+| `fractal_agent_anomaly_triage(host_id, log_table, baseline_window, OUT result)` | `fractal_dimension_drift` + `fractal_reason` | Per-entity incident triage: scores drift on the host's latency series, then reasons a human-readable triage summary over the drift result. |
+
+Also exercises `fractal_agent_detect_loop` (period-2 loop detection, a pure numeric primitive with no table access) and `fractal_search_agent`/`fractal_rag_agent` (embed → Scout-search a real vectorized column → reason over the matched rows).
+
+### FinTech — `demo/demo-vertical-agentic-fintech-mcts.sql`
+
+| Agent Procedure | Composes | Purpose |
+| --- | --- | --- |
+| `fractal_agent_plan_explore(initial_state, strategy_table, vector_col, max_branches, OUT result)` | Embed + Scout-search | Strategy trajectory exploration: returns each explored branch's real row id, its own vector, and a fitness score. |
+| `fractal_sql_agent(question, table_names, max_retries, auto_execute, OUT generated_sql, OUT status, OUT result_json)` | Self-correcting Text-to-SQL | Scenario query generation with an optional auto-execute step; a thrown exception during auto-execute is caught and surfaced as `execution_status='execution_failed'`, never propagated to abort the whole `CALL`. |
+| `fractal_agent_rebalance_sibling(portfolio_id, target_cardinality, OUT result)` | `fractal_optimize_portfolio` + `fractal_reason` | Cardinality-constrained rebalance: runs the SFS Sharpe optimizer for the target asset count, then reasons a rationale for the weight shift. |
+
+### Customer Support — `demo/demo-vertical-agentic-customer-support.sql`
+
+| Agent Procedure | Composes | Purpose |
+| --- | --- | --- |
+| `fractal_agent_trajectory_predict(table_name, vector_col, baseline_id, forecast_steps, risk_threshold, OUT result)` | `fractal_search_trajectory` | Churn drift forecast: reads a table's baseline and latest rows, derives a real delta, and returns a predicted state vector plus drift score. |
+| `fractal_agent_recall_hybrid(table_name, vector_col, query, filter_col, filter_val, k, content_col, OUT result)` | `fractal_search_trajectory` + SQL filter | Hybrid memory recall over a churn-recovery playbook: fuses an optional metadata filter with a drift-vector state search (`NULL`/`NULL` for `filter_col`/`filter_val` means "no cohort filter"). |
+| `fractal_agent_recommend_diverse(customer_id, catalog_table, vector_col, k, OUT result)` | `fractal_diversify_enable` + Scout (`fractal_search_explore`) | Feedback-aware recommender: enables the stateful Diversify/Repulsion layer so re-searches avoid recently-rejected items, then Scout-searches for diverse retention-offer candidates. |
+
+### Getting started with the blueprints
+
+1. **Prerequisites**: `SOURCE sql/install_udf.sql;` then `SOURCE sql/install_agents.sql;`, and reasoning configured — the agents call `fractal_reason`/`fractal_embed`, so follow [`reasoning-setup.md`](reasoning-setup.md) first. The Ops/DevOps and FinTech demos also need an embeddings endpoint and a vectorized column; see [`vectorizer-setup.md`](vectorizer-setup.md).
+2. **Run a demo** end to end: each is a single `SOURCE` (or piped file):
+   ```sh
+   mariadb -u root -p <your_database> < demo/demo-vertical-agentic-customer-support.sql
+   ```
+3. **Read the composition**: every `fractal_agent_*` call in the tables above follows `CALL fractal_agent_x(...args, @result); SELECT JSON_VALUE(@result, '$.field')` — read `sql/install_agents.sql`'s own header comment and each procedure's body for the exact composition, or the demo file's own "Structural notes" header comment for the exact call shape used there.
 
 ---
 
@@ -876,7 +902,7 @@ function or procedure, so a custom agent is just a
 `CREATE PROCEDURE ... SQL SECURITY INVOKER` that calls them in sequence,
 feeds one's output into the next's input via a local `DECLARE`d variable,
 and returns a shaped `JSON` result through an `OUT` parameter. Read any of
-the 15 recipes in `sql/install_agents.sql` as a worked template; they're
+the 16 recipes in `sql/install_agents.sql` as a worked template; they're
 all under 100 lines each and follow the same shape (validate inputs →
 gather via dynamic SQL or a search primitive → analyze → `fractal_reason` →
 assemble the `OUT` JSON).

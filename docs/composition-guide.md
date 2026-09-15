@@ -16,7 +16,7 @@ compositions) is an **ordinary SQL function or procedure**. A custom agent
 is just a `CREATE PROCEDURE ... SQL SECURITY INVOKER` that calls them in
 sequence, feeds one's output into the next's input via a local `DECLARE`d
 variable, and returns a shaped result through an `OUT JSON` parameter. The
-15 shipped agents are exactly this, productized. Read any of them in
+16 shipped agents are exactly this, productized. Read any of them in
 `sql/install_agents.sql` as a worked template; they're all under 100 lines
 and follow the same shape (validate inputs → gather via a search primitive
 or dynamic SQL → analyze → `fractal_reason` → assemble the `OUT` JSON).
@@ -34,7 +34,7 @@ or dynamic SQL → analyze → `fractal_reason` → assemble the `OUT` JSON).
 > procedures in `sql/install_agents.sql`/`sql/install_udf.sql`
 > (`fractal_sql_agent` lives in `sql/install_udf.sql`, the other five in
 > `sql/install_agents.sql`) and are building blocks you can call directly
-> (see Pattern B below), not just internal to the 15 shipped recipes.
+> (see Pattern B below), not just internal to the 16 shipped recipes.
 
 ---
 
@@ -47,7 +47,7 @@ here is the pick-list.
 | Block | Role | Use it when… |
 |---|---|---|
 | `fractal_search` | Sniper-mode convergence over an inline corpus | You need the single best point, or a refinement pass over a task vector |
-| `fractal_explore` | Scout-mode diverse population, inline corpus | You need a *spread* of results, not one answer |
+| `fractal_search_explore` | Scout-mode diverse population, inline corpus | You need a *spread* of results, not one answer |
 | `fractal_search_telemetry` (procedure) | Real top-k rows from a table | You have a real table and want ground-truth nearest matches |
 | `fractal_hybrid_clinical_search` (procedure) | Cohort-restricted top-k | You need a metadata-filtered search, not the whole table |
 | `fractal_search_trajectory` (procedure) | Delta-vector search over a table | You need "what changed": baseline vs. current state |
@@ -71,7 +71,7 @@ JSON`, never a `SELECT function(...)`.
 
 A composition is a pipeline with up to four stages:
 
-1. **Retrieve**: find the relevant rows (`fractal_explore` for diversity
+1. **Retrieve**: find the relevant rows (`fractal_search_explore` for diversity
    over an inline corpus, or a table-backed procedure for "what changed" /
    a real cohort). Build the corpus/query strings with ordinary SQL first.
 2. **Reason**: `fractal_reason(session_id, query, context)` over the
@@ -224,9 +224,9 @@ vector against known-bad-state clusters before the action runs.
 
 ---
 
-## Two notes to carry over
+## Notes
 
-These bit the shipped agents; they'll bite yours too.
+Two issues surfaced while building the shipped agents, and apply equally to any composition you write.
 
 - **Table-backed procedures need a single-column, real `PRIMARY KEY`.**
   `_fractalsql_scan_corpus` and the other table-scanning helpers `SIGNAL`

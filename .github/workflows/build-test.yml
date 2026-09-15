@@ -346,6 +346,19 @@ jobs:
           exit $LASTEXITCODE
 
   darwin-asan:
+    # The cluster gates SKIP on stock Homebrew mariadbd, by design: ASan
+    # must install its malloc/free interceptors before the host process
+    # makes its first allocation, and on modern macOS (dyld chained
+    # fixups) no late injection can achieve that against a mariadbd that
+    # wasn't itself compiled with -fsanitize=address -- LD_PRELOAD is
+    # ignored by dyld outright, and DYLD_INSERT_LIBRARIES loads the
+    # runtime too late, after which the runtime aborts the whole
+    # (single, threaded) mariadbd process mid-query (surfacing as ERROR
+    # 2013 Lost connection at the first CREATE FUNCTION; caught live on
+    # this cell). build_test.sh detects the non-instrumented host via
+    # otool -L and skips cleanly rather than hard-failing cluster setup.
+    # The Linux/Windows ASan cells cover the same portable C source;
+    # full-cluster ASan on macOS would need a source-built ASan mariadbd.
     name: build_test.sh --asan (macOS)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-14

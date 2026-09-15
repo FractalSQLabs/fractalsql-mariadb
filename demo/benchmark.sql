@@ -109,8 +109,8 @@ SELECT COUNT(DISTINCT (
 FROM bt_topk;
 
 -- mmr_lambda 0.2 weights diversity more heavily than the 0.5 default.
--- --- Scout Discovery (fractal_explore, population_size=50) ---
--- fractal_explore(corpus, query, params) takes the corpus inline
+-- --- Scout Discovery (fractal_search_explore, population_size=50) ---
+-- fractal_search_explore(corpus, query, params) takes the corpus inline
 -- rather than as a table/column reference (same as demo.sql
 -- Section 4). Aggregate the 5000-row corpus into that shape first, then
 -- explode the "population" array in the JSON result.
@@ -118,7 +118,7 @@ SET @bench_corpus = (SELECT JSON_ARRAYAGG(emb_arr) FROM bt_bench_corpus);
 DROP TEMPORARY TABLE IF EXISTS bt_scout;
 CREATE TEMPORARY TABLE bt_scout AS
 SELECT p AS emb_arr FROM JSON_TABLE(
-    (SELECT fractal_explore(
+    (SELECT fractal_search_explore(
         @bench_corpus, @query,
         '{"population_size": 50, "iterations": 8, "walk": 0, "mmr_lambda": 0.2}')),
     '$.population[*]' COLUMNS (p JSON PATH '$')

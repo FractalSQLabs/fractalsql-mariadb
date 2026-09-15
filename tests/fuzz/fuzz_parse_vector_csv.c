@@ -11,7 +11,7 @@
  * src/fractalsql_cognition.c's fractal_embed(), which calls this on
  * resp.summary after fsql_dispatch_ai returns) -- a malicious or
  * merely buggy third-party HTTP provider fully controls these bytes.
- * It is also called on every fractal_search()/fractal_explore() query
+ * It is also called on every fractal_search()/fractal_search_explore() query
  * argument and each corpus row (via parse_corpus, fuzzed separately),
  * SQL-caller-supplied text with a different, lower-privilege threat
  * model but the identical parser underneath.

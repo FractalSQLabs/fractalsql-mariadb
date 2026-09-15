@@ -26,7 +26,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${FSQL_PKG_VERSION:-$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' src/fractalsql.c)}"
-[ -n "${VERSION}" ] || { echo "could not determine VERSION (FSQL_VERSION not found in src/fractalsql.c)" >&2; exit 1; }
+[[ -n "${VERSION}" ]] || { echo "could not determine VERSION (FSQL_VERSION not found in src/fractalsql.c)" >&2; exit 1; }
 ITERATION="1"
 DIST_DIR="dist/packages"
 
@@ -57,6 +57,7 @@ esac
 case "${PKG_ARCH}" in
     amd64) RPM_ARCH="x86_64"  ; FSQL_PLATFORM="linux-x86_64"  ;;
     arm64) RPM_ARCH="aarch64" ; FSQL_PLATFORM="linux-aarch64" ;;
+    *)     echo "unknown arch '${PKG_ARCH}': expected amd64 or arm64" >&2; exit 2 ;;
 esac
 
 SO="dist/${PKG_ARCH}/fractalsql.so"

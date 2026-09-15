@@ -9,7 +9,7 @@
 --     derives dim from the data, computes a real delta via
 --     fractal_search_trajectory, and returns a real predicted_state_
 --     vector plus projected_drift_delta.
---   * fractal_explore                   -- pure-C Scout search on an
+--   * fractal_search_explore                   -- pure-C Scout search on an
 --     inline corpus.
 --   * fractal_agent_recall_hybrid       -- hybrid memory recall over a
 --     churn-recovery playbook.
@@ -37,7 +37,7 @@
 --     verbatim below), and mem_id in the result is already
 --     customer_playbook's own real `case_id` PRIMARY KEY value, not a
 --     corpus-position index.
---   - fractal_explore(corpus, query, params) takes the corpus inline
+--   - fractal_search_explore(corpus, query, params) takes the corpus inline
 --     (a JSON array) rather than as a table/column reference, the same
 --     approach demo-business-intelligence.sql Section 6 and
 --     demo-vertical-cybersecurity-threat-detection.sql Section 2 use.
@@ -64,7 +64,7 @@
 -- vector below is a literal.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. Customer session telemetry -- a single customer (cust-abc)
@@ -177,7 +177,7 @@ SELECT mem_id, content
            mem_id  VARCHAR(32) PATH '$.mem_id',
            content TEXT        PATH '$.content')) AS jt;
 
--- === 7. fractal_explore: repulsion-guided intervention candidates ===
+-- === 7. fractal_search_explore: repulsion-guided intervention candidates ===
 -- Diverse (non-redundant) session-state candidates around this
 -- customer's current drifting state, Scout-searched over the inline
 -- session corpus, see this file's header note on why this takes the
@@ -185,7 +185,7 @@ SELECT mem_id, content
 SET @vcs_corpus = (SELECT JSON_ARRAYAGG(state_vector) FROM vcs_customer_sessions);
 SELECT jt.p AS candidate_vector
   FROM JSON_TABLE(
-      (SELECT fractal_explore(@vcs_corpus, '[0.8, 0.2, 0.1]', '{"population_size": 5}')),
+      (SELECT fractal_search_explore(@vcs_corpus, '[0.8, 0.2, 0.1]', '{"population_size": 5}')),
       '$.population[*]' COLUMNS (p JSON PATH '$')
   ) AS jt;
 

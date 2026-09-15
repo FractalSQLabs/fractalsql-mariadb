@@ -82,4 +82,68 @@ Finds the best `k` assets in a large universe without brute-force exponential co
 SELECT fractal_optimize_portfolio('[0.1,0.15]', '[0.04,0.01,0.01,0.03]', 2, '{}');
 ```
 
-> The Enterprise-tier variants `fractal_optimize_portfolio_multimodal`/`_multimodal_pareto` and the Named Feature Store (`fractal_store_morphology`/`fractal_mine_topology_negatives`) are not available in this edition. See [`enterprise.md`](enterprise.md) for what the Enterprise tier actually covers here (ledger/audit gating, not additional Analytics-tier search variants).
+### `fractal_optimize_portfolio_multimodal`
+**Enterprise tier.** Diverse-candidate variant of `fractal_optimize_portfolio`: runs `n_restarts` independent single-best searches and greedy-selects up to `n_restarts` structurally distinct candidates instead of one. Returns `NULL` cleanly if no enterprise library is loaded (`FRACTALSQL_ENTERPRISE_LIB`, see [`enterprise.md`](enterprise.md)).
+
+**Signature**: `fractal_optimize_portfolio_multimodal(mu_csv TEXT, cov_csv TEXT, k INT, n_restarts INT, overlap_threshold DOUBLE, quality_frac DOUBLE, seed BIGINT) RETURNS TEXT`
+
+**Return**: `{"n_found":N,"candidates":[{"sharpe":..,"weights":[..]},...]}`, Sharpe descending.
+
+All 7 arguments are required and positional (MariaDB UDFs have no default-argument syntax, and this function has no trailing params-JSON convention, unlike the Community-tier `fractal_optimize_portfolio` above).
+- `overlap_threshold`: max allowed selected-asset overlap (0.0-1.0, Jaccard-style) between any two returned candidates.
+- `quality_frac`: a candidate must reach at least `quality_frac` × the best Sharpe found to be kept.
+
+Also logs a best-effort audit-chain entry (kind=2) with the full candidate set, same as `fractal_optimize_portfolio` does for its one result. See [`enterprise.md`](enterprise.md).
+
+### `fractal_optimize_portfolio_multimodal_ex`
+**Enterprise tier, no equivalent in fractalsql-postgresql.** The OBL/Lévy-flight-capable sibling of `fractal_optimize_portfolio_multimodal` above: same `n_restarts` search and diverse selection, with two extra knobs applied uniformly to every restart's search. fractalsql-postgresql has no separate `_ex` function for this — there, `use_obl`/`diffusion_mode` are just two more optional (defaulted) arguments directly on `fractal_optimize_portfolio_multimodal` itself. MariaDB's UDF ABI has no default-argument syntax, so the two knobs can't be added to the 7-argument function above without breaking every existing positional call site; `_ex` is a separate, additive 9-argument symbol instead.
+
+**Signature**: `fractal_optimize_portfolio_multimodal_ex(mu_csv TEXT, cov_csv TEXT, k INT, n_restarts INT, overlap_threshold DOUBLE, quality_frac DOUBLE, seed BIGINT, use_obl INT, diffusion_mode TEXT) RETURNS TEXT`
+
+**Return**: same shape as `fractal_optimize_portfolio_multimodal`.
+
+- `use_obl`: `0`/`1` (the UDF ABI has no BOOLEAN) — Opposition-Based Learning: evaluate each SFS trial candidate's bound-reflected opposite, keep whichever fits better.
+- `diffusion_mode`: `'gaussian'` (default behavior) or `'levy'`, a heavy-tailed Mantegna-algorithm step that can help escape local optima on highly multimodal problems.
+
+All 9 arguments are required and positional; same NULL-dormant and audit-chain behavior as the function above. When the loaded enterprise library predates the `_ex` symbol, passing the default knobs (`use_obl=0`, `diffusion_mode='gaussian'`) falls back to the base function's identical search; requesting either knob on such a library returns `NULL`.
+
+### `fractal_optimize_portfolio_multimodal_pareto`
+**Enterprise tier.** Pareto-front sibling of `fractal_optimize_portfolio_multimodal`: runs the same `n_restarts` independent searches, but scores each by decomposed **(return, risk)** instead of scalar Sharpe and reduces them to a genuine non-dominated Pareto front (NSGA-II crowding-distance truncation if the front exceeds `max_front`). This is not the sharpe-threshold + asset-overlap selection the sibling above uses. Purely additive: does not change that function's selection semantics.
+
+**Signature**: `fractal_optimize_portfolio_multimodal_pareto(mu_csv TEXT, cov_csv TEXT, k INT, n_restarts INT, max_front INT, seed BIGINT, use_obl INT, diffusion_mode TEXT) RETURNS TEXT`
+
+**Return**: `{"n_found":N,"candidates":[{"return":..,"risk":..,"sharpe":..,"weights":[..]},...]}`, Sharpe descending. `sharpe = return/risk` is informational, not the selection criterion.
+
+- `max_front`: cap on returned front size, `1 <= max_front <= n_restarts`.
+- `use_obl`/`diffusion_mode`: same knobs and encoding as `fractal_optimize_portfolio_multimodal_ex` above, applied uniformly to every restart.
+
+All 8 arguments are required and positional; same NULL-dormant and audit-chain behavior as above. Unlike `_ex`, this one has no fallback to a base symbol — there is no non-Pareto shape of this result to fall back to.
+
+---
+
+## Named Feature Store
+
+A generic per-item vector store for custom metadata or flagged examples. Community tier here, same as in fractalsql-postgresql; independent of the ledger/audit mechanism entirely (see [`enterprise.md`](enterprise.md)).
+
+Unlike fractalsql-postgresql's C-level `fractal_store_morphology`/`fractal_mine_topology_negatives` (implemented via SPI against a plain table), both are stored PROCEDUREs here, composing the existing `fractal_vector_l2_squared` UDF over a fixed internal table (`fractalsql_feature_store`). No dynamic SQL is needed for either: unlike the table-backed search procedures elsewhere in this doc, this table's name is fixed, not caller-supplied.
+
+### `fractal_store_morphology`
+Upserts a vector against a `doc_id`.
+
+**Signature**: `fractal_store_morphology(doc_id BIGINT, feature_array TEXT)` — `feature_array` is a JSON-array-string vector, the same convention as `fractal_search`'s `vector_csv`/`query_csv`.
+
+```sql
+CALL fractal_store_morphology(1, '[0.1,0.2,0.3]');
+```
+
+### `fractal_mine_topology_negatives`
+Brute-force k-NN scan (squared Euclidean distance) over the feature store.
+
+**Signature**: `fractal_mine_topology_negatives(surrogate_vector TEXT, k INT, OUT result JSON)`
+
+**Return**: `[{"doc_id":.., "dist":..}, ...]`, ascending by distance — O(n) per call, no index. Intended for a curated store (e.g. vectors flagged via `fractal_store_morphology` as rejected/negative examples), not a full corpus scan.
+
+```sql
+CALL fractal_mine_topology_negatives('[0.1,0.2,0.3]', 5, @result);
+SELECT @result;
+```

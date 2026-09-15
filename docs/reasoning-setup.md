@@ -25,7 +25,7 @@ The Cognition tier provides `fractal_reason(session_id, query
 orchestrators, FractalSQL performs the synthesis inside the backend:
 
 1. **Context Assembly**: You use ordinary SQL (subqueries, `JSON_ARRAYAGG`,
-   or `fractal_explore`) to gather the precise data needed.
+   or `fractal_search_explore`) to gather the precise data needed.
 2. **Sovereign Dispatch**: The extension dispatches the query and context
    to your configured LLM via a dedicated C-bridge.
 3. **In-Place Synthesis**: The response is returned directly into your
@@ -70,7 +70,8 @@ Copy `fractalsql-reasoning-http.so`/`.dll` there (the `.deb`/`.rpm`
 packages already do this for you).
 
 ### 2. Technical Requirements
-- **Extension Version**: `fractalsql-mariadb` 2.0.0+ (`SELECT fractalsql_version();`).
+- **Extension Version**: `fractalsql-mariadb` 2.0.0+ (`SELECT fractal_version();`).
+- **Plugin Version**: `fractalsql-reasoning-http` v1.2.1+ (required for Response Modes and System Tags).
 - **Host Dependencies**: `libcurl` 7.75.0+ (required for AWS SigV4 auth). The `.deb`/`.rpm` packages declare `libcurl4`/`libcurl.so.4()(64bit)` as a real dependency.
 - **Endpoint**: An LLM provider (Ollama, AWS Bedrock, Azure OpenAI, GCP Vertex, or any OpenAI-compatible API).
 
@@ -130,9 +131,7 @@ FRACTALSQL_HTTP_MODEL=gpt-oss:20b
 FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:11434/v1/embeddings
 FRACTALSQL_HTTP_EMBED_MODEL=nomic-embed-text
 ```
-*Note: Run `ollama pull gpt-oss:20b` (and `nomic-embed-text`) before
-connecting. See `docker-compose.yml` at the repo root for a working
-turnkey example of exactly this.*
+*Note: Run `ollama pull gpt-oss:20b` or `ollama pull gemma4:12b` or `ollama pull phi4:14b` before connecting.*
 
 ## OpenAI-Compatible (OpenAI, Together AI, Fireworks, vLLM)
 ```bash
@@ -150,8 +149,11 @@ FRACTALSQL_HTTP_URL=https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/ch
 FRACTALSQL_HTTP_MODEL=amazon.nova-lite-v1:0
 ```
 **Critical**: Auth type and region are set via the reasoning plugin's own
-lower-level env vars (see [Advanced Configuration](#-advanced-configuration)
-below), not the `FRACTALSQL_*` bridge names.
+lower-level env vars, not the `FRACTALSQL_*` names above:
+```bash
+FSQL_REASONING_HTTP_AUTH_TYPE=aws-sigv4
+FSQL_REASONING_HTTP_AWS_REGION=us-east-1
+```
 
 ## Azure OpenAI
 Azure requires a separate deployment for the chat model.
@@ -222,54 +224,37 @@ environment, not a config file. Restart `mariadbd` after changing them.
 
 ## 🛠️ Advanced Configuration
 
-### Two layers of environment variables: don't conflate them
+Every advanced knob at a glance -- details for each are in the sections below:
 
-This repo's C code (`src/fractalsql_cognition.c`,
-`src/fractalsql_textsql.c`) reads one set of variables and **translates**
-them, at plugin-load time, into a second, lower-level set the vendored
-`fractalsql-reasoning-http.so` plugin itself reads.
-
-| You set (this repo's bridge) | Becomes (the plugin's own var) |
+| Variable | Notes |
 | --- | --- |
-| `FRACTALSQL_HTTP_URL` | `FSQL_REASONING_HTTP_URL` |
-| `FRACTALSQL_HTTP_TOKEN` | `FSQL_REASONING_HTTP_TOKEN` |
-| `FRACTALSQL_HTTP_MODEL` | `FSQL_REASONING_HTTP_MODEL` |
-| `FRACTALSQL_HTTP_ALLOW_PLAINTEXT` | `FSQL_REASONING_HTTP_ALLOW_PLAINTEXT` |
-| `FRACTALSQL_HTTP_EMBED_URL` | `FSQL_REASONING_HTTP_URL` (embed dispatch reuses the URL slot) |
-| `FRACTALSQL_HTTP_EMBED_MODEL` | `FSQL_REASONING_HTTP_MODEL` (embed dispatch reuses the model slot) |
-| `FRACTALSQL_HTTP_THINK` | `FSQL_REASONING_HTTP_THINK` |
-| `FRACTALSQL_HTTP_THINK_PROVIDER` | `FSQL_REASONING_HTTP_THINK_PROVIDER` |
-| `FRACTALSQL_HTTP_NATIVE_URL` | `FSQL_REASONING_HTTP_NATIVE_URL` |
-| `FRACTALSQL_HTTP_NUM_CTX` | `FSQL_REASONING_HTTP_NUM_CTX` |
-
-A **third** family exists with **no `FRACTALSQL_*` bridge at all**. Set
-these directly, they're read straight by the plugin: `FSQL_REASONING_HTTP_TIMEOUT_MS`,
-`FSQL_REASONING_HTTP_LOW_SPEED_SECS`, `FSQL_REASONING_HTTP_SYSTEM_PROMPT`
-(see [Security & Governance](#-security--governance) below).
-
-You will only ever need to set the `FRACTALSQL_*` names yourself for normal
-provider config; the translation happens automatically. This table exists
-so the `FSQL_REASONING_HTTP_*` names you'll see in plugin log lines or
-`docker-compose.yml` comments make sense, and so you know which family a
-given knob belongs to when this page or the plugin's own docs mention one
-you haven't seen before.
+| `FSQL_REASONING_HTTP_RESPONSE_MODE` | `text` (default) / `code` / `json` -- see [Response Modes](#response-modes) |
+| `FRACTALSQL_HTTP_THINK` | Reasoning effort for hybrid-thinker models -- see [Reasoning Effort](#reasoning-effort) |
+| `FRACTALSQL_HTTP_THINK_PROVIDER` | Request shape THINK uses -- see [Reasoning Effort](#reasoning-effort) |
+| `FRACTALSQL_HTTP_NATIVE_URL` | Override URL for the ollama/anthropic native shape |
+| `FRACTALSQL_HTTP_NUM_CTX` | Ollama-native context-window cap |
+| `FSQL_REASONING_HTTP_AUTH_TYPE` | `bearer` (default) / `api-key` / `aws-sigv4` -- see [AWS Bedrock](#aws-bedrock) |
+| `FSQL_REASONING_HTTP_AWS_REGION` | AWS region for `aws-sigv4` |
+| `FSQL_REASONING_HTTP_TIMEOUT_MS` | Total request timeout -- see [Handling Constrained Hardware](#handling-constrained-hardware) |
+| `FSQL_REASONING_HTTP_LOW_SPEED_SECS` | Slow-response abort window |
+| `FSQL_REASONING_HTTP_SYSTEM_PROMPT` | Replaces the baseline anti-injection system prompt -- see [Security & Governance](#-security--governance) |
 
 ### Response Modes
-Shape how the plugin post-processes the LLM response, set internally by
-this repo's own C code depending on which function you called. You don't
-set `FSQL_REASONING_HTTP_RESPONSE_MODE` yourself for normal use:
-- `text` (`fractal_reason`, `fractal_t2s_review`): Raw content.
-- `code` (`fractal_t2s_generate`): Forces a single fenced code block and
-  extracts it automatically.
-- `json`: Forces a fenced JSON block and validates structural integrity
-  (available at the plugin level; not currently dispatched to by any
-  function in this repo).
+Shape how the plugin post-processes the LLM response, via
+`FSQL_REASONING_HTTP_RESPONSE_MODE`:
+- `text` (default): Raw content.
+- `code`: Forces a single fenced code block and extracts it.
+- `json`: Forces a fenced JSON block and validates structural integrity.
 
-### Reasoning Effort (THINK)
-Unlike Response Modes, this one you *do* set yourself. It throttles
-hybrid-thinker models (Granite 4.2, OpenAI o-series, Claude extended
-thinking, DeepSeek-R1, QwQ) whose internal reasoning trace otherwise
-dominates latency and VRAM. Applies to `fractal_reason`,
+Applies to `fractal_reason`
+
+Set `FSQL_REASONING_HTTP_RESPONSE_MODE` in `mariadbd`'s environment and
+restart the server as there is no config-reload path for this.
+
+### Reasoning Effort
+Throttles hybrid-thinker models (Granite 4.2, OpenAI o-series, Claude
+extended thinking, DeepSeek-R1, QwQ) whose internal reasoning trace
+otherwise dominates latency and VRAM. Applies to `fractal_reason`,
 `fractal_t2s_generate`, and `fractal_t2s_review` (chat tiers only:
 `fractal_embed` never sees it, by design, since no provider applies
 reasoning effort to an embeddings request).

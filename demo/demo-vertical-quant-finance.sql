@@ -44,7 +44,7 @@
 -- executed statements.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 25 synthetic assets, 4-factor covariance model (same construction

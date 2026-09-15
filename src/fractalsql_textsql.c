@@ -95,7 +95,7 @@
 #include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-#  include <windows.h>
+#  include <Windows.h>
 #  define FRACTAL_EXPORT __declspec(dllexport)
 #else
 #  include <pthread.h>
@@ -373,13 +373,20 @@ apply_generate_env_locked(const char *system_tag)
         unsetenv("FSQL_REASONING_HTTP_SYSTEM_TAG");
 }
 
-/* "review" mode: plain chat, no RESPONSE_MODE override. Shares
- * fractal_reason()'s own ctx-loading shape (see
- * fractalsql_cognition.c's apply_reason_env_locked), used via the
- * REASON ctx slot, not the GENERATE one, because a code-mode extractor
- * would risk pulling a quoted SQL fragment out of the review's
- * PASS/FAIL explanation instead of returning the verdict text itself.
- * Caller MUST hold g_load_lock. */
+/* "review" mode: plain chat, its own ctx slot (review_ctx, acquired via
+ * fractal_session_acquire_review -- NOT reason_ctx). RESPONSE_MODE is
+ * hardcoded unset here, always, regardless of what an operator has set
+ * FSQL_REASONING_HTTP_RESPONSE_MODE to for fractal_reason(): RESPONSE_MODE
+ * is read once at plugin-load time and baked into a ctx for its whole
+ * lifetime (no per-dispatch override in the reasoning-http plugin's ABI),
+ * so if review shared reason_ctx, the operator's own fractal_reason()
+ * setting would silently apply to review too -- a code-mode extractor
+ * could pull a quoted SQL fragment out of review's PASS/FAIL explanation
+ * instead of the verdict text, and a json-mode extractor would almost
+ * never produce a response starting with "PASS"/"FAIL" at all, since the
+ * fractal_t2s_review UDF's parser hardcodes that check. RESPONSE_MODE is
+ * fractal_reason()'s own opt-in lever, not review's. Caller MUST hold
+ * g_load_lock. */
 static void
 apply_review_env_locked(void)
 {
@@ -446,7 +453,7 @@ ensure_review_loaded(unsigned long long session_id, fsql_ctx *ctx,
                        rc, err && *err ? err : "(no detail)");
         return false;
     }
-    fractal_session_mark_reason_loaded(session_id);
+    fractal_session_mark_review_loaded(session_id);
     return true;
 }
 
@@ -555,6 +562,17 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
         fractal_session_release(sid);
         *error = 1; return NULL;
     }
+    /* The rc==0 dispatch contract says summary is non-NULL, but the
+     * copy below would crash on a contract-violating plugin -- a
+     * plugin bug gets a clean error, not a segfault. */
+    if (resp.summary == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: reasoning plugin returned a NULL summary "
+            "on a success status -- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
 
     s = str_out_set(so, resp.summary, resp.summary_len, length);
     fsql_ai_response_free(&resp);
@@ -615,7 +633,7 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     sid = (unsigned long long) *(long long *) args->args[0];
 
-    ctx = fractal_session_acquire_reason(sid, &loaded);
+    ctx = fractal_session_acquire_review(sid, &loaded);
     if (ctx == NULL) {
         SFS_INIT_ERROR(errbuf,
             "fractal_t2s_review: session acquire failed for id %llu", sid);
@@ -659,6 +677,17 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
         SFS_INIT_ERROR(errbuf,
             "fractal_t2s_review: response %zu bytes exceeds "
             "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+    /* The rc==0 dispatch contract says summary is non-NULL, but the
+     * scan/copy below would deref NULL on a contract-violating plugin
+     * -- a plugin bug gets a clean error, not a segfault. */
+    if (resp.summary == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: reasoning plugin returned a NULL summary "
+            "on a success status -- likely a plugin bug");
         fsql_ai_response_free(&resp);
         fractal_session_release(sid);
         *error = 1; return NULL;
@@ -709,11 +738,10 @@ t2s_skip_ws_comments(t2s_scan *sc)
     while (moved && sc->pos < sc->len) {
         moved = false;
         while (sc->pos < sc->len && isspace((unsigned char) sc->s[sc->pos])) { sc->pos++; moved = true; }
-        if (sc->pos + 1 < sc->len && sc->s[sc->pos] == '-' && sc->s[sc->pos + 1] == '-' &&
-            (sc->pos + 2 >= sc->len || isspace((unsigned char) sc->s[sc->pos + 2]))) {
-            while (sc->pos < sc->len && sc->s[sc->pos] != '\n') sc->pos++;
-            moved = true;
-        } else if (sc->pos < sc->len && sc->s[sc->pos] == '#') {
+        /* `--<ws>` and `#` line comments both run to end-of-line. */
+        if ((sc->pos + 1 < sc->len && sc->s[sc->pos] == '-' && sc->s[sc->pos + 1] == '-' &&
+             (sc->pos + 2 >= sc->len || isspace((unsigned char) sc->s[sc->pos + 2]))) ||
+            (sc->pos < sc->len && sc->s[sc->pos] == '#')) {
             while (sc->pos < sc->len && sc->s[sc->pos] != '\n') sc->pos++;
             moved = true;
         } else if (sc->pos + 1 < sc->len && sc->s[sc->pos] == '/' && sc->s[sc->pos + 1] == '*') {
@@ -777,7 +805,12 @@ t2s_skip_paren_balanced(t2s_scan *sc)
         char c = sc->s[sc->pos];
         if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(sc); continue; }
         if (c == '(') { depth++; sc->pos++; continue; }
-        if (c == ')') { depth--; sc->pos++; if (depth == 0) return true; continue; }
+        if (c == ')') {
+            depth--;
+            sc->pos++;
+            if (depth == 0) return true;
+            continue;
+        }
         sc->pos++;
     }
     return false;

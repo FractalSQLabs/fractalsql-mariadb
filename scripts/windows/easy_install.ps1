@@ -33,7 +33,7 @@
         SQL files (sql/install_udf.sql + sql/install_agents.sql), not
         CREATE EXTENSION -- no catalog-version/staleness concept, since
         both scripts are unconditionally idempotent.
-      - Verification functions are fractalsql_edition()/fractalsql_version()
+      - Verification functions are fractal_edition()/fractal_version()
         (the fractalsql_ prefix, see sql/install_udf.sql).
 
     No telemetry. This script never reports usage, provider choice, or
@@ -380,7 +380,7 @@ function Test-Installed {
 }
 
 # --- Phase B: install the package (default-on) ------------------------
-function Install-Package {
+function Install-MsiPackage {
     param($Target)
     if (Test-Installed) { return }
     if ($NoInstall) {
@@ -471,8 +471,10 @@ function Set-ReasoningEnvAndRestart {
     if ($doRestart) { $elevatedCmd += "; Restart-Service -Name '$ServiceName' -Force" }
 
     if (Test-IsAdmin) {
+        # Already elevated: run the cmdlets directly.
         try {
-            Invoke-Expression $elevatedCmd
+            Set-ItemProperty -Path $regPath -Name Environment -Value ([string[]]$regValues) -Type MultiString
+            if ($doRestart) { Restart-Service -Name $ServiceName -Force }
         } catch {
             Write-Warn2 "Could not write the service environment ($($_.Exception.Message)). Set those values by hand under $regPath and restart $ServiceName yourself."
             return $false
@@ -571,7 +573,7 @@ function Invoke-Wizard {
             }
         }
         'skip' {
-            Write-Step "Skipping reasoning config. Search functions like fractal_search and fractal_explore work with no model."
+            Write-Step "Skipping reasoning config. Search functions like fractal_search and fractal_search_explore work with no model."
         }
     }
 
@@ -590,9 +592,9 @@ function Invoke-Wizard {
 
     Write-Step "Registering UDFs + agent procedures..."
     $already = ''
-    try { $already = Invoke-Mariadb $bin $mdbPort @("SELECT 1 FROM mysql.func WHERE name='fractalsql_edition';") } catch {}
+    try { $already = Invoke-Mariadb $bin $mdbPort @("SELECT 1 FROM mysql.func WHERE name='fractal_edition';") } catch { $already = '' }
     if ($already -and -not $ForceReinstall) {
-        if (-not (Confirm-Step "fractalsql_edition() is already registered. Re-register UDFs/procedures against the currently staged plugin file?")) {
+        if (-not (Confirm-Step "fractal_edition() is already registered. Re-register UDFs/procedures against the currently staged plugin file?")) {
             Write-Die "Nothing to do. Re-run with -ForceReinstall to skip this pause."
         }
     }
@@ -615,9 +617,9 @@ function Invoke-Wizard {
     }
 
     if (-not $DryRun) {
-        $ed = Invoke-Mariadb $bin $mdbPort @('SELECT fractalsql_edition();') -Db $Database
-        $ver = Invoke-Mariadb $bin $mdbPort @('SELECT fractalsql_version();') -Db $Database
-        Write-Ok "fractalsql_edition() = $ed, fractalsql_version() = $ver"
+        $ed = Invoke-Mariadb $bin $mdbPort @('SELECT fractal_edition();') -Db $Database
+        $ver = Invoke-Mariadb $bin $mdbPort @('SELECT fractal_version();') -Db $Database
+        Write-Ok "fractal_edition() = $ed, fractal_version() = $ver"
         if ($ver -ne $Version) {
             Write-Warn2 "That's not $Version, the version this script expected. The installed fractalsql.dll itself is out of date. Reinstall the current .msi from https://github.com/$Repo/releases over this install to actually update it, then re-run this script."
         }
@@ -655,10 +657,12 @@ function Invoke-Uninstall {
             Write-Step "(-DryRun: not actually resetting)"
         } else {
             $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
-            $elevatedCmd = "Remove-ItemProperty -Path '$regPath' -Name Environment -ErrorAction SilentlyContinue; Restart-Service -Name '$ServiceName' -Force"
             if (Test-IsAdmin) {
-                Invoke-Expression $elevatedCmd
+                # Already elevated: run the cmdlets directly.
+                Remove-ItemProperty -Path $regPath -Name Environment -ErrorAction SilentlyContinue
+                Restart-Service -Name $ServiceName -Force
             } elseif ([Environment]::UserInteractive) {
+                $elevatedCmd = "Remove-ItemProperty -Path '$regPath' -Name Environment -ErrorAction SilentlyContinue; Restart-Service -Name '$ServiceName' -Force"
                 Start-Process powershell.exe -Verb RunAs -Wait -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $elevatedCmd) | Out-Null
             } else {
                 Write-Warn2 "Skipping: needs administrator access. Remove the Environment value under $regPath and restart $ServiceName by hand."
@@ -694,11 +698,11 @@ if ($Uninstall) {
 }
 
 # Resolve-PluginDir needs a live connection (SELECT @@plugin_dir), so the
-# root password has to be in hand first -- both ahead of Install-Package,
+# root password has to be in hand first -- both ahead of Install-MsiPackage,
 # which itself depends on $script:PluginDir via Test-Installed.
 Resolve-RootPassword
 Resolve-PluginDir $target
 Write-Step "Plugin directory (live @@plugin_dir): $script:PluginDir"
 
-Install-Package $target
+Install-MsiPackage $target
 Invoke-Wizard $target

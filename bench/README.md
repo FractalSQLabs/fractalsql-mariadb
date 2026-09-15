@@ -5,7 +5,7 @@
 # FractalSQL benchmark: native VECTOR(n) index vs Scout Mode
 
 Head-to-head comparison of MariaDB's own built-in `VECTOR(n)` ANN index
-against FractalSQL's `fractal_explore` (Scout Mode, `walk=0`). Measures
+against FractalSQL's `fractal_search_explore` (Scout Mode, `walk=0`). Measures
 search latency and island recall on a synthetic Gaussian-cluster dataset.
 This is a research/methodology comparison, distinct from
 [`bench/tester/`](tester/)'s raw `fractal_search()` latency-percentile
@@ -29,7 +29,7 @@ pip install -r bench/requirements.txt
 mariadb -uroot -p -e "CREATE DATABASE fractalsql_bench;"
 ```
 
-`fractal_explore`/`fractal_search` (used by `head_to_head.py`) are UDFs,
+`fractal_search_explore`/`fractal_search` (used by `head_to_head.py`) are UDFs,
 registered globally by `sql/install_udf.sql` and callable from any
 database once installed anywhere. `fractal_search_trajectory` (used by
 `vector_type_head_to_head.py`'s search-latency arm) is a stored
@@ -68,7 +68,7 @@ dim=128), not a hand-written estimate:
 ```
 Benchmark: 5000 stored vectors, 50 clusters, dim=128
   Native VECTOR(n) index: available, LIMIT 50
-  Scout (fractal_explore): population=50, iterations=8, mdn=2, walk=0.0 (brute-force relevance scan + MMR)
+  Scout (fractal_search_explore): population=50, iterations=8, mdn=2, walk=0.0 (brute-force relevance scan + MMR)
 
 qi  anchor      |     Native ms   Native recall  |     Scout ms   Scout recall
 --------------------------------------------------------------------------------
@@ -94,7 +94,7 @@ different algorithms solving different problems.
 
 `data_gen.py` defaults to **5000 rows, dim=128**, while a large-corpus ANN
 benchmark would default to 100,000 rows, dim=768. This is not a smaller-is-easier choice,
-it's architectural: `fractal_explore()` (Scout Mode) takes its **entire**
+it's architectural: `fractal_search_explore()` (Scout Mode) takes its **entire**
 corpus as one client-supplied inline string argument on every call. MariaDB's
 C UDF ABI has no server-side table access and no table-returning UDFs at all
 (see `sql/install_udf.sql`'s own "Scout Mode" comment), so there is no way
@@ -115,9 +115,13 @@ either.
 ## Scaling notes
 
 Scout Mode's brute-force fitness (`min over corpus of ||candidate - v||^2`)
-is O(N x D) per evaluation, and one `head_to_head.py` run makes
-population_size x iterations evaluations per query (50 x 8 = 400 by
-default). Real measured output from `bench/scale_sweep.sh 127.0.0.1
+is O(N x D) per evaluation. The SFS core evaluates fitness well beyond a
+flat population_size x iterations product (diffusion offspring plus
+per-generation update passes each add more), so a population=50,
+iterations=8 run makes on the order of ~2500 evaluations per query, not
+400 -- see `fractalsql-postgresql/bench/README.md`'s "Scaling notes" for
+the same ~2500 figure at the same defaults, same underlying engine.
+Real measured output from `bench/scale_sweep.sh 127.0.0.1
 3306 <password>` against this repo's own Docker demo container (dim=128,
 5 queries averaged per N, every row measured, none extrapolated):
 

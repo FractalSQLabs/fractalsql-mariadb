@@ -21,7 +21,7 @@
 #include <time.h>
 
 #if defined(_WIN32)
-#  include <windows.h>
+#  include <Windows.h>
 #else
 #  include <pthread.h>
 #endif
@@ -53,6 +53,10 @@ typedef struct fsql_session_entry {
      * share reason_ctx or embed_ctx. */
     fsql_ctx                   *t2s_ctx;
     bool                         t2s_loaded;
+    /* Fifth slot, for fractal_t2s_review(). See fractalsql_session.h's
+     * declaration comment for why this can't share reason_ctx. */
+    fsql_ctx                   *review_ctx;
+    bool                         review_loaded;
     int                          refcount;
     /* Exclusive-use pin for the main `ctx` slot (see
      * fractal_session_acquire_exclusive). The core's fsql_search_ptr is
@@ -129,10 +133,16 @@ bucket_unlink(fsql_session_entry *e)
 static void
 lru_unlink(fsql_session_entry *e)
 {
-    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
-    else              g_lru_head = e->lru_next;
-    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
-    else              g_lru_tail = e->lru_prev;
+    if (e->lru_prev) {
+        e->lru_prev->lru_next = e->lru_next;
+    } else {
+        g_lru_head = e->lru_next;
+    }
+    if (e->lru_next) {
+        e->lru_next->lru_prev = e->lru_prev;
+    } else {
+        g_lru_tail = e->lru_prev;
+    }
     e->lru_prev = e->lru_next = NULL;
 }
 
@@ -155,6 +165,7 @@ entry_destroy(fsql_session_entry *e)
     if (e->reason_ctx) fsql_free(e->reason_ctx);
     if (e->embed_ctx)  fsql_free(e->embed_ctx);
     if (e->t2s_ctx)    fsql_free(e->t2s_ctx);
+    if (e->review_ctx) fsql_free(e->review_ctx);
     free(e);
     g_entry_count--;
 }
@@ -318,7 +329,7 @@ fractal_session_acquire_reason(unsigned long long session_id, bool *out_loaded)
 }
 
 /* Exclusive-use acquire of session_id's Diversify/search ctx, for
- * fractal_search()/fractal_explore() (see fractalsql.c). Same
+ * fractal_search()/fractal_search_explore() (see fractalsql.c). Same
  * acquire/create/refcount/LRU contract as fractal_session_acquire, plus:
  *   1. The entry is marked busy for the duration of the call, and
  *      release_exclusive clears it. Busy entries are never destroyed by
@@ -437,6 +448,33 @@ fractal_session_acquire_t2s(unsigned long long session_id, bool *out_loaded)
     return ctx;
 }
 
+/* Same as fractal_session_acquire_reason but for fractal_t2s_review()'s
+ * ctx slot. See fsql_session_entry's field comment for why this is a
+ * separate slot rather than sharing reason_ctx. */
+fsql_ctx *
+fractal_session_acquire_review(unsigned long long session_id, bool *out_loaded)
+{
+    session_lock();
+    sweep_stale(FSQL_SESSION_SWEEP_SCAN_LIMIT);
+
+    fsql_session_entry *e = find_or_create_entry_locked(session_id);
+    if (e == NULL) { session_unlock(); return NULL; }
+
+    if (e->review_ctx == NULL) {
+        e->review_ctx = fsql_new_sovereign(NULL, NULL);
+        if (e->review_ctx == NULL) {
+            if (e->refcount > 0) e->refcount--;
+            session_unlock();
+            return NULL;
+        }
+    }
+
+    fsql_ctx *ctx = e->review_ctx;
+    if (out_loaded) *out_loaded = e->review_loaded;
+    session_unlock();
+    return ctx;
+}
+
 /* Mark session_id's reason/embed ctx as having a reasoning plugin
  * successfully attached. Called by fractalsql_cognition.c right
  * after a successful fsql_load_reasoning, under ITS OWN load-
@@ -470,6 +508,15 @@ fractal_session_mark_t2s_loaded(unsigned long long session_id)
     session_lock();
     fsql_session_entry *e = find_entry(session_id);
     if (e) e->t2s_loaded = true;
+    session_unlock();
+}
+
+void
+fractal_session_mark_review_loaded(unsigned long long session_id)
+{
+    session_lock();
+    fsql_session_entry *e = find_entry(session_id);
+    if (e) e->review_loaded = true;
     session_unlock();
 }
 

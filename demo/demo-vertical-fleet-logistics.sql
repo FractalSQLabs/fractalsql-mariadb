@@ -24,7 +24,7 @@
 --     vehicle 5's UPDATE relocating its row, or a cohort filter's scan
 --     order diverging from id order, has no effect on doc_id, since
 --     doc_id is always the row's own primary key.
---   - fractal_explore(corpus, query, params) takes the corpus inline
+--   - fractal_search_explore(corpus, query, params) takes the corpus inline
 --     as a JSON array rather than as a table/column reference (see
 --     demo-business-intelligence.sql Section 6).
 --   - There is no fixed-width vector column type here with a
@@ -61,7 +61,7 @@
 -- limitation, not a silent omission.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 40 delivery vehicles across 4 routes, each with a BASELINE route
@@ -123,13 +123,13 @@ UPDATE vfl_vehicles
 -- depot coverage planning ("what KINDS of routes are actually running
 -- today") without scanning all 40 by hand.
 -- ------------------------------------------------------------------
--- === 2. fractal_explore: diverse route/zone clustering ===
+-- === 2. fractal_search_explore: diverse route/zone clustering ===
 -- --- Preset: fractal_agent_recommend_diverse (raw explore form preserved below) ---
 
 -- Blueprint (raw primitive): returns a diverse representative set of
--- route/zone-cluster embeddings across the fleet. fractal_explore
+-- route/zone-cluster embeddings across the fleet. fractal_search_explore
 -- takes its corpus inline (a JSON array), not a table/column pair.
--- SELECT fractal_explore(
+-- SELECT fractal_search_explore(
 --     (SELECT JSON_ARRAYAGG(current_pos) FROM vfl_vehicles), '[0,0,0,0]',
 --     '{"population_size": 6, "iterations": 8, "walk": 0}');
 

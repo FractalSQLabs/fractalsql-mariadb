@@ -50,7 +50,7 @@
 -- comments, not executed statements.
 
 -- === 0. Sanity check: extension + edition loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 50 edge-compute nodes with a 5-dim resource-capability vector:
@@ -64,7 +64,7 @@ DROP TABLE IF EXISTS vse_nodes;
 -- convention (see sql/install_udf.sql's "REPRESENTATION" note) is a
 -- JSON-array-of-numbers string holding a fixed-width 5-dim
 -- resource-capability vector, without a distinct column type for it.
--- fractal_search_telemetry/fractal_explore below already read a plain
+-- fractal_search_telemetry/fractal_search_explore below already read a plain
 -- JSON column transparently.
 CREATE TABLE vse_nodes (id INT AUTO_INCREMENT PRIMARY KEY, node_name VARCHAR(32), capability JSON);
 
@@ -160,13 +160,13 @@ SELECT JSON_VALUE(@r, '$.assigned_node') AS assigned_node,
 -- --- Preset: fractal_agent_recommend_diverse (raw explore form preserved below) ---
 
 -- Blueprint (raw primitive): returns a diverse representative set of the
--- fleet's distinct capability-profile embeddings. fractal_explore
+-- fleet's distinct capability-profile embeddings. fractal_search_explore
 -- (corpus, query, params) takes the corpus inline rather than as a
 -- table/column reference, so the corpus has to be assembled first,
 -- same approach as demo-business-intelligence.sql's own Scout
 -- Discovery section.
 -- SET @corpus = (SELECT JSON_ARRAYAGG(capability) FROM vse_nodes);
--- SELECT fractal_explore(@corpus, '[0,0,0,0,0]',
+-- SELECT fractal_search_explore(@corpus, '[0,0,0,0,0]',
 --     '{"population_size": 6, "iterations": 8, "walk": 0}') AS p;
 
 -- Productized preset: the shipped engine returns real node ids

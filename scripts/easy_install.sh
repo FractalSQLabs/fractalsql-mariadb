@@ -55,7 +55,7 @@
 #     to detect, since both scripts are unconditionally idempotent
 #     (DROP ... IF EXISTS then CREATE). UDFs are also server-global, not
 #     per-database.
-#   - Verification functions are fractalsql_edition()/fractalsql_version()
+#   - Verification functions are fractal_edition()/fractal_version()
 #     (the fractalsql_ prefix; agent functions use fractal_ instead, see
 #     sql/install_udf.sql).
 #
@@ -577,7 +577,7 @@ phase_c_wizard() {
             fi
             ;;
         skip)
-            log "Skipping reasoning config. Search functions like fractal_search and fractal_explore work with no model."
+            log "Skipping reasoning config. Search functions like fractal_search and fractal_search_explore work with no model."
             ;;
         *) die "unknown --provider '${PROVIDER}' (expected ollama, openai-compatible, or skip)" ;;
     esac
@@ -601,9 +601,9 @@ phase_c_wizard() {
 
     log "Registering UDFs + agent procedures..."
     local already=0
-    "${MDB_AS[@]}" -Nse "SELECT 1 FROM mysql.func WHERE name='fractalsql_edition';" 2>/dev/null | grep -q 1 && already=1
+    "${MDB_AS[@]}" -Nse "SELECT 1 FROM mysql.func WHERE name='fractal_edition';" 2>/dev/null | grep -q 1 && already=1
     if [[ "${already}" -eq 1 && "${FORCE_REINSTALL}" -ne 1 ]]; then
-        confirm "fractalsql_edition() is already registered. Re-register UDFs/procedures against the currently staged plugin file?" \
+        confirm "fractal_edition() is already registered. Re-register UDFs/procedures against the currently staged plugin file?" \
             || die "Nothing to do. Re-run with --force-reinstall to skip this pause."
     fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -621,9 +621,9 @@ phase_c_wizard() {
 
     if [[ "${DRY_RUN}" -ne 1 ]]; then
         local ed ver
-        ed="$("${MDB_AS[@]}" -Nse 'SELECT fractalsql_edition();')"
-        ver="$("${MDB_AS[@]}" -Nse 'SELECT fractalsql_version();')"
-        ok "fractalsql_edition() = ${ed}, fractalsql_version() = ${ver}"
+        ed="$("${MDB_AS[@]}" -Nse 'SELECT fractal_edition();')"
+        ver="$("${MDB_AS[@]}" -Nse 'SELECT fractal_version();')"
+        ok "fractal_edition() = ${ed}, fractal_version() = ${ver}"
         if [[ "${ver}" != "${INSTALL_VERSION}" ]]; then
             warn "That's not ${INSTALL_VERSION}, the version this script expected. The installed .so itself is out of date. Reinstall the current package from https://github.com/${REPO}/releases over this install to actually update the plugin file, then re-run this script."
         fi

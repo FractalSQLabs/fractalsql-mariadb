@@ -66,7 +66,7 @@
 #  define FRACTAL_EXPORT
 #endif
 
-/* Single source of truth for the shipped version. fractalsql_version()
+/* Single source of truth for the shipped version. fractal_version()
  * below returns this, and scripts/package.sh derives the .deb/.rpm
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
@@ -554,7 +554,7 @@ fractal_search(UDF_INIT *initid, UDF_ARGS *args, char *result,
 }
 
 /* ------------------------------------------------------------------ */
-/* UDF triad: fractal_explore (Scout Mode)                            */
+/* UDF triad: fractal_search_explore (Scout Mode)                            */
 /*                                                                    */
 /* Sniper (fractal_search) returns best_point + the top-k nearest     */
 /* stored vectors. Scout disperses the SFS population across distinct */
@@ -565,11 +565,11 @@ fractal_search(UDF_INIT *initid, UDF_ARGS *args, char *result,
 /* ------------------------------------------------------------------ */
 
 FRACTAL_EXPORT bool
-fractal_explore_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+fractal_search_explore_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
     if (args->arg_count != 3) {
         SFS_INIT_ERROR(message,
-            "fractal_explore(corpus_csv, query_csv, params): "
+            "fractal_search_explore(corpus_csv, query_csv, params): "
             "expected 3 arguments, got %u", args->arg_count);
         return true;
     }
@@ -597,7 +597,7 @@ fractal_explore_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 }
 
 FRACTAL_EXPORT void
-fractal_explore_deinit(UDF_INIT *initid)
+fractal_search_explore_deinit(UDF_INIT *initid)
 {
     sfs_ctx *c = (sfs_ctx *) initid->ptr;
     if (c == NULL) return;
@@ -608,7 +608,7 @@ fractal_explore_deinit(UDF_INIT *initid)
 }
 
 FRACTAL_EXPORT char *
-fractal_explore(UDF_INIT *initid, UDF_ARGS *args, char *result,
+fractal_search_explore(UDF_INIT *initid, UDF_ARGS *args, char *result,
                 unsigned long *length, char *is_null, char *error)
 {
     sfs_ctx *c = (sfs_ctx *) initid->ptr;
@@ -1090,10 +1090,9 @@ fractal_optimize_portfolio(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     seed    = (long long) json_get_int(params_s, params_len, "seed", 0);
     use_obl = json_get_bool(params_s, params_len, "use_obl", false);
-    if (json_get_str(params_s, params_len, "diffusion_mode", mode_buf, sizeof mode_buf)) {
-        if (!parse_diffusion_mode(mode_buf, &diffusion_mode, errbuf)) {
-            free(mu); free(cov); *error = 1; return NULL;
-        }
+    if (json_get_str(params_s, params_len, "diffusion_mode", mode_buf, sizeof mode_buf) &&
+        !parse_diffusion_mode(mode_buf, &diffusion_mode, errbuf)) {
+        free(mu); free(cov); *error = 1; return NULL;
     }
 
     weights = malloc(n_assets * sizeof(double));
@@ -1511,14 +1510,14 @@ fractal_morphological_complexity(UDF_INIT *initid, UDF_ARGS *args, char *result,
 }
 
 /* ------------------------------------------------------------------ */
-/* UDF triad: fractalsql_edition                                      */
+/* UDF triad: fractal_edition                                      */
 /* ------------------------------------------------------------------ */
 
 FRACTAL_EXPORT bool
-fractalsql_edition_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+fractal_edition_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
     if (args->arg_count != 0) {
-        SFS_INIT_ERROR(message, "fractalsql_edition(): expected 0 arguments");
+        SFS_INIT_ERROR(message, "fractal_edition(): expected 0 arguments");
         return true;
     }
     initid->maybe_null = 0;
@@ -1527,13 +1526,13 @@ fractalsql_edition_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 }
 
 FRACTAL_EXPORT void
-fractalsql_edition_deinit(UDF_INIT *initid)
+fractal_edition_deinit(UDF_INIT *initid)
 {
     (void) initid;
 }
 
 FRACTAL_EXPORT char *
-fractalsql_edition(UDF_INIT *initid, UDF_ARGS *args, char *result,
+fractal_edition(UDF_INIT *initid, UDF_ARGS *args, char *result,
                    unsigned long *length, char *is_null, char *error)
 {
     static const char kEdition[] = "Community";
@@ -1545,14 +1544,14 @@ fractalsql_edition(UDF_INIT *initid, UDF_ARGS *args, char *result,
 }
 
 /* ------------------------------------------------------------------ */
-/* UDF triad: fractalsql_version                                      */
+/* UDF triad: fractal_version                                      */
 /* ------------------------------------------------------------------ */
 
 FRACTAL_EXPORT bool
-fractalsql_version_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+fractal_version_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
     if (args->arg_count != 0) {
-        SFS_INIT_ERROR(message, "fractalsql_version(): expected 0 arguments");
+        SFS_INIT_ERROR(message, "fractal_version(): expected 0 arguments");
         return true;
     }
     initid->maybe_null = 0;
@@ -1561,13 +1560,13 @@ fractalsql_version_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 }
 
 FRACTAL_EXPORT void
-fractalsql_version_deinit(UDF_INIT *initid)
+fractal_version_deinit(UDF_INIT *initid)
 {
     (void) initid;
 }
 
 FRACTAL_EXPORT char *
-fractalsql_version(UDF_INIT *initid, UDF_ARGS *args, char *result,
+fractal_version(UDF_INIT *initid, UDF_ARGS *args, char *result,
                    unsigned long *length, char *is_null, char *error)
 {
     static const char kVersion[] = FSQL_VERSION;
@@ -1592,7 +1591,7 @@ fractalsql_version(UDF_INIT *initid, UDF_ARGS *args, char *result,
 /* connection-scoped registry in fractalsql_session.c instead. Pass    */
 /* CONNECTION_ID() by convention (sql/install_udf.sql documents        */
 /* this). fractal_search /                                             */
-/* fractal_explore pick up the same session's ctx via an optional      */
+/* fractal_search_explore pick up the same session's ctx via an optional      */
 /* "session_id" key in their own params JSON, see those functions'     */
 /* header comments.                                                    */
 /* ------------------------------------------------------------------ */

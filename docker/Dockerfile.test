@@ -33,16 +33,16 @@ USER root
 # mock_llm.py, the reasoning-tier gates' deterministic HTTP stub.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        build-essential \
         binutils \
+        build-essential \
         file \
+        jq \
+        libcurl4 \
         libmariadb-dev \
         libmariadb-dev-compat \
-        libcurl4 \
-        python3 \
-        jq \
-        mariadb-plugin-connect \
         libssl-dev \
+        mariadb-plugin-connect \
+        python3 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -58,5 +58,5 @@ ENV MDB_MAJOR=${MDB_MAJOR}
 ENV FSQL_TEST_TIMEOUT_MULT=${FSQL_TEST_TIMEOUT_MULT}
 
 RUN chmod +x build_test.sh \
- && ./build_test.sh --mdb ${MDB_MAJOR} \
-      $(case "${FSQL_SAN_MODE}" in asan) echo --asan ;; ubsan) echo --ubsan ;; esac)
+ && ./build_test.sh --mdb "${MDB_MAJOR}" \
+      "$(case "${FSQL_SAN_MODE}" in asan) echo --asan ;; ubsan) echo --ubsan ;; esac)"

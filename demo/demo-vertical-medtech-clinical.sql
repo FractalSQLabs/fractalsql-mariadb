@@ -52,7 +52,7 @@
 -- executed statements.
 
 -- === 0. Sanity check: extension loaded? ===
-SELECT fractalsql_edition(), fractalsql_version();
+SELECT fractal_edition(), fractal_version();
 
 -- ------------------------------------------------------------------
 -- 1. 40 synthetic patients with a demographic/condition cohort and a
