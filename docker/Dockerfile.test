@@ -58,5 +58,8 @@ ENV MDB_MAJOR=${MDB_MAJOR}
 ENV FSQL_TEST_TIMEOUT_MULT=${FSQL_TEST_TIMEOUT_MULT}
 
 RUN chmod +x build_test.sh \
- && ./build_test.sh --mdb "${MDB_MAJOR}" \
-      "$(case "${FSQL_SAN_MODE}" in asan) echo --asan ;; ubsan) echo --ubsan ;; esac)"
+ && case "${FSQL_SAN_MODE}" in \
+      asan)  ./build_test.sh --mdb "${MDB_MAJOR}" --asan ;; \
+      ubsan) ./build_test.sh --mdb "${MDB_MAJOR}" --ubsan ;; \
+      *)     ./build_test.sh --mdb "${MDB_MAJOR}" ;; \
+    esac

@@ -1743,7 +1743,9 @@ gate_20_analytics() {
   echo "$knn" | grep -q '"doc_id": *2' \
     && pass "20 analytics: fractal_mine_topology_negatives ranks the nearest stored vector (doc_id=2) first" \
     || fail "20 analytics: fractal_mine_topology_negatives='$knn'"
-  [ "$(echo "$knn" | grep -o '"doc_id"' | wc -l)" = "2" ] \
+  # Arithmetic coercion: BSD wc (macOS) pads pipe counts with leading
+  # spaces; $(( )) strips them so GNU and BSD agree.
+  [ "$(( $(echo "$knn" | grep -o '"doc_id"' | wc -l) ))" = "2" ] \
     && pass "20 analytics: fractal_mine_topology_negatives honors k=2 (returned exactly 2 rows)" \
     || fail "20 analytics: expected 2 result rows, got: $knn"
 
