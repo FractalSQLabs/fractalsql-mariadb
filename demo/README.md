@@ -212,14 +212,16 @@ to compare a different model, then re-run Parts 1–4 from scratch.
 
 ## Industry vertical demos
 
-Eleven runnable walkthroughs — eight **industry verticals** and three
+Thirteen runnable walkthroughs — ten **industry verticals** and three
 **agentic verticals** — each with its own synthetic dataset and its own
 subset of the function surface chosen for genuine domain fit, not forced
 coverage. Every one ends with a `fractal_reason()` narrative call over
 real computed results, same closing pattern as `demo.sql`. Same
 prerequisites as `demo.sql` (UDFs registered; the final reasoning
 section in each needs [reasoning configured](../docs/reasoning-setup.md)
-— every earlier section runs without it). All eleven are also wired
+— every earlier section runs without it; the two newest kits,
+Biotech & Genomics and Edge Swarm, need no reasoning at all — see their
+entries below). All thirteen are also wired
 into the Docker demo — see
 [the Learning Path](../docs/docker-demo.md#the-learning-path).
 Four (MedTech, Maritime, Fleet, Cybersecurity) store their vector
@@ -309,6 +311,30 @@ mariadb -u root -p <your_database> < demo/demo-vertical-quant-finance.sql
   `fractal_search_trajectory`, and connection-rate regime-change
   detection via `fractal_dimension_dfa`/`fractal_dimension_drift` on a
   beaconing-onset series.
+- **[demo-vertical-biotech-genomics.sql](demo-vertical-biotech-genomics.sql)** —
+  Biotech & Genomics (structural bioinformatics / single-cell
+  transcriptomics). Two showcases for the newest primitives:
+  `fractal_tda_persistence_diagram` over a PCA/UMAP-reduced-style point
+  cloud standing in for a cell-cycle trajectory that loops back on
+  itself (G1 → S → G2/M → G1) — topological data analysis is a real,
+  published technique for detecting exactly this kind of cyclic
+  structure in single-cell data — and `fractal_vector_lp_distance`
+  comparing synthetic gene-expression profiles under L1 (Manhattan,
+  the more standard genomics choice) vs the extension's default L2,
+  with the demo narrative explaining *why* they disagree. Needs no
+  reasoning at all. Carries the TDA scope note (betti1 is the 1-skeleton
+  cycle rank, not full homology) from the install script verbatim.
+- **[demo-vertical-agentic-edge-swarm.sql](demo-vertical-agentic-edge-swarm.sql)** —
+  Agentic Edge Swarms (many small autonomous agents coordinating under
+  tight memory/battery/bandwidth budgets). Three showcases for the same
+  operating envelope: `fractal_vector_quantize_int8`/`_binary` +
+  `fractal_vector_hamming_distance` compressing a swarm agent's local
+  observation memory 4x/32x, `fractal_state_fingerprint` +
+  `fractal_cycle_detect` catching an agent stuck in a "cognitive
+  wobble" period-2 loop with O(1) memory per step, and
+  `fractal_optimize_subset` doing battery-constrained task routing.
+  Despite the "agentic" name it exercises the primitives directly, not
+  the agent procedures — needs no reasoning at all.
 
 One genuine architectural constraint applies to two of the above:
 MariaDB's `information_schema` has zero visibility into `TEMPORARY`

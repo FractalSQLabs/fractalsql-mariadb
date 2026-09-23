@@ -26,6 +26,12 @@ DROP FUNCTION IF EXISTS fractal_optimize_portfolio;
 DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal;
 DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal_ex;
 DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal_pareto;
+DROP FUNCTION IF EXISTS fractal_change_point_detect;
+DROP FUNCTION IF EXISTS fractal_periodogram;
+DROP FUNCTION IF EXISTS fractal_state_fingerprint;
+DROP FUNCTION IF EXISTS fractal_cycle_detect;
+DROP FUNCTION IF EXISTS fractal_tda_persistence_diagram;
+DROP FUNCTION IF EXISTS fractal_optimize_subset;
 DROP FUNCTION IF EXISTS fractal_vascular_network;
 DROP FUNCTION IF EXISTS fractal_cortical_folding;
 DROP FUNCTION IF EXISTS fractal_nerve_plexus_metric;
@@ -49,6 +55,10 @@ DROP FUNCTION IF EXISTS fractal_vector_cosine_similarity;
 DROP FUNCTION IF EXISTS fractal_vector_negative_inner_product;
 DROP FUNCTION IF EXISTS fractal_vector_from_float8_array;
 DROP FUNCTION IF EXISTS fractal_vector_to_float8_array;
+DROP FUNCTION IF EXISTS fractal_vector_lp_distance;
+DROP FUNCTION IF EXISTS fractal_vector_quantize_int8;
+DROP FUNCTION IF EXISTS fractal_vector_quantize_binary;
+DROP FUNCTION IF EXISTS fractal_vector_hamming_distance;
 DROP FUNCTION IF EXISTS fractal_reason;
 DROP FUNCTION IF EXISTS fractal_embed;
 DROP FUNCTION IF EXISTS fractal_t2s_config;
@@ -98,7 +108,7 @@ CREATE FUNCTION fractal_search_explore   RETURNS STRING SONAME 'fractalsql.so';
 -- fractal_edition() -> 'Community'
 CREATE FUNCTION fractal_edition RETURNS STRING SONAME 'fractalsql.so';
 
--- fractal_version() -> '2.0.3'
+-- fractal_version() -> '2.0.7'
 CREATE FUNCTION fractal_version RETURNS STRING SONAME 'fractalsql.so';
 
 -- ---------------------------------------------------------------------
@@ -142,6 +152,70 @@ CREATE FUNCTION fractal_dimension_drift RETURNS STRING SONAME 'fractalsql.so';
 -- Pass '{}' for defaults. mu: n_assets expected returns. cov: flat,
 -- row-major n_assets x n_assets covariance matrix.
 CREATE FUNCTION fractal_optimize_portfolio RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_change_point_detect(series_csv, window, threshold, max_points)
+--   -> JSON STRING array of ascending 0-indexed boundary positions,
+-- e.g. "[12,47]". Sliding two-sample test over adjacent windows of
+-- `window` samples; flags a boundary where the mean differs by more
+-- than `threshold` pooled-stddev units or the variance ratio exceeds
+-- threshold^2. Requires n >= 2*window, window >= 1, threshold > 0,
+-- max_points >= 1.
+CREATE FUNCTION fractal_change_point_detect RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_periodogram(series_csv, max_peaks) -> JSON STRING
+-- {"freqs":[..],"power":[..]}. Classical periodogram (exact direct DFT,
+-- no FFT dependency), returning only the max_peaks highest-power bins,
+-- sorted descending. out_freqs[i] is cycles/sample; 1/out_freqs[i] is
+-- samples/cycle. Requires n >= 4, max_peaks >= 1.
+CREATE FUNCTION fractal_periodogram RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_state_fingerprint(vec_csv, n_bits, seed) -> JSON STRING array
+-- of the (n_bits+7)/8 output bytes, e.g. "[145,3,201]". Random-
+-- hyperplane SimHash (Charikar 2002): projects a state vector onto
+-- n_bits random hyperplanes (deterministic from seed), packs the sign
+-- of each projection MSB-first. Nearly-identical states collapse to
+-- the same or a low-Hamming-distance fingerprint, unlike an exact hash.
+-- Feed the output straight into fractal_cycle_detect below.
+CREATE FUNCTION fractal_state_fingerprint RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_cycle_detect(fingerprints_csv, n_bytes, hamming_threshold)
+--   -> JSON STRING {"detected":true,"cycle_len":N,"at_index":I} or
+-- {"detected":false}. Single-call wrapper over streaming Brent's-
+-- algorithm cycle detection (Brent 1980): fingerprints_csv is a flat
+-- array of concatenated fingerprint bytes (n_fingerprints * n_bytes
+-- long, e.g. successive fractal_state_fingerprint outputs
+-- concatenated), fed one n_bytes-byte chunk at a time; returns the
+-- FIRST cycle found (fingerprints within hamming_threshold of a prior
+-- checkpoint count as the same state), or {"detected":false} if the
+-- stream never closed one.
+CREATE FUNCTION fractal_cycle_detect RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_tda_persistence_diagram(points_csv, dim, max_dim, max_thresh,
+--   max_h0_bars) -> JSON STRING {"h0_bars":[{"birth":..,"death":..},..],
+-- "n_h0_bars":N,"betti1":N_or_null}. Size-capped (<=512 points) 0-dim
+-- persistence diagram plus a graph-theoretic Betti-1 count over a point
+-- cloud's Vietoris-Rips filtration (Edelsbrunner, Letscher & Zomorodian
+-- 2002). SCOPE NOTE: h0_bars is an EXACT, complete 0-dim persistence
+-- computation. betti1 (only computed when max_dim=1) is a real,
+-- correctly-computed, but DIFFERENT invariant than full simplicial H1:
+-- it is the bare 1-skeleton graph's cycle rank, which over-counts true
+-- H1 whenever a filled triangle exists in the data. A full TDA library
+-- (Ripser/GUDHI) computes true H1 via boundary-matrix reduction; this
+-- does not attempt that. points_csv: flat, row-major n_points x dim,
+-- 2 <= n_points <= 512. max_dim: 0 (h0_bars only) or 1 (also betti1).
+CREATE FUNCTION fractal_tda_persistence_diagram RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_optimize_subset(item_values_csv, upper_bounds_csv, k, params)
+--   -> JSON STRING {"score":..,"weights":[..]}. Generalizes
+-- fractal_optimize_portfolio's cardinality-constrained search with a
+-- hardcoded VALUE-WEIGHTED ALLOCATION objective: maximizes
+-- sum(weight[i] * item_value[i]) subject to per-item upper_bounds[i],
+-- an at-most-k-nonzero constraint, and weights summing to 1.0.
+-- upper_bounds_csv may be '' for the core default ([0,1] per item).
+-- Turnover-penalty rebalancing (prev_weights) is not exposed here --
+-- every call runs with it disabled. params (optional):
+-- {"seed": <int, default 0>}. Pass '{}' for defaults.
+CREATE FUNCTION fractal_optimize_subset RETURNS STRING SONAME 'fractalsql.so';
 
 -- fractal_optimize_portfolio_multimodal(mu_csv, cov_csv, k, n_restarts,
 --   overlap_threshold, quality_frac, seed) -> JSON STRING
@@ -399,6 +473,33 @@ CREATE FUNCTION fractal_vector_from_float8_array RETURNS STRING SONAME 'fractals
 
 -- fractal_vector_to_float8_array(vec) -> fractal_vector (see above)
 CREATE FUNCTION fractal_vector_to_float8_array RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_vector_lp_distance(a, b, p) -> DOUBLE
+-- (sum(|a[i]-b[i]|^p))^(1/p), p > 0. p == 2 matches
+-- fractal_vector_l2_distance mathematically but not bit-for-bit. Real
+-- caveat, not a stability one: for 0 < p < 1 this does not satisfy the
+-- triangle inequality (true of any correct Lp implementation, not
+-- specific to this one) -- ship as an explicit, separately-named
+-- function, never a silent replacement for the L2/cosine defaults.
+CREATE FUNCTION fractal_vector_lp_distance RETURNS REAL SONAME 'fractalsql.so';
+
+-- fractal_vector_quantize_int8(vec) -> JSON STRING
+-- {"scale":..,"values":[i1,i2,..]}. Per-vector symmetric int8
+-- quantization (4x compression); dequantize via
+-- v[i] ~= values[i] * scale.
+CREATE FUNCTION fractal_vector_quantize_int8 RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_vector_quantize_binary(vec) -> JSON STRING array of the
+-- (dim+7)/8 packed output bytes, e.g. "[145,3]". Binary (1-bit)
+-- quantization (32x compression), sign of v[i] packed MSB-first. Pairs
+-- with fractal_vector_hamming_distance for cheap candidate filtering.
+CREATE FUNCTION fractal_vector_quantize_binary RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_vector_hamming_distance(a_bytes, b_bytes) -> INTEGER
+-- Hamming distance between two binary-quantized vectors, as packed by
+-- fractal_vector_quantize_binary (JSON array of bytes). Requires equal
+-- byte length.
+CREATE FUNCTION fractal_vector_hamming_distance RETURNS INTEGER SONAME 'fractalsql.so';
 
 -- v2.0.0, Cognition tier
 --
@@ -671,7 +772,11 @@ BEGIN
     SET v_cfg          = fractal_t2s_config();
     SET v_max_attempts = JSON_VALUE(v_cfg, '$.max_attempts');
     SET v_allowed       = JSON_VALUE(v_cfg, '$.allowed_statements');
-    SET v_use_review    = (JSON_VALUE(v_cfg, '$.use_review') = 'true');
+    -- JSON_VALUE stringifies a JSON boolean as '1'/'0' on this server
+    -- family (JSON_EXTRACT preserves 'true'/'false'; JSON_VALUE does
+    -- not), so comparing against 'true' alone would read every
+    -- use_review=true configuration as false -- accept both spellings.
+    SET v_use_review    = (JSON_VALUE(v_cfg, '$.use_review') IN ('true', '1'));
 
     -- e.g. VERSION() = '10.11.10-MariaDB' becomes 'mariadb1011'. A plain UDF
     -- has no access to the connected server's version (see
@@ -966,10 +1071,9 @@ BEGIN
                 END IF;
                 SET v_row_count = @_fractalsql_sa_rowcount;
             ELSE
-                -- Subtransaction-equivalent safety net (fractalsql-postgresql
-                -- wraps this same auto_execute step in an SPI subtransaction;
-                -- MariaDB/InnoDB has no such implicit wrapper, but does
-                -- support SAVEPOINT/ROLLBACK TO SAVEPOINT here). SAVEPOINT
+                -- Subtransaction-equivalent safety net (MariaDB/InnoDB has
+                -- no implicit subtransaction wrapper around PREPARE/EXECUTE,
+                -- but does support SAVEPOINT/ROLLBACK TO SAVEPOINT here). SAVEPOINT
                 -- implicitly starts a transaction if none is active yet, so
                 -- this is safe under autocommit. Scoped to the mutating
                 -- (INSERT/UPDATE/...) branch only: the SELECT branch above
@@ -2134,18 +2238,14 @@ END$$
 -- ---------------------------------------------------------------------
 -- Named feature store (Community tier)
 --
--- fractal_store_morphology / fractal_mine_topology_negatives, matching
--- fractalsql-postgresql's own Community-tier feature store (see that
--- repo's src/fractalsql.c: implemented there via SPI against a plain
--- table, not a core-library primitive -- fsql_ledger_* is whole-ledger
--- admin plus two counters, not a per-item put/get). A plain table
+-- fractal_store_morphology / fractal_mine_topology_negatives: the
+-- Community-tier named feature store. A plain table
 -- holding one caller-supplied vector per doc_id, upserted by
 -- fractal_store_morphology and brute-force k-NN-scanned (squared
 -- Euclidean distance via fractal_vector_l2_squared, no index -- this
 -- table is expected to hold curated per-item features/negative
 -- examples, not a full corpus) by fractal_mine_topology_negatives.
--- Independent of core's ledger/repulsion mechanism, same as in
--- fractalsql-postgresql.
+-- Independent of core's ledger/repulsion mechanism.
 --
 -- Unlike the table-backed search compositions above, this table's name
 -- is fixed (not caller-supplied), so no dynamic SQL/PREPARE is needed
@@ -2187,8 +2287,7 @@ END$$
 -- Brute-force k-NN (squared-Euclidean distance, via
 -- fractal_vector_l2_squared) over fractalsql_feature_store: the k
 -- stored vectors closest to surrogate_vector, ascending by distance.
--- O(n) per call, no index -- same semantics as fractalsql-postgresql's
--- version. Result objects use the key "dist", the same convention as
+-- O(n) per call, no index. Result objects use the key "dist", the same convention as
 -- the table-backed search procedures above. p_k is an IN parameter
 -- referenced directly in LIMIT: MariaDB/MySQL SQL/PSM has always
 -- allowed a routine parameter (not an arbitrary expression) there.

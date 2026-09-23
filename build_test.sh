@@ -181,7 +181,28 @@
 #                        repeated calls in one transaction (restarts
 #                        with FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=
 #                        select_insert_update; drives GENERATE through
+#   31  sql_agent_savepoint  fractal_sql_agent's auto_execute INSERT/    ~10s
+#                        UPDATE branch: SAVEPOINT/ROLLBACK TO SAVEPOINT
+#                        scopes a failed execution's rollback to just
+#                        that call, not the whole transaction, and the
+#                        same fixed savepoint name is reusable across
+#                        repeated calls in one transaction (restarts
+#                        with FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS=
+#                        select_insert_update; drives GENERATE through
 #                        the real mock_llm.py via a marker-routed reply)
+#   32  new_primitives    the newest analytics/vector-math UDFs, known-   ~3s
+#                        answer asserted: change_point_detect,
+#                        periodogram, state_fingerprint (determinism,
+#                        byte packing), cycle_detect (period-2 closes,
+#                        distinct states do not), tda_persistence_
+#                        diagram (two-cluster betti1=20, n_h0_bars=10,
+#                        max_dim=0 -> betti1 null), optimize_subset
+#                        (score near the hand-computed optimum, <=2
+#                        nonzero weights), lp_distance (p=2/p=1),
+#                        quantize_int8 (dequantization within rounding
+#                        error), quantize_binary + hamming_distance
+#                        (0 for identical, 1 for one flipped sign,
+#                        unequal-length rejection)
 #
 # NOT ported, each for its own documented reason (see the architecture-
 # differences block above, not a TODO backlog):
@@ -197,7 +218,7 @@
 # Gate sets:
 #   QUICK   = 01 02
 #   DEFAULT = 01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20
-#             21 22 23 24 25 29 31
+#             21 22 23 24 25 29 31 32
 #   FUZZ    = 30                                       --fuzz, not part of DEFAULT (adds real wall-time)
 #   (26/27/28 stay opt-in: each needs a real, licensed enterprise .so
 #   this public repo doesn't ship -- see gate_26_enterprise_active's own
@@ -245,7 +266,7 @@ cd "$HERE"
 
 TMPROOT="$(cd /tmp && pwd -P)"
 
-DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 29 31)
+DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 29 31 32)
 QUICK_GATES=(01 02)
 FUZZ_GATES=(30)
 
@@ -1873,6 +1894,99 @@ gate_24_agents() {
     SELECT JSON_LENGTH(JSON_EXTRACT(@rg, '\$.cohort_matches'));" 2>&1)
   [ "$rg" = "2" ] && pass "24 agents: patient_deterioration_triage (H) cohort_matches now honors p_k (got 2 of 2 qualifying rows)" \
                    || fail "24 agents: patient_deterioration_triage cohort_matches length='$rg'"
+
+  # detect_loop (O), rewritten onto SimHash fingerprints + streaming
+  # Brent cycle detection + a DFA-over-L2-norms check. The near-identical
+  # "cognitive wobble" log must close a cycle and flag loop_detected --
+  # live-verified: its two states' SimHash fingerprints COLLAPSE to one
+  # fingerprint (the vectors differ by 0.005 on two of three dims, under
+  # random-hyperplane rounding), so this is a period-1 cycle (cycle_len
+  # 1) rather than period-2; a second log with genuinely distinct states
+  # below asserts the real period-2 path.
+  local dl_log; dl_log="$(python3 -c "
+import json
+print(json.dumps([[0.5,0.5,0.5] if i % 2 == 0 else [0.505,0.495,0.5] for i in range(20)], separators=(',',':')))
+")"
+  local dl; dl=$("${MARIADB[@]}" -N -e "
+    CALL fractal_agent_detect_loop('bt_wobble', '$dl_log', 16, 42.0, 2, @dlr);
+    SELECT @dlr;" 2>&1)
+  echo "$dl" | grep -Eq '"loop_detected" *: *(true|1)' \
+    && pass "24 agents: detect_loop flags the near-identical wobble log" \
+    || fail "24 agents: detect_loop wobble='$dl'"
+  echo "$dl" | grep -Eq '"cycle_detected" *: *"?(true|1)"?' \
+    && pass "24 agents: detect_loop cycle check fired on the wobble log" \
+    || fail "24 agents: detect_loop cycle='$dl'"
+  # Genuinely distinct alternating states (directions 30+ degrees apart,
+  # so no fingerprint collapse): the 20-state log must close a real
+  # period-2 cycle -- cycle_len 2, at_index 3 (Brent's checkpoint
+  # schedule closes it on the 4th state).
+  local dl_log3; dl_log3="$(python3 -c "
+import json
+print(json.dumps([[0.5,0.5,0.5] if i % 2 == 0 else [0.9,0.1,0.5] for i in range(20)], separators=(',',':')))
+")"
+  local dl3; dl3=$("${MARIADB[@]}" -N -e "
+    CALL fractal_agent_detect_loop('bt_wobble2', '$dl_log3', 64, 42.0, 0, @dlr3);
+    SELECT @dlr3;" 2>&1)
+  # ("cycle_len" comes back "2" quoted on 11.4 but 2 unquoted on 10.6 --
+  # MariaDB's JSON_OBJECT integer serialization differs by major --
+  # accept both spellings.)
+  echo "$dl3" | grep -Eq '"cycle_len" *: *"?2"?' \
+    && echo "$dl3" | grep -Eq '"loop_detected" *: *(true|1)' \
+    && pass "24 agents: detect_loop closes a true period-2 cycle on distinct states (cycle_len 2)" \
+    || fail "24 agents: detect_loop distinct-states='$dl3' (expected cycle_len 2, loop_detected true)"
+  # A constant state log: the cycle check still fires, but every L2
+  # norm is identical so the DFA-over-norms branch must be SKIPPED
+  # (the core DFA errors on degenerate constant input) -- dfa_exponent
+  # stays null, and the call must not abort the statement.
+  local dl_log2; dl_log2="$(python3 -c "
+import json
+print(json.dumps([[0.5,0.5,0.5] for _ in range(8)], separators=(',',':')))
+")"
+  local dl2; dl2=$("${MARIADB[@]}" -N -e "
+    CALL fractal_agent_detect_loop('bt_constant', '$dl_log2', 16, 42.0, 0, @dlr2);
+    SELECT @dlr2;" 2>&1)
+  # ("cycle_detected" comes back "1" quoted here but 1 unquoted on the
+  # wobble CALL above -- MariaDB's JSON_OBJECT boolean serialization is
+  # inconsistent by value -- accept both spellings.)
+  echo "$dl2" | grep -Eq '"cycle_detected" *: *"?(true|1)"?' \
+    && pass "24 agents: detect_loop constant-state log closes a cycle" \
+    || fail "24 agents: detect_loop constant='$dl2'"
+  echo "$dl2" | grep -Eq '"dfa_exponent" *: *null' \
+    && pass "24 agents: detect_loop skips the DFA on degenerate constant norms (dfa_exponent null, no abort)" \
+    || fail "24 agents: detect_loop constant dfa='$dl2' (expected dfa_exponent null)"
+
+  # outlier_intercept (H-adjacent safety barrier), now with an explicit
+  # metric argument. cosine (the default) intercepts a probe near a
+  # known-bad state; l2 on a far probe does not; a nonsense metric
+  # must SIGNAL, not silently fall back.
+  "${MARIADB[@]}" -e "
+    DROP TABLE IF EXISTS bt_bad_states;
+    CREATE TABLE bt_bad_states (id BIGINT PRIMARY KEY AUTO_INCREMENT, emb TEXT);
+    INSERT INTO bt_bad_states (emb) VALUES ('[1,0,0]'), ('[0.9,0.1,0]');
+  " >/tmp/fractalsql_bt_gate24_bad.log 2>&1
+
+  local oi1; oi1=$("${MARIADB[@]}" -N -e "
+    CALL fractal_agent_outlier_intercept('[1.0,0.05,0]', 'bt_bad_states', 'emb', 0.5, 'cosine', @oi1);
+    SELECT @oi1;" 2>&1)
+  # (outlier_intercept serializes "intercepted" as a quoted "1"/"0"
+  # string, not a JSON boolean -- accept both spellings.)
+  echo "$oi1" | grep -Eq '"intercepted" *: *"?(true|1)"?' \
+    && pass "24 agents: outlier_intercept cosine intercepts a probe near a known-bad state" \
+    || fail "24 agents: outlier_intercept cosine='$oi1'"
+  local oi2; oi2=$("${MARIADB[@]}" -N -e "
+    CALL fractal_agent_outlier_intercept('[0.0,1.0,0.0]', 'bt_bad_states', 'emb', 0.5, 'l2', @oi2);
+    SELECT @oi2;" 2>&1)
+  echo "$oi2" | grep -Eq '"intercepted" *: *"?(false|0)"?' \
+    && echo "$oi2" | grep -Eq '"metric" *: *"l2"' \
+    && pass "24 agents: outlier_intercept l2 does not intercept a far probe (metric echoed)" \
+    || fail "24 agents: outlier_intercept l2='$oi2'"
+  local oi3; oi3=$("${MARIADB[@]}" -N -e "
+    CALL fractal_agent_outlier_intercept('[1,0,0]', 'bt_bad_states', 'emb', 0.5, 'manhattan', @oi3);" 2>&1)
+  echo "$oi3" | grep -qi "metric must be" \
+    && pass "24 agents: outlier_intercept SIGNALs on an unknown metric" \
+    || fail "24 agents: expected a metric rejection, got: $oi3"
+
+  "${MARIADB[@]}" -e "DROP TABLE IF EXISTS bt_bad_states;" >/dev/null 2>&1
 }
 
 # Regression test for fractal_sql_agent's SAVEPOINT/ROLLBACK TO
@@ -1967,6 +2081,210 @@ gate_31_sql_agent_savepoint() {
   "${MARIADB[@]}" -e "DROP TABLE IF EXISTS bt_sql_agent_sp;" >/dev/null 2>&1
   unset FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS
   mdb_restore_reasoning_plugin >/dev/null 2>&1
+}
+
+# The newest analytics/vector-math UDFs, known-answer asserted. No LLM.
+# Every assertion here is convention-independent where the underlying
+# convention lives in the vendored core (e.g. quantize_binary's sign-bit
+# polarity): hamming(quantize(v), quantize(v))=0 and
+# hamming(quantize(v), quantize(one sign flipped))=1 hold regardless of
+# which bit value "positive" packs as.
+gate_32_new_primitives() {
+  # --- fractal_change_point_detect: step up at t=50 in a 100-sample
+  # series with a non-degenerate (sine) wobble, window=16, threshold=2.
+  # At least one flagged boundary must land near the true split. A
+  # constant-series wobble would risk the pooled-stddev denominator
+  # being 0, so the wobble is real, not cosmetic.
+  local step; step="$(python3 -c "
+import math
+print(','.join('%.4f' % (0.2*math.sin(0.5*i) if i < 50 else 5.2+0.2*math.cos(0.5*i)) for i in range(100)))
+")"
+  local cp; cp=$("${MARIADB[@]}" -N -e "SELECT fractal_change_point_detect('[$step]', 16, 2.0, 16);" 2>&1)
+  local cp_ok=0 cp_v
+  for cp_v in $(echo "$cp" | tr -d '[]' | tr ',' ' '); do
+    awk "BEGIN{exit !($cp_v >= 30 && $cp_v <= 70)}" && cp_ok=1
+  done
+  [ "$cp_ok" = "1" ] && pass "32 new_primitives: change_point_detect flags a boundary near the t=50 step ($cp)" \
+                    || fail "32 new_primitives: change_point_detect='$cp' (no boundary in [30,70])"
+
+  local cp_bad; cp_bad=$("${MARIADB[@]}" -N -e "SELECT fractal_change_point_detect('[1,2,3]', 0, 2.0, 16);" 2>&1)
+  # Empirical contract on this server family: a UDF whose main function
+  # sets *error (no init message) surfaces as a NULL result, not a
+  # statement error -- assert that, not an ERROR banner.
+  [ "$cp_bad" = "NULL" ] \
+    && pass "32 new_primitives: change_point_detect rejects window < 1 (NULL)" \
+    || fail "32 new_primitives: expected NULL for window < 1, got: $cp_bad"
+
+  # --- fractal_periodogram: 64 samples of sin(2*pi*t/8) -> an exact
+  # k=8/64 bin at 0.125 cycles/sample as the top-power peak.
+  local sine; sine="$(python3 -c "
+import math
+print(','.join('%.6f' % (0.5*math.sin(2*math.pi*i/8)) for i in range(64)))
+")"
+  local pg; pg=$("${MARIADB[@]}" -N -e "SELECT fractal_periodogram('$sine', 4);" 2>&1)
+  echo "$pg" | grep -q '"freqs"' \
+    && pass "32 new_primitives: periodogram returned peaks" \
+    || fail "32 new_primitives: periodogram='$pg'"
+
+  local pg_top; pg_top=$("${MARIADB[@]}" -N -e "SELECT JSON_EXTRACT('$pg', '\$.freqs[0]');" 2>&1)
+  if awk "BEGIN{exit !($pg_top > 0.124 && $pg_top < 0.126)}" 2>/dev/null; then
+    pass "32 new_primitives: periodogram top freq is the true 0.125 bin (got $pg_top)"
+  else
+    fail "32 new_primitives: periodogram top freq='$pg_top' (expected 0.125)"
+  fi
+
+  # --- fractal_state_fingerprint: 128 bits -> exactly 16 packed bytes,
+  # all in [0,255], byte-for-byte deterministic across identical calls
+  # (seeded random hyperplanes).
+  local fp1 fp2 n_fp
+  fp1=$("${MARIADB[@]}" -N -e "SELECT fractal_state_fingerprint('1,2,3', 128, 42);" 2>&1)
+  n_fp=$(echo "$fp1" | tr -d '[]' | tr ',' '\n' | grep -c .)
+  [ "$n_fp" = "16" ] && pass "32 new_primitives: state_fingerprint 128 bits -> 16 bytes" \
+                     || fail "32 new_primitives: state_fingerprint byte count=$n_fp ('$fp1')"
+  echo "$fp1" | tr -d '[]' | tr ',' '\n' | grep -v '^$' | awk '$1 < 0 || $1 > 255 {exit 1}' \
+    && pass "32 new_primitives: state_fingerprint bytes all in [0,255]" \
+    || fail "32 new_primitives: state_fingerprint out-of-range byte in '$fp1'"
+  fp2=$("${MARIADB[@]}" -N -e "SELECT fractal_state_fingerprint('1,2,3', 128, 42);" 2>&1)
+  [ "$fp1" = "$fp2" ] && pass "32 new_primitives: state_fingerprint is deterministic (same seed, same bytes)" \
+                      || fail "32 new_primitives: state_fingerprint differs across identical calls: '$fp1' vs '$fp2'"
+
+  # --- fractal_cycle_detect: fingerprints of A,B,A,B,A,B (concatenated
+  # 64-bit fingerprint bytes). Live-verified: Brent's checkpoint
+  # schedule needs roughly twice the period in stream length to close,
+  # so a bare A,B,A does NOT report a cycle -- the 6-element stream
+  # does (cycle_len=2, at_index=3). Negative case uses A,B,D with
+  # mutually non-collinear state vectors: SimHash fingerprints of
+  # SCALAR-MULTIPLE states are byte-identical (live-verified: '9,9,9'
+  # and '4,4,4' collide -- both on the (1,1,1) diagonal), so the
+  # negative case needs a different direction, not a different magnitude.
+  local fpA fpB fpD sA sB sD
+  fpA=$("${MARIADB[@]}" -N -e "SELECT fractal_state_fingerprint('1,2,3', 64, 7);" 2>&1)
+  fpB=$("${MARIADB[@]}" -N -e "SELECT fractal_state_fingerprint('9,9,9', 64, 7);" 2>&1)
+  fpD=$("${MARIADB[@]}" -N -e "SELECT fractal_state_fingerprint('4,5,6', 64, 7);" 2>&1)
+  sA="${fpA#[}"; sA="${sA%]}"
+  sB="${fpB#[}"; sB="${sB%]}"
+  sD="${fpD#[}"; sD="${sD%]}"
+  local cy; cy=$("${MARIADB[@]}" -N -e "SELECT fractal_cycle_detect('$sA,$sB,$sA,$sB,$sA,$sB', 8, 0);" 2>&1)
+  echo "$cy" | grep -Eq '"detected" *: *true' \
+    && pass "32 new_primitives: cycle_detect closes the A,B,A,B,A,B period-2 stream ($cy)" \
+    || fail "32 new_primitives: cycle_detect(A,B,A,B,A,B)='$cy'"
+  echo "$cy" | grep -Eq '"cycle_len" *: *2' \
+    && pass "32 new_primitives: cycle_detect reports cycle_len=2" \
+    || fail "32 new_primitives: cycle_detect cycle_len='$cy'"
+  local cy2; cy2=$("${MARIADB[@]}" -N -e "SELECT fractal_cycle_detect('$sA,$sB,$sD', 8, 0);" 2>&1)
+  echo "$cy2" | grep -Eq '"detected" *: *(false|0)' \
+    && pass "32 new_primitives: cycle_detect reports no cycle for three distinct states" \
+    || fail "32 new_primitives: cycle_detect(A,B,D)='$cy2' (expected detected:false)"
+
+  # --- fractal_tda_persistence_diagram: 12 points in two tight 6-point
+  # clusters far apart. Each cluster forms a complete graph under
+  # thresh=1.0, so the 1-skeleton cycle rank is 15 edges - 6 vertices
+  # + 1 component = 10 per cluster = 20 total; h0 is 5 bars per
+  # cluster = 10. max_dim=0 must leave betti1 null (scope note: the
+  # 1-skeleton cycle rank, not full simplicial H1).
+  local pts; pts="$(python3 -c "
+a = [0.0,0.0, 0.1,0.0, 0.05,0.0866, 0.1,0.0866, 0.02,0.05, 0.08,0.03]
+b = [10.0+x for x in a]
+print(','.join('%.4f' % v for v in a + b))
+")"
+  local tda; tda=$("${MARIADB[@]}" -N -e "SELECT fractal_tda_persistence_diagram('$pts', 2, 1, 1.0, 64);" 2>&1)
+  echo "$tda" | grep -Eq '"betti1" *: *20' \
+    && pass "32 new_primitives: tda_persistence_diagram two-cluster betti1=20 (2 x (15-6+1))" \
+    || fail "32 new_primitives: tda_persistence_diagram='$tda' (expected betti1=20)"
+  echo "$tda" | grep -Eq '"n_h0_bars" *: *10' \
+    && pass "32 new_primitives: tda_persistence_diagram n_h0_bars=10 (2 x 5 merge bars)" \
+    || fail "32 new_primitives: tda_persistence_diagram n_h0_bars='$tda' (expected 10)"
+  local tda0; tda0=$("${MARIADB[@]}" -N -e "SELECT fractal_tda_persistence_diagram('$pts', 2, 0, 1.0, 64);" 2>&1)
+  echo "$tda0" | grep -Eq '"betti1" *: *null' \
+    && pass "32 new_primitives: tda_persistence_diagram max_dim=0 leaves betti1 null" \
+    || fail "32 new_primitives: tda max_dim=0 betti1='$tda0' (expected null)"
+
+  # --- fractal_optimize_subset: value-weighted allocation with bounds
+  # 0.6 per item and at-most-2 nonzero. Live-verified: bounds must
+  # leave the allocation FEASIBLE -- weights sum to 1.0, so with k=2
+  # each cap must allow the pair to reach 1.0 (0.6+0.4 works; the
+  # [0.4]*5 caps would cap the pair at 0.8 < 1.0 and the infeasible
+  # instance comes back NULL rather than an error). With feasible
+  # [0.6]*5 caps the optimum puts 0.6 on the largest value (0.15) and
+  # 0.4 on the second (0.12) -> score exactly 0.138.
+  local os; os=$("${MARIADB[@]}" -N -e "SELECT fractal_optimize_subset('[0.12,0.09,0.15,0.06,0.11]', '[0.6,0.6,0.6,0.6,0.6]', 2, '{}');" 2>&1)
+  echo "$os" | grep -q '"weights"' \
+    && pass "32 new_primitives: optimize_subset returned a weights array" \
+    || fail "32 new_primitives: optimize_subset='$os'"
+  local os_score; os_score=$("${MARIADB[@]}" -N -e "SELECT JSON_EXTRACT('$os', '\$.score');" 2>&1)
+  awk "BEGIN{exit !($os_score > 0.1378 && $os_score < 0.1382)}" \
+    && pass "32 new_primitives: optimize_subset hits the exact 0.138 optimum (got $os_score)" \
+    || fail "32 new_primitives: optimize_subset score='$os_score' (expected 0.138)"
+  local os_infeas; os_infeas=$("${MARIADB[@]}" -N -e "SELECT fractal_optimize_subset('[0.12,0.09,0.15,0.06,0.11]', '[0.4,0.4,0.4,0.4,0.4]', 2, '{}');" 2>&1)
+  [ "$os_infeas" = "NULL" ] \
+    && pass "32 new_primitives: optimize_subset infeasible instance (caps 0.4x5 < 1.0 at k=2) returns NULL" \
+    || fail "32 new_primitives: infeasible optimize_subset='$os_infeas' (expected NULL)"
+  local os_w; os_w=$("${MARIADB[@]}" -N -e "SELECT JSON_EXTRACT('$os', '\$.weights');" 2>&1)
+  local os_nz; os_nz=0
+  for cp_v in $(echo "$os_w" | tr -d '[]' | tr ',' ' '); do
+    awk "BEGIN{exit !($cp_v > 0.0000001)}" && os_nz=$((os_nz + 1))
+  done
+  [ "$os_nz" -le 2 ] && pass "32 new_primitives: optimize_subset honors the at-most-2-nonzero cap ($os_nz nonzero)" \
+                     || fail "32 new_primitives: optimize_subset nonzero weights=$os_nz ('$os_w')"
+
+  # --- fractal_vector_lp_distance: p=2 -> 5.0, p=1 -> 7.0.
+  local lp; lp=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_lp_distance('[3,4,0]', '[0,0,0]', 2.0);" 2>&1)
+  awk "BEGIN{exit !($lp > 4.999 && $lp < 5.001)}" \
+    && pass "32 new_primitives: lp_distance p=2 ([3,4] from origin) = 5" \
+    || fail "32 new_primitives: lp_distance p=2='$lp'"
+  local lp1; lp1=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_lp_distance('[3,4,0]', '[0,0,0]', 1.0);" 2>&1)
+  awk "BEGIN{exit !($lp1 > 6.999 && $lp1 < 7.001)}" \
+    && pass "32 new_primitives: lp_distance p=1 ([3,4] from origin) = 7" \
+    || fail "32 new_primitives: lp_distance p=1='$lp1'"
+
+  # --- fractal_vector_quantize_int8: dequantization v[i] ~= values[i]
+  # * scale must hold to within rounding error, and values stay int8.
+  local q8; q8=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_quantize_int8('[1,-2,3]');" 2>&1)
+  echo "$q8" | grep -q '"scale"' \
+    && pass "32 new_primitives: quantize_int8 returned {scale,values}" \
+    || fail "32 new_primitives: quantize_int8='$q8'"
+  local q8_scale q8_vals
+  q8_scale=$("${MARIADB[@]}" -N -e "SELECT JSON_EXTRACT('$q8', '\$.scale');" 2>&1)
+  q8_vals=$("${MARIADB[@]}" -N -e "SELECT JSON_EXTRACT('$q8', '\$.values');" 2>&1)
+  echo "$q8_scale" | awk -v s_in="$q8_scale" -v vals="$q8_vals" '
+    function abs(x) { return x < 0 ? -x : x }
+    BEGIN {
+      n = split(vals, v, /[,\[\]]/); j = 0
+      for (i = 1; i <= n; i++) if (v[i] != "") q[++j] = v[i] + 0
+      if (j != 3) exit 1
+      s = s_in + 0
+      if (s <= 0) exit 1
+      # dequantization must land back on the source vector within half a
+      # quantization step (round-to-nearest int8)
+      if (abs(q[1]*s - 1) > s*0.6) exit 1
+      if (abs(q[2]*s + 2) > s*0.6) exit 1
+      if (abs(q[3]*s - 3) > s*0.6) exit 1
+      if (q[1] < -127 || q[1] > 127 || q[2] < -127 || q[2] > 127 || q[3] < -127 || q[3] > 127) exit 1
+    }' \
+    && pass "32 new_primitives: quantize_int8 dequantizes [1,-2,3] within rounding error" \
+    || fail "32 new_primitives: quantize_int8 scale='$q8_scale' values='$q8_vals' (dequantization out of tolerance)"
+
+  # --- fractal_vector_quantize_binary + fractal_vector_hamming_distance:
+  # 2 dims pack into 1 byte; identical vectors -> 0; one flipped sign
+  # -> 1. (The sign-bit polarity itself is the vendored core's choice;
+  # these assertions hold either way.)
+  local qb; qb=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_quantize_binary('[1,-1]');" 2>&1)
+  local qb_n; qb_n=$(echo "$qb" | tr -d '[]' | tr ',' '\n' | grep -c .)
+  [ "$qb_n" = "1" ] && pass "32 new_primitives: quantize_binary 2 dims -> 1 packed byte" \
+                    || fail "32 new_primitives: quantize_binary byte count=$qb_n ('$qb')"
+  local hm0 hm1
+  hm0=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_hamming_distance('$qb', '$qb');" 2>&1)
+  [ "$hm0" = "0" ] && pass "32 new_primitives: hamming_distance(identical) = 0" \
+                   || fail "32 new_primitives: hamming_distance(identical)='$hm0'"
+  local qb2; qb2=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_quantize_binary('[1,1]');" 2>&1)
+  local hm1; hm1=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_hamming_distance('$qb', '$qb2');" 2>&1)
+  [ "$hm1" = "1" ] && pass "32 new_primitives: hamming_distance(one flipped sign) = 1" \
+                   || fail "32 new_primitives: hamming_distance(flipped sign)='$hm1'"
+  local hm_bad; hm_bad=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_hamming_distance('[1]', '[1,2]');" 2>&1)
+  # Same *error -> NULL contract as the change_point rejection above.
+  [ "$hm_bad" = "NULL" ] \
+    && pass "32 new_primitives: hamming_distance rejects unequal byte lengths (NULL)" \
+    || fail "32 new_primitives: expected NULL for unequal byte lengths, got: $hm_bad"
 }
 
 # Enterprise tier: with FRACTALSQL_ENTERPRISE_LIB unset (the
@@ -2379,7 +2697,7 @@ run_major() {
 
   local need_db=0
   for g in "${gates[@]}"; do
-    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|31) need_db=1 ;; esac
+    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|31|32) need_db=1 ;; esac
   done
   if [ "$need_db" -eq 1 ]; then
     mdb_setup "$v"; local rc=$?
@@ -2418,6 +2736,7 @@ run_major() {
         28) gate_28_enterprise_signature ;;
         29) gate_29_think ;;
         31) gate_31_sql_agent_savepoint ;;
+        32) gate_32_new_primitives ;;
       esac
     done
     mdb_teardown

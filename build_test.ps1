@@ -38,10 +38,13 @@
     29 think (FRACTALSQL_HTTP_THINK* -> FSQL_REASONING_HTTP_THINK* bridge),
     31 sql_agent_savepoint (fractal_sql_agent's auto_execute SAVEPOINT/
     ROLLBACK TO SAVEPOINT safety net, via a marker-routed mock_llm.py
-    reply)
-    -- full parity with build_test.sh's DEFAULT_GATES (01-25, 29, and 31,
-    all of 05/07/08/14-18 included and unconditional there too) plus its
-    three opt-in enterprise gates (26-28). Gate 09 (a non-
+    reply), 32 new_primitives (the newest analytics/vector-math UDFs:
+    change_point_detect, periodogram, state_fingerprint, cycle_detect,
+    tda_persistence_diagram, optimize_subset, lp_distance,
+    quantize_int8/binary, hamming_distance -- known-answer asserted)
+    -- full parity with build_test.sh's DEFAULT_GATES (01-25, 29, 31, and
+    32, all of 05/07/08/14-18 included and unconditional there too) plus
+    its three opt-in enterprise gates (26-28). Gate 09 (a non-
     superuser SQL-SET privilege-escalation check against a server
     system variable) is intentionally NOT
     ported -- MariaDB's reasoning-plugin config is env-var-only, read
@@ -189,7 +192,7 @@ Set-Location $Here
 # ("[SKIP] N enterprise*: skipped (community edition; no fractalsql-
 # enterprise-sovereign-c.* shared lib in include/)"), instead of
 # silently omitting the opt-in gates from the transcript.
-$DefaultGates = @("01","02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31")
+$DefaultGates = @("01","02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31","32")
 $QuickGates   = @("01", "02")
 $FuzzGates    = @("30")
 
@@ -1735,6 +1738,260 @@ SELECT JSON_LENGTH(JSON_EXTRACT(@rg, '$.cohort_matches'));
 '@ 2>&1
     $rgTrim = ($rg -join "").Trim()
     if ($rgTrim -eq "2") { Pass "24 agents: patient_deterioration_triage (H) cohort_matches now honors p_k (got 2 of 2 qualifying rows)" } else { Fail "24 agents: patient_deterioration_triage cohort_matches length='$rgTrim'" }
+
+    # detect_loop (O), rewritten onto SimHash fingerprints + streaming
+    # Brent cycle detection + a DFA-over-L2-norms check. The
+    # near-identical "cognitive wobble" log must close a cycle and flag
+    # loop_detected -- live-verified: its two states' SimHash
+    # fingerprints COLLAPSE to one fingerprint (the vectors differ by
+    # 0.005 on two of three dims, under random-hyperplane rounding), so
+    # this is a period-1 cycle (cycle_len 1) rather than period-2; a
+    # second log with genuinely distinct states below asserts the real
+    # period-2 path.
+    $py = Get-PythonExe
+    if ($py) {
+        $dlLog = & $py -c "import json; print(json.dumps([[0.5,0.5,0.5] if i % 2 == 0 else [0.505,0.495,0.5] for i in range(20)], separators=(',',':')))"
+        $dl = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_agent_detect_loop('bt_wobble', '$dlLog', 16, 42.0, 2, @dlr);
+SELECT @dlr;
+"@ 2>&1
+        $dlJoined = ($dl -join "`n")
+        if ($dlJoined -match '"loop_detected":\s*(true|1)') { Pass "24 agents: detect_loop flags the near-identical wobble log" } else { Fail "24 agents: detect_loop wobble='$dlJoined'" }
+        if ($dlJoined -match '"cycle_detected":\s*"?(true|1)"?') { Pass "24 agents: detect_loop cycle check fired on the wobble log" } else { Fail "24 agents: detect_loop cycle='$dlJoined'" }
+
+        # Genuinely distinct alternating states (directions far enough
+        # apart that no fingerprint collapse happens): the 20-state log
+        # must close a real period-2 cycle -- cycle_len 2, at_index 3
+        # (Brent's checkpoint schedule closes it on the 4th state).
+        $dlLog3 = & $py -c "import json; print(json.dumps([[0.5,0.5,0.5] if i % 2 == 0 else [0.9,0.1,0.5] for i in range(20)], separators=(',',':')))"
+        $dl3 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_agent_detect_loop('bt_wobble2', '$dlLog3', 64, 42.0, 0, @dlr3);
+SELECT @dlr3;
+"@ 2>&1
+        $dl3Joined = ($dl3 -join "`n")
+        # ("cycle_len" comes back "2" quoted on 11.4 but 2 unquoted on
+        # 10.6 -- MariaDB's JSON_OBJECT integer serialization differs
+        # by major -- accept both spellings.)
+        if (($dl3Joined -match '"cycle_len":\s*"?2"?') -and ($dl3Joined -match '"loop_detected":\s*(true|1)')) { Pass "24 agents: detect_loop closes a true period-2 cycle on distinct states (cycle_len 2)" } else { Fail "24 agents: detect_loop distinct-states='$dl3Joined' (expected cycle_len 2, loop_detected true)" }
+
+        # A constant state log: the cycle check still fires, but every L2
+        # norm is identical so the DFA-over-norms branch must be SKIPPED
+        # (the core DFA errors on degenerate constant input) --
+        # dfa_exponent stays null, and the call must not abort.
+        $dlLog2 = & $py -c "import json; print(json.dumps([[0.5,0.5,0.5] for _ in range(8)], separators=(',',':')))"
+        $dl2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_agent_detect_loop('bt_constant', '$dlLog2', 16, 42.0, 0, @dlr2);
+SELECT @dlr2;
+"@ 2>&1
+        $dl2Joined = ($dl2 -join "`n")
+        # ("cycle_detected" comes back "1" quoted here but 1 unquoted on
+        # the wobble CALL above -- MariaDB's JSON_OBJECT boolean
+        # serialization is inconsistent by value -- accept both spellings.)
+        if ($dl2Joined -match '"cycle_detected":\s*"?(true|1)"?') { Pass "24 agents: detect_loop constant-state log closes a cycle" } else { Fail "24 agents: detect_loop constant='$dl2Joined'" }
+        if ($dl2Joined -match '"dfa_exponent":\s*null') { Pass "24 agents: detect_loop skips the DFA on degenerate constant norms (dfa_exponent null, no abort)" } else { Fail "24 agents: detect_loop constant dfa='$dl2Joined' (expected dfa_exponent null)" }
+    } else {
+        Skip "24 agents: detect_loop checks (no python found to generate the synthetic state log)"
+    }
+
+    # outlier_intercept (H-adjacent safety barrier), now with an explicit
+    # metric argument. cosine (the default) intercepts a probe near a
+    # known-bad state; l2 on a far probe does not; a nonsense metric
+    # must SIGNAL, not silently fall back.
+    & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e @"
+DROP TABLE IF EXISTS bt_bad_states;
+CREATE TABLE bt_bad_states (id BIGINT PRIMARY KEY AUTO_INCREMENT, emb TEXT);
+INSERT INTO bt_bad_states (emb) VALUES ('[1,0,0]'), ('[0.9,0.1,0]');
+"@ 2>&1 | Out-Null
+
+    $oi1 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_agent_outlier_intercept('[1.0,0.05,0]', 'bt_bad_states', 'emb', 0.5, 'cosine', @oi1);
+SELECT @oi1;
+"@ 2>&1
+    $oi1Joined = ($oi1 -join "`n")
+    # (outlier_intercept serializes "intercepted" as a quoted "1"/"0"
+    # string, not a JSON boolean -- accept both spellings.)
+    if ($oi1Joined -match '"intercepted":\s*"?(true|1)"?') { Pass "24 agents: outlier_intercept cosine intercepts a probe near a known-bad state" } else { Fail "24 agents: outlier_intercept cosine='$oi1Joined'" }
+
+    $oi2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e @"
+CALL fractal_agent_outlier_intercept('[0.0,1.0,0.0]', 'bt_bad_states', 'emb', 0.5, 'l2', @oi2);
+SELECT @oi2;
+"@ 2>&1
+    $oi2Joined = ($oi2 -join "`n")
+    if (($oi2Joined -match '"intercepted":\s*"?(false|0)"?') -and $oi2Joined -match '"metric":\s*"l2"') { Pass "24 agents: outlier_intercept l2 does not intercept a far probe (metric echoed)" } else { Fail "24 agents: outlier_intercept l2='$oi2Joined'" }
+
+    $oi3 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "CALL fractal_agent_outlier_intercept('[1,0,0]', 'bt_bad_states', 'emb', 0.5, 'manhattan', @oi3);" 2>&1
+    if (($oi3 -join "`n") -match "metric must be") { Pass "24 agents: outlier_intercept SIGNALs on an unknown metric" } else { Fail "24 agents: expected a metric rejection, got: $oi3" }
+
+    & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e "DROP TABLE IF EXISTS bt_bad_states;" 2>&1 | Out-Null
+}
+
+# The newest analytics/vector-math UDFs, known-answer asserted. No LLM.
+# Every assertion here is convention-independent where the underlying
+# convention lives in the vendored core (e.g. quantize_binary's sign-bit
+# polarity): hamming(quantize(v), quantize(v))=0 and
+# hamming(quantize(v), quantize(one sign flipped))=1 hold regardless of
+# which bit value "positive" packs as.
+function Gate-32-NewPrimitives {
+    $py = Get-PythonExe
+    if (-not $py) { Skip "32 new_primitives: no python found to generate synthetic series"; return }
+
+    # fractal_change_point_detect: step up at t=50 in a 100-sample series
+    # with a non-degenerate (sine) wobble, window=16, threshold=2. At
+    # least one flagged boundary must land near the true split. A
+    # constant-series wobble would risk the pooled-stddev denominator
+    # being 0, so the wobble is real, not cosmetic.
+    $step = & $py -c "import math; print(','.join('%.4f' % (0.2*math.sin(0.5*i) if i < 50 else 5.2+0.2*math.cos(0.5*i)) for i in range(100)))"
+    $cp = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_change_point_detect('[$step]', 16, 2.0, 16);" 2>&1
+    $cpJoined = ($cp -join "").Trim()
+    $cpVals = $cpJoined.Trim("[]") -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+    $cpOk = $false
+    foreach ($v in $cpVals) { if (([double]$v -ge 30) -and ([double]$v -le 70)) { $cpOk = $true } }
+    if ($cpOk) { Pass "32 new_primitives: change_point_detect flags a boundary near the t=50 step ($cpJoined)" } else { Fail "32 new_primitives: change_point_detect='$cpJoined' (no boundary in [30,70])" }
+
+    $cpBad = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_change_point_detect('[1,2,3]', 0, 2.0, 16);" 2>&1
+    # Empirical contract on this server family: a UDF whose main function
+    # sets *error (no init message) surfaces as a NULL result, not a
+    # statement error -- assert that, not an ERROR banner.
+    if (($cpBad -join "").Trim() -eq "NULL") { Pass "32 new_primitives: change_point_detect rejects window < 1 (NULL)" } else { Fail "32 new_primitives: expected NULL for window < 1, got: $cpBad" }
+
+    # fractal_periodogram: 64 samples of sin(2*pi*t/8) -> an exact
+    # k=8/64 bin at 0.125 cycles/sample as the top-power peak.
+    $sine = & $py -c "import math; print(','.join('%.6f' % (0.5*math.sin(2*math.pi*i/8)) for i in range(64)))"
+    $pg = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_periodogram('$sine', 4);" 2>&1
+    $pgJoined = ($pg -join "`n")
+    if ($pgJoined -match '"freqs"') { Pass "32 new_primitives: periodogram returned peaks" } else { Fail "32 new_primitives: periodogram='$pgJoined'" }
+
+    # Note: '$.freqs[0]' etc. are literal inside these double-quoted
+    # strings -- PowerShell only interpolates $ followed by a name
+    # character, and '.' is not one, so $.field paths pass through
+    # verbatim to MariaDB.
+    $pgTop = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT JSON_EXTRACT('$(($pg -join ''))', '$.freqs[0]');" 2>&1
+    $pgTopVal = 0.0
+    if ([double]::TryParse((($pgTop -join "").Trim()), [ref]$pgTopVal) -and ($pgTopVal -gt 0.124) -and ($pgTopVal -lt 0.126)) {
+        Pass "32 new_primitives: periodogram top freq is the true 0.125 bin (got $pgTopVal)"
+    } else {
+        Fail "32 new_primitives: periodogram top freq='$pgTop' (expected 0.125)"
+    }
+
+    # fractal_state_fingerprint: 128 bits -> exactly 16 packed bytes, all
+    # in [0,255], byte-for-byte deterministic across identical calls
+    # (seeded random hyperplanes).
+    $fp1 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_state_fingerprint('1,2,3', 128, 42);" 2>&1
+    $fp1Joined = ($fp1 -join "").Trim()
+    $fp1Bytes = $fp1Joined.Trim("[]") -split "," | Where-Object { $_ -ne "" }
+    if ($fp1Bytes.Count -eq 16) { Pass "32 new_primitives: state_fingerprint 128 bits -> 16 bytes" } else { Fail "32 new_primitives: state_fingerprint byte count=$($fp1Bytes.Count) ('$fp1Joined')" }
+    $fpInRange = ($fp1Bytes | Where-Object { [double]$_ -lt 0 -or [double]$_ -gt 255 }).Count -eq 0
+    if ($fpInRange) { Pass "32 new_primitives: state_fingerprint bytes all in [0,255]" } else { Fail "32 new_primitives: state_fingerprint out-of-range byte in '$fp1Joined'" }
+    $fp2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_state_fingerprint('1,2,3', 128, 42);" 2>&1
+    if (($fp2 -join "").Trim() -eq $fp1Joined) { Pass "32 new_primitives: state_fingerprint is deterministic (same seed, same bytes)" } else { Fail "32 new_primitives: state_fingerprint differs across identical calls: '$fp1Joined' vs '$(($fp2 -join '').Trim())'" }
+
+    # fractal_cycle_detect: fingerprints of A,B,A,B,A,B (concatenated
+    # 64-bit fingerprint bytes). Live-verified: Brent's checkpoint
+    # schedule needs roughly twice the period in stream length to close,
+    # so a bare A,B,A does NOT report a cycle -- the 6-element stream
+    # does (cycle_len=2, at_index=3). Negative case uses A,B,D with
+    # mutually non-collinear state vectors: SimHash fingerprints of
+    # SCALAR-MULTIPLE states are byte-identical (live-verified: '9,9,9'
+    # and '4,4,4' collide -- both on the (1,1,1) diagonal), so the
+    # negative case needs a different direction, not a different magnitude.
+    $fpA = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_state_fingerprint('1,2,3', 64, 7);" 2>&1) -join ""
+    $fpB = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_state_fingerprint('9,9,9', 64, 7);" 2>&1) -join ""
+    $fpD = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_state_fingerprint('4,5,6', 64, 7);" 2>&1) -join ""
+    $sA = $fpA.Trim("[]"); $sB = $fpB.Trim("[]"); $sD = $fpD.Trim("[]")
+    $cy = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_cycle_detect('$sA,$sB,$sA,$sB,$sA,$sB', 8, 0);" 2>&1
+    $cyJoined = ($cy -join "`n")
+    if ($cyJoined -match '"detected":\s*(true|1)') { Pass "32 new_primitives: cycle_detect closes the A,B,A,B,A,B period-2 stream" } else { Fail "32 new_primitives: cycle_detect(A,B,A,B,A,B)='$cyJoined'" }
+    if ($cyJoined -match '"cycle_len":\s*2') { Pass "32 new_primitives: cycle_detect reports cycle_len=2" } else { Fail "32 new_primitives: cycle_detect cycle_len='$cyJoined'" }
+    $cy2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_cycle_detect('$sA,$sB,$sD', 8, 0);" 2>&1
+    if ((($cy2 -join "`n")) -match '"detected":\s*(false|0)') { Pass "32 new_primitives: cycle_detect reports no cycle for three distinct states" } else { Fail "32 new_primitives: cycle_detect(A,B,D)='$($cy2 -join '')' (expected detected:false)" }
+
+    # fractal_tda_persistence_diagram: 12 points in two tight 6-point
+    # clusters far apart. Each cluster forms a complete graph under
+    # thresh=1.0, so the 1-skeleton cycle rank is 15 edges - 6 vertices
+    # + 1 component = 10 per cluster = 20 total; h0 is 5 bars per
+    # cluster = 10. max_dim=0 must leave betti1 null (scope note: the
+    # 1-skeleton cycle rank, not full simplicial H1).
+    $pts = & $py -c "a=[0.0,0.0, 0.1,0.0, 0.05,0.0866, 0.1,0.0866, 0.02,0.05, 0.08,0.03]; b=[10.0+x for x in a]; print(','.join('%.4f' % v for v in a+b))"
+    $tda = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_tda_persistence_diagram('$pts', 2, 1, 1.0, 64);" 2>&1
+    $tdaJoined = ($tda -join "`n")
+    if ($tdaJoined -match '"betti1":\s*20') { Pass "32 new_primitives: tda_persistence_diagram two-cluster betti1=20 (2 x (15-6+1))" } else { Fail "32 new_primitives: tda_persistence_diagram='$tdaJoined' (expected betti1=20)" }
+    if ($tdaJoined -match '"n_h0_bars":\s*10') { Pass "32 new_primitives: tda_persistence_diagram n_h0_bars=10 (2 x 5 merge bars)" } else { Fail "32 new_primitives: tda_persistence_diagram n_h0_bars='$tdaJoined' (expected 10)" }
+    $tda0 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_tda_persistence_diagram('$pts', 2, 0, 1.0, 64);" 2>&1
+    if ((($tda0 -join "`n")) -match '"betti1":\s*null') { Pass "32 new_primitives: tda_persistence_diagram max_dim=0 leaves betti1 null" } else { Fail "32 new_primitives: tda max_dim=0 betti1='$($tda0 -join '')' (expected null)" }
+
+    # fractal_optimize_subset: value-weighted allocation with bounds 0.6
+    # per item and at-most-2 nonzero. Live-verified: bounds must leave
+    # the allocation FEASIBLE -- weights sum to 1.0, so with k=2 each cap
+    # must allow the pair to reach 1.0 (0.6+0.4 works; the [0.4]*5 caps
+    # would cap the pair at 0.8 < 1.0 and the infeasible instance comes
+    # back NULL rather than an error). With feasible [0.6]*5 caps the
+    # optimum puts 0.6 on the largest value (0.15) and 0.4 on the second
+    # (0.12) -> score exactly 0.138.
+    $os = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_optimize_subset('[0.12,0.09,0.15,0.06,0.11]', '[0.6,0.6,0.6,0.6,0.6]', 2, '{}');" 2>&1
+    $osJoined = ($os -join "`n")
+    if ($osJoined -match '"weights"') { Pass "32 new_primitives: optimize_subset returned a weights array" } else { Fail "32 new_primitives: optimize_subset='$osJoined'" }
+    $osScoreStr = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT JSON_EXTRACT('$(($os -join ''))', '$.score');" 2>&1) -join ""
+    $osScore = 0.0
+    if ([double]::TryParse($osScoreStr.Trim(), [ref]$osScore) -and $osScore -gt 0.1378 -and $osScore -lt 0.1382) {
+        Pass "32 new_primitives: optimize_subset hits the exact 0.138 optimum (got $osScore)"
+    } else {
+        Fail "32 new_primitives: optimize_subset score='$osScoreStr' (expected 0.138)"
+    }
+    $osInfeas = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_optimize_subset('[0.12,0.09,0.15,0.06,0.11]', '[0.4,0.4,0.4,0.4,0.4]', 2, '{}');" 2>&1) -join ""
+    if ($osInfeas.Trim() -eq "NULL") { Pass "32 new_primitives: optimize_subset infeasible instance (caps 0.4x5 < 1.0 at k=2) returns NULL" } else { Fail "32 new_primitives: infeasible optimize_subset='$osInfeas' (expected NULL)" }
+    $osW = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT JSON_EXTRACT('$(($os -join ''))', '$.weights');" 2>&1) -join ""
+    # Numeric guard: a NULL/garbage token would throw under a bare
+    # [double]$_ cast (this exact cast crashed a live gate run once).
+    $osNonZero = (($osW.Trim("[]") -split ",") | Where-Object { $d = 0.0; [double]::TryParse($_.Trim(), [ref]$d) -and $d -gt 0.0000001 }).Count
+    if ($osNonZero -le 2) { Pass "32 new_primitives: optimize_subset honors the at-most-2-nonzero cap ($osNonZero nonzero)" } else { Fail "32 new_primitives: optimize_subset nonzero weights=$osNonZero" }
+
+    # fractal_vector_lp_distance: p=2 -> 5.0, p=1 -> 7.0.
+    $lp = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_lp_distance('[3,4,0]', '[0,0,0]', 2.0);" 2>&1
+    $lpVal = 0.0
+    if ([double]::TryParse((($lp -join "").Trim()), [ref]$lpVal) -and $lpVal -gt 4.999 -and $lpVal -lt 5.001) {
+        Pass "32 new_primitives: lp_distance p=2 ([3,4] from origin) = 5"
+    } else {
+        Fail "32 new_primitives: lp_distance p=2='$lp'"
+    }
+    $lp1 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_lp_distance('[3,4,0]', '[0,0,0]', 1.0);" 2>&1
+    $lp1Val = 0.0
+    if ([double]::TryParse((($lp1 -join "").Trim()), [ref]$lp1Val) -and $lp1Val -gt 6.999 -and $lp1Val -lt 7.001) {
+        Pass "32 new_primitives: lp_distance p=1 ([3,4] from origin) = 7"
+    } else {
+        Fail "32 new_primitives: lp_distance p=1='$lp1'"
+    }
+
+    # fractal_vector_quantize_int8: dequantization v[i] ~= values[i] *
+    # scale must hold to within rounding error, and values stay int8.
+    $q8 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_quantize_int8('[1,-2,3]');" 2>&1
+    $q8Joined = ($q8 -join "`n")
+    if ($q8Joined -match '"scale"') { Pass "32 new_primitives: quantize_int8 returned {scale,values}" } else { Fail "32 new_primitives: quantize_int8='$q8Joined'" }
+    $q8Scale = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT JSON_EXTRACT('$(($q8 -join ''))', '$.scale');" 2>&1) -join ""
+    $q8Vals = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT JSON_EXTRACT('$(($q8 -join ''))', '$.values');" 2>&1) -join ""
+    $q8Nums = $q8Vals.Trim("[]") -split "," | Where-Object { $_ -ne "" } | ForEach-Object { [double]$_ }
+    $q8ScaleNum = [double]($q8Scale.Trim())
+    $q8Ok = ($q8Nums.Count -eq 3) -and ($q8ScaleNum -gt 0) `
+        -and ([math]::Abs($q8Nums[0]*$q8ScaleNum - 1) -le $q8ScaleNum*0.6) `
+        -and ([math]::Abs($q8Nums[1]*$q8ScaleNum + 2) -le $q8ScaleNum*0.6) `
+        -and ([math]::Abs($q8Nums[2]*$q8ScaleNum - 3) -le $q8ScaleNum*0.6) `
+        -and (($q8Nums | Where-Object { $_ -lt -127 -or $_ -gt 127 }).Count -eq 0)
+    if ($q8Ok) { Pass "32 new_primitives: quantize_int8 dequantizes [1,-2,3] within rounding error" } else { Fail "32 new_primitives: quantize_int8 scale='$q8Scale' values='$q8Vals' (dequantization out of tolerance)" }
+
+    # fractal_vector_quantize_binary + fractal_vector_hamming_distance:
+    # 2 dims pack into 1 byte; identical vectors -> 0; one flipped sign
+    # -> 1. (The sign-bit polarity itself is the vendored core's choice;
+    # these assertions hold either way.)
+    $qb = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_quantize_binary('[1,-1]');" 2>&1) -join ""
+    $qbNums = $qb.Trim("[]") -split "," | Where-Object { $_ -ne "" }
+    if ($qbNums.Count -eq 1) { Pass "32 new_primitives: quantize_binary 2 dims -> 1 packed byte" } else { Fail "32 new_primitives: quantize_binary byte count='$qb'" }
+    $hm0 = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_hamming_distance('$qb', '$qb');" 2>&1) -join ""
+    if ($hm0.Trim() -eq "0") { Pass "32 new_primitives: hamming_distance(identical) = 0" } else { Fail "32 new_primitives: hamming_distance(identical)='$hm0'" }
+    $qb2 = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_quantize_binary('[1,1]');" 2>&1) -join ""
+    $hm1 = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_hamming_distance('$qb', '$qb2');" 2>&1) -join ""
+    if ($hm1.Trim() -eq "1") { Pass "32 new_primitives: hamming_distance(one flipped sign) = 1" } else { Fail "32 new_primitives: hamming_distance(flipped sign)='$hm1'" }
+    $hmBad = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_vector_hamming_distance('[1]', '[1,2]');" 2>&1
+    # Same *error -> NULL contract as the change_point rejection above.
+    if (($hmBad -join "").Trim() -eq "NULL") { Pass "32 new_primitives: hamming_distance rejects unequal byte lengths (NULL)" } else { Fail "32 new_primitives: expected NULL for unequal byte lengths, got: $hmBad" }
 }
 
 # Regression test for fractal_sql_agent's SAVEPOINT/ROLLBACK TO
@@ -2084,7 +2341,7 @@ function Run-Gates([string[]]$Gates) {
     # src\fractalsql_parse.c directly, no extension DLL, no mariadbd.exe,
     # no cluster at all.
     if ($Gates -contains "30") { Gate-30-FuzzSmoke }
-    $needDb = $Gates | Where-Object { $_ -in @("02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31") }
+    $needDb = $Gates | Where-Object { $_ -in @("02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31","32") }
     if ($needDb) {
         $rc = Mdb-Setup $MdbMajor
         if ($rc -eq 1) { Skip "MariaDB $MdbMajor runtime gates (mariadbd.exe not found, pass -MdbDir)"; return }
@@ -2119,6 +2376,7 @@ function Run-Gates([string[]]$Gates) {
                 "28" { Gate-28-EnterpriseSignature }
                 "29" { Gate-29-Think }
                 "31" { Gate-31-SqlAgentSavepoint }
+                "32" { Gate-32-NewPrimitives }
             }
         }
         Mdb-Teardown

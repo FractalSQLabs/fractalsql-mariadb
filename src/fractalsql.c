@@ -71,7 +71,7 @@
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
  * metadata's version silently drifting apart. */
-#define FSQL_VERSION "2.0.3"
+#define FSQL_VERSION "2.0.7"
 
 /* strncasecmp is POSIX (<strings.h>), not standard C. MSVC has no
  * <strings.h> at all, only the underscore-prefixed _strnicmp. Used by
@@ -1981,4 +1981,660 @@ fractal_isolate_background(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char
     if (rc != FSQL_OK) { *error = 1; return 0; }
     *is_null = 0;
     return 0;
+}
+
+/* ==================================================================== */
+/* v2.0.25 Analytics additions -- change-point detection, periodogram,  */
+/* subset optimizer, state fingerprinting, cycle detection, TDA         */
+/* persistence diagrams. Same conventions as the Analytics/Portfolio    */
+/* UDFs above: series/point-cloud args are CSV/JSON-array STRINGs       */
+/* (parse_vector_csv), multi-value results are a JSON-valid STRING      */
+/* (json_out_ctx), optional tuning knobs ride in a trailing params      */
+/* JSON blob (json_get_*), matching fractal_optimize_portfolio's        */
+/* precedent exactly. No experimental gating on any of these --         */
+/* shipped as regular first-class functions like everything above,      */
+/* real caveats (noted per-function below where one exists) documented  */
+/* in comments, not hidden behind a flag.                               */
+/* ==================================================================== */
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_change_point_detect                             */
+/*                                                                    */
+/* Sliding two-sample test over adjacent windows of `window` samples; */
+/* flags a boundary where the mean differs by more than `threshold`   */
+/* pooled-stddev units or the variance ratio exceeds threshold^2.     */
+/* Returns a JSON array of ascending 0-indexed boundary positions,    */
+/* e.g. "[12,47]". Requires n >= 2*window, window >= 1, threshold > 0,*/
+/* max_points >= 1.                                                   */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_change_point_detect_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 4) {
+        SFS_INIT_ERROR(message,
+            "fractal_change_point_detect(series_csv, window, threshold, max_points): "
+            "expected 4 arguments, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = INT_RESULT;
+    args->arg_type[2] = REAL_RESULT;
+    args->arg_type[3] = INT_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_change_point_detect_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_change_point_detect(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                            unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char     errbuf[MYSQL_ERRMSG_SIZE];
+    double  *series = NULL;
+    size_t  *idx = NULL;
+    size_t   n = 0, n_found = 0, pos;
+    long long window, max_points;
+    double   threshold;
+    int      rc;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL ||
+        args->args[2] == NULL || args->args[3] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+
+    window     = *(long long *) args->args[1];
+    threshold  = *(double *) args->args[2];
+    max_points = *(long long *) args->args[3];
+    if (window <= 0 || threshold <= 0.0 || max_points <= 0) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0], &series, &n, errbuf)) {
+        *error = 1; return NULL;
+    }
+    idx = malloc((size_t) max_points * sizeof(size_t));
+    if (idx == NULL) { free(series); *error = 1; return NULL; }
+
+    rc = fsql_change_point_detect(series, n, (size_t) window, threshold,
+                                  idx, (size_t) max_points, &n_found);
+    free(series);
+    if (rc != FSQL_OK) { free(idx); *error = 1; return NULL; }  /* n >= 2*window required */
+
+    if (!json_out_ensure(jo, 8)) { free(idx); *error = 1; return NULL; }
+    jo->buf[0] = '['; pos = 1;
+    for (size_t i = 0; i < n_found; i++) {
+        char field[40];
+        int  flen = snprintf(field, sizeof field, "%s%zu", i > 0 ? "," : "", idx[i]);
+        if (flen < 0 || (size_t) flen >= sizeof field) { free(idx); *error = 1; return NULL; }
+        if (!json_out_ensure(jo, pos + (size_t) flen + 4)) { free(idx); *error = 1; return NULL; }
+        memcpy(jo->buf + pos, field, (size_t) flen);
+        pos += (size_t) flen;
+    }
+    free(idx);
+    jo->buf[pos++] = ']';
+    jo->buf[pos]   = '\0';
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_periodogram                                     */
+/*                                                                    */
+/* Classical periodogram (direct O(n^2) DFT -- exact values, no FFT   */
+/* dependency), returning only the max_peaks highest-power bins,      */
+/* sorted descending. Returns {"freqs":[...],"power":[...]}. Requires */
+/* n >= 4, max_peaks >= 1.                                            */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_periodogram_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 2) {
+        SFS_INIT_ERROR(message,
+            "fractal_periodogram(series_csv, max_peaks): expected 2 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = INT_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_periodogram_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_periodogram(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                    unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char     errbuf[MYSQL_ERRMSG_SIZE];
+    double  *series = NULL;
+    double  *freqs = NULL, *power = NULL;
+    size_t   n = 0, n_peaks = 0, pos;
+    long long max_peaks;
+    int      rc;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+
+    max_peaks = *(long long *) args->args[1];
+    if (max_peaks <= 0) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0], &series, &n, errbuf)) {
+        *error = 1; return NULL;
+    }
+    freqs = malloc((size_t) max_peaks * sizeof(double));
+    power = malloc((size_t) max_peaks * sizeof(double));
+    if (freqs == NULL || power == NULL) {
+        free(series); free(freqs); free(power); *error = 1; return NULL;
+    }
+
+    rc = fsql_periodogram(series, n, freqs, power, (size_t) max_peaks, &n_peaks);
+    free(series);
+    if (rc != FSQL_OK) { free(freqs); free(power); *error = 1; return NULL; }  /* n >= 4 */
+
+    if (!json_out_ensure(jo, 16)) { free(freqs); free(power); *error = 1; return NULL; }
+    pos = (size_t) snprintf(jo->buf, jo->cap, "{\"freqs\":[");
+    for (size_t i = 0; i < n_peaks; i++) {
+        char field[40];
+        int  flen = snprintf(field, sizeof field, "%s%.10f", i > 0 ? "," : "", freqs[i]);
+        if (flen < 0 || (size_t) flen >= sizeof field) {
+            free(freqs); free(power); *error = 1; return NULL;
+        }
+        if (!json_out_ensure(jo, pos + (size_t) flen + 32)) {
+            free(freqs); free(power); *error = 1; return NULL;
+        }
+        memcpy(jo->buf + pos, field, (size_t) flen);
+        pos += (size_t) flen;
+    }
+    if (!json_out_ensure(jo, pos + 16)) { free(freqs); free(power); *error = 1; return NULL; }
+    pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos, "],\"power\":[");
+    for (size_t i = 0; i < n_peaks; i++) {
+        char field[40];
+        int  flen = snprintf(field, sizeof field, "%s%.10f", i > 0 ? "," : "", power[i]);
+        if (flen < 0 || (size_t) flen >= sizeof field) {
+            free(freqs); free(power); *error = 1; return NULL;
+        }
+        if (!json_out_ensure(jo, pos + (size_t) flen + 8)) {
+            free(freqs); free(power); *error = 1; return NULL;
+        }
+        memcpy(jo->buf + pos, field, (size_t) flen);
+        pos += (size_t) flen;
+    }
+    free(freqs); free(power);
+    if (!json_out_ensure(jo, pos + 4)) { *error = 1; return NULL; }
+    pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos, "]}");
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_state_fingerprint                               */
+/*                                                                    */
+/* Random-hyperplane SimHash: projects a state vector onto n_bits     */
+/* random hyperplanes (deterministic from seed), packs the sign of    */
+/* each projection MSB-first. Returns a JSON array of the (n_bits+7)/8*/
+/* output bytes, e.g. "[145,3,201]" -- same byte-array-as-JSON-ints   */
+/* convention fractal_vector_quantize_binary uses, so a fingerprint   */
+/* can be fed straight into fractal_cycle_detect below.               */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_state_fingerprint_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 3) {
+        SFS_INIT_ERROR(message,
+            "fractal_state_fingerprint(vec_csv, n_bits, seed): expected 3 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = INT_RESULT;
+    args->arg_type[2] = REAL_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_state_fingerprint_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_state_fingerprint(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                          unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char     errbuf[MYSQL_ERRMSG_SIZE];
+    double  *v = NULL;
+    uint8_t *out = NULL;
+    size_t   dim = 0, n_bytes, pos;
+    long long n_bits;
+    double   seed;
+    int      rc;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL || args->args[2] == NULL) {
+        *is_null = 1; return NULL;
+    }
+    if (args->lengths[0] > MAX_QUERY_BYTES) { *error = 1; return NULL; }
+
+    n_bits = *(long long *) args->args[1];
+    seed   = *(double *) args->args[2];
+    if (n_bits <= 0) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0], &v, &dim, errbuf)) {
+        *error = 1; return NULL;
+    }
+    n_bytes = ((size_t) n_bits + 7) / 8;
+    out = malloc(n_bytes);
+    if (out == NULL) { free(v); *error = 1; return NULL; }
+
+    rc = fsql_state_fingerprint(v, dim, (size_t) n_bits, seed, out);
+    free(v);
+    if (rc != FSQL_OK) { free(out); *error = 1; return NULL; }
+
+    if (!json_out_ensure(jo, n_bytes * 4 + 4)) { free(out); *error = 1; return NULL; }
+    jo->buf[0] = '['; pos = 1;
+    for (size_t i = 0; i < n_bytes; i++) {
+        int flen = snprintf(jo->buf + pos, jo->cap - pos, "%s%u",
+                            i > 0 ? "," : "", (unsigned) out[i]);
+        if (flen < 0 || (size_t) flen >= jo->cap - pos) { free(out); *error = 1; return NULL; }
+        pos += (size_t) flen;
+    }
+    free(out);
+    jo->buf[pos++] = ']';
+    jo->buf[pos]   = '\0';
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* Parses a JSON/CSV array of small non-negative integers (0-255) into
+ * a caller-owned uint8_t buffer -- shared by fractal_cycle_detect
+ * (fingerprint bytes) below. Reuses parse_vector_csv, then narrows
+ * with a range check rather than silently truncating out-of-range
+ * values (which would corrupt fingerprint bytes without any error). */
+static bool
+parse_byte_array(const char *s, size_t slen, uint8_t **out, size_t *n_out, char *errbuf)
+{
+    double *dv = NULL;
+    size_t  n = 0;
+    uint8_t *bv;
+
+    if (!parse_vector_csv(s, slen, &dv, &n, errbuf)) return false;
+    bv = malloc(n > 0 ? n : 1);
+    if (bv == NULL) {
+        SFS_INIT_ERROR(errbuf, "fractalsql: oom");
+        free(dv);
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (dv[i] < 0.0 || dv[i] > 255.0 || dv[i] != (double) (int) dv[i]) {
+            SFS_INIT_ERROR(errbuf, "fractalsql: byte array element %zu out of range [0,255]", i);
+            free(dv); free(bv);
+            return false;
+        }
+        bv[i] = (uint8_t) dv[i];
+    }
+    free(dv);
+    *out   = bv;
+    *n_out = n;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_cycle_detect                                    */
+/*                                                                    */
+/* Single-call wrapper over the stateful fsql_cycle_detect_init/_feed/*/
+/* _free streaming Brent's-algorithm API: takes a flat JSON/CSV array */
+/* of concatenated fingerprint bytes (n_fingerprints * n_bytes long,  */
+/* each n_bytes-byte chunk one fingerprint, e.g. successive            */
+/* fractal_state_fingerprint outputs concatenated by the caller) plus */
+/* the per-fingerprint byte width and a Hamming-distance tolerance,   */
+/* feeds them one at a time, and returns the FIRST cycle found:       */
+/* {"detected":true,"cycle_len":<int>,"at_index":<int>} or             */
+/* {"detected":false} if the stream never closed a cycle. Loses the   */
+/* ability to keep streaming across calls (a true incremental wrapper */
+/* would need a session-scoped handle, out of scope for this pass --  */
+/* see fractal_diversify_enable's session_id convention for the        */
+/* precedent a future incremental version could follow).              */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_cycle_detect_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 3) {
+        SFS_INIT_ERROR(message,
+            "fractal_cycle_detect(fingerprints_csv, n_bytes, hamming_threshold): "
+            "expected 3 arguments, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = INT_RESULT;
+    args->arg_type[2] = INT_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_cycle_detect_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_cycle_detect(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                     unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx    *jo = (json_out_ctx *) initid->ptr;
+    char             errbuf[MYSQL_ERRMSG_SIZE];
+    uint8_t         *flat = NULL;
+    size_t           flat_n = 0, n_fp, pos;
+    long long        n_bytes, hamming_threshold;
+    fsql_cycle_state_t cs;
+    int              rc, detected = 0;
+    size_t           cycle_len = 0, at_index = 0;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL || args->args[2] == NULL) {
+        *is_null = 1; return NULL;
+    }
+    if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+
+    n_bytes           = *(long long *) args->args[1];
+    hamming_threshold = *(long long *) args->args[2];
+    if (n_bytes <= 0 || hamming_threshold < 0) { *error = 1; return NULL; }
+
+    if (!parse_byte_array(args->args[0], args->lengths[0], &flat, &flat_n, errbuf)) {
+        *error = 1; return NULL;
+    }
+    if (flat_n % (size_t) n_bytes != 0) {
+        free(flat); *error = 1; return NULL;
+    }
+    n_fp = flat_n / (size_t) n_bytes;
+
+    rc = fsql_cycle_detect_init(&cs, (size_t) n_bytes, (size_t) hamming_threshold);
+    if (rc != FSQL_OK) { free(flat); *error = 1; return NULL; }
+
+    for (size_t i = 0; i < n_fp; i++) {
+        int out_detected = 0;
+        size_t out_cycle_len = 0;
+        rc = fsql_cycle_detect_feed(&cs, flat + i * (size_t) n_bytes,
+                                    &out_detected, &out_cycle_len);
+        if (rc != FSQL_OK) { fsql_cycle_detect_free(&cs); free(flat); *error = 1; return NULL; }
+        if (out_detected) { detected = 1; cycle_len = out_cycle_len; at_index = i; break; }
+    }
+    fsql_cycle_detect_free(&cs);
+    free(flat);
+
+    if (!json_out_ensure(jo, 96)) { *error = 1; return NULL; }
+    if (detected) {
+        pos = (size_t) snprintf(jo->buf, jo->cap,
+            "{\"detected\":true,\"cycle_len\":%zu,\"at_index\":%zu}", cycle_len, at_index);
+    } else {
+        pos = (size_t) snprintf(jo->buf, jo->cap, "{\"detected\":false}");
+    }
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_tda_persistence_diagram                         */
+/*                                                                    */
+/* Size-capped 0-dim persistence diagram plus a graph-theoretic       */
+/* Betti-1 count over a point cloud's Vietoris-Rips filtration.       */
+/*                                                                    */
+/* SCOPE NOTE (real, not a stability caveat -- read before            */
+/* interpreting betti1): the 0-dim diagram (h0_bars, birth/death) is  */
+/* an EXACT, complete persistence computation -- single-linkage       */
+/* clustering is mathematically equivalent to 0-dim persistent        */
+/* homology of the Vietoris-Rips filtration. The betti1 number is a   */
+/* real, correctly-computed, different invariant: the bare 1-skeleton */
+/* GRAPH's cycle rank (|E| - |V| + components), NOT full simplicial   */
+/* H1 of the Vietoris-Rips complex. It over-counts true H1 whenever a */
+/* filled triangle exists in the data. A full TDA library (Ripser/    */
+/* GUDHI) would compute true H1 via boundary-matrix reduction; this   */
+/* module deliberately doesn't attempt that (no reference oracle      */
+/* exists in this codebase to validate a from-scratch implementation  */
+/* against). Not gated behind any flag -- both numbers are correct    */
+/* for what they actually measure, this is a documentation obligation */
+/* on the caller, not a runtime restriction.                          */
+/*                                                                    */
+/* points_csv: flat, row-major n_points x dim. max_dim: 0 (h0_bars    */
+/* only) or 1 (also computes betti1). Returns {"h0_bars":             */
+/* [{"birth":..,"death":..},...],"n_h0_bars":<int>,"betti1":<int or   */
+/* null>}. 2 <= n_points <= 512 (FSQL_TDA_MAX_POINTS).                */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_tda_persistence_diagram_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 5) {
+        SFS_INIT_ERROR(message,
+            "fractal_tda_persistence_diagram(points_csv, dim, max_dim, max_thresh, "
+            "max_h0_bars): expected 5 arguments, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = INT_RESULT;
+    args->arg_type[2] = INT_RESULT;
+    args->arg_type[3] = REAL_RESULT;
+    args->arg_type[4] = INT_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_tda_persistence_diagram_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_tda_persistence_diagram(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                                unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx    *jo = (json_out_ctx *) initid->ptr;
+    char             errbuf[MYSQL_ERRMSG_SIZE];
+    double          *points = NULL;
+    fsql_tda_bar_t  *bars = NULL;
+    size_t           flat_n = 0, n_h0_bars = 0, betti1 = 0, pos;
+    long long        dim, max_dim, max_h0_bars;
+    double           max_thresh;
+    int              rc;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL || args->args[2] == NULL ||
+        args->args[3] == NULL || args->args[4] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+
+    dim         = *(long long *) args->args[1];
+    max_dim     = *(long long *) args->args[2];
+    max_thresh  = *(double *) args->args[3];
+    max_h0_bars = *(long long *) args->args[4];
+    if (dim <= 0 || (max_dim != 0 && max_dim != 1) ||
+        max_thresh <= 0.0 || max_h0_bars <= 0) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0], &points, &flat_n, errbuf)) {
+        *error = 1; return NULL;
+    }
+    if (flat_n % (size_t) dim != 0) { free(points); *error = 1; return NULL; }
+
+    bars = malloc((size_t) max_h0_bars * sizeof(fsql_tda_bar_t));
+    if (bars == NULL) { free(points); *error = 1; return NULL; }
+
+    rc = fsql_tda_persistence_diagram(points, flat_n / (size_t) dim, (size_t) dim,
+                                      (int) max_dim, max_thresh,
+                                      bars, (size_t) max_h0_bars, &n_h0_bars,
+                                      max_dim == 1 ? &betti1 : NULL);
+    free(points);
+    if (rc != FSQL_OK) { free(bars); *error = 1; return NULL; }
+
+    if (!json_out_ensure(jo, 32)) { free(bars); *error = 1; return NULL; }
+    pos = (size_t) snprintf(jo->buf, jo->cap, "{\"h0_bars\":[");
+    for (size_t i = 0; i < n_h0_bars; i++) {
+        char field[128];
+        int  flen = snprintf(field, sizeof field, "%s{\"birth\":%.10f,\"death\":%.10f}",
+                             i > 0 ? "," : "", bars[i].birth, bars[i].death);
+        if (flen < 0 || (size_t) flen >= sizeof field) { free(bars); *error = 1; return NULL; }
+        if (!json_out_ensure(jo, pos + (size_t) flen + 64)) {
+            free(bars); *error = 1; return NULL;
+        }
+        memcpy(jo->buf + pos, field, (size_t) flen);
+        pos += (size_t) flen;
+    }
+    free(bars);
+    if (!json_out_ensure(jo, pos + 64)) { *error = 1; return NULL; }
+    if (max_dim == 1) {
+        pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos,
+            "],\"n_h0_bars\":%zu,\"betti1\":%zu}", n_h0_bars, betti1);
+    } else {
+        pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos,
+            "],\"n_h0_bars\":%zu,\"betti1\":null}", n_h0_bars);
+    }
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_optimize_subset                                 */
+/*                                                                    */
+/* fsql_optimize_subset generalizes portfolio optimization behind a   */
+/* caller-supplied objective callback, but SQL can't pass a function  */
+/* pointer -- same situation fractal_optimize_portfolio already       */
+/* solves by hardcoding Sharpe ratio. This hardcodes VALUE-WEIGHTED   */
+/* ALLOCATION: maximize sum(weight[i] * item_value[i]) subject to     */
+/* upper_bounds[i], the k-cardinality constraint, and (fixed off in   */
+/* this pass -- see below) an optional turnover penalty.              */
+/*                                                                    */
+/* item_values_csv/upper_bounds_csv: n_items doubles each.            */
+/* upper_bounds_csv may be '' for the core's default [0,1] per item.  */
+/* Turnover penalty (prev_weights) is not exposed here -- it needs a  */
+/* second n_items-length array threaded through the params JSON as a  */
+/* nested CSV string, which this pass keeps out of scope; every call  */
+/* here runs with turnover disabled (prev_weights=NULL,               */
+/* turnover_penalty=0.0), same as calling fsql_optimize_subset         */
+/* directly with turnover off. Returns {"score":<f>,"weights":[...]}. */
+/* params (all optional): {"seed": <int, default 0>}.                 */
+/* ------------------------------------------------------------------ */
+
+typedef struct subset_value_ctx {
+    const double *item_values;
+    size_t        n;
+} subset_value_ctx;
+
+/* fsql_subset_objective_fn: lower is better, so negate the quantity
+ * we actually want to maximize. */
+static double
+subset_value_objective(const double *weights, size_t n, void *ctx_void)
+{
+    subset_value_ctx *ctx = (subset_value_ctx *) ctx_void;
+    double sum = 0.0;
+    (void) n;  /* == ctx->n, guaranteed by the caller */
+    for (size_t i = 0; i < ctx->n; i++) sum += weights[i] * ctx->item_values[i];
+    return -sum;
+}
+
+FRACTAL_EXPORT bool
+fractal_optimize_subset_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 4) {
+        SFS_INIT_ERROR(message,
+            "fractal_optimize_subset(item_values_csv, upper_bounds_csv, k, params): "
+            "expected 4 arguments, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = STRING_RESULT;
+    args->arg_type[2] = INT_RESULT;
+    args->arg_type[3] = STRING_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_optimize_subset_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_optimize_subset(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                        unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char      errbuf[MYSQL_ERRMSG_SIZE];
+    double   *item_values = NULL, *upper_bounds = NULL, *weights = NULL;
+    size_t    n_items = 0, ub_n = 0, pos;
+    long long k;
+    const char *params_s; size_t params_len;
+    long long   seed;
+    double      score;
+    subset_value_ctx ctx;
+    int         rc;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[2] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+
+    k = *(long long *) args->args[2];
+    if (k <= 0) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0], &item_values, &n_items, errbuf)) {
+        *error = 1; return NULL;
+    }
+    if (args->args[1] != NULL && args->lengths[1] > 0) {
+        if (!parse_vector_csv(args->args[1], args->lengths[1], &upper_bounds, &ub_n, errbuf)) {
+            free(item_values); *error = 1; return NULL;
+        }
+        if (ub_n != n_items) {
+            free(item_values); free(upper_bounds); *error = 1; return NULL;
+        }
+    }
+    if ((size_t) k > n_items) {
+        free(item_values); free(upper_bounds); *error = 1; return NULL;
+    }
+
+    params_s   = (args->args[3] != NULL) ? args->args[3] : "{}";
+    params_len = (args->args[3] != NULL) ? args->lengths[3] : 2;
+    seed       = (long long) json_get_int(params_s, params_len, "seed", 0);
+
+    weights = malloc(n_items * sizeof(double));
+    if (weights == NULL) {
+        free(item_values); free(upper_bounds); *error = 1; return NULL;
+    }
+
+    ctx.item_values = item_values;
+    ctx.n           = n_items;
+    rc = fsql_optimize_subset(subset_value_objective, &ctx, n_items, (size_t) k,
+                              NULL, upper_bounds, NULL, 0.0, (uint64_t) seed,
+                              weights, &score);
+    free(item_values); free(upper_bounds);
+    if (rc != FSQL_OK) { free(weights); *error = 1; return NULL; }
+
+    /* score is -sum(weight*value) per subset_value_objective's sign
+     * convention (fsql_optimize_subset always minimizes); negate back
+     * to report the actual maximized value-weighted allocation. */
+    if (!json_out_ensure(jo, 64)) { free(weights); *error = 1; return NULL; }
+    {
+        int hlen = snprintf(jo->buf, jo->cap, "{\"score\":%.10f,\"weights\":[", -score);
+        if (hlen < 0 || (size_t) hlen >= jo->cap) { free(weights); *error = 1; return NULL; }
+        pos = (size_t) hlen;
+    }
+    for (size_t i = 0; i < n_items; i++) {
+        char field[356];
+        int  flen = snprintf(field, sizeof field, "%s%.10f",
+                             i > 0 ? "," : "", weights[i]);
+        if (flen < 0 || (size_t) flen >= sizeof field) { free(weights); *error = 1; return NULL; }
+        if (!json_out_ensure(jo, pos + (size_t) flen + 8)) {
+            free(weights); *error = 1; return NULL;
+        }
+        memcpy(jo->buf + pos, field, (size_t) flen);
+        pos += (size_t) flen;
+    }
+    free(weights);
+    if (!json_out_ensure(jo, pos + 8)) { *error = 1; return NULL; }
+    pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos, "]}");
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
 }

@@ -109,12 +109,29 @@ CREATE TABLE agents_demo_badstates (id INT PRIMARY KEY AUTO_INCREMENT, emb JSON)
 INSERT INTO agents_demo_badstates (emb) VALUES ('[1.0, 0.0, 0.0]'), ('[0.9, 0.1, 0.0]');
 
 CALL fractal_agent_outlier_intercept(
-    '[0.95, 0.05, 0.0]', 'agents_demo_badstates', 'emb', 0.5, @r);
+    '[0.95, 0.05, 0.0]', 'agents_demo_badstates', 'emb', 0.5, 'cosine', @r);
 SELECT JSON_VALUE(@r, '$.intercepted') AS intercepted, JSON_VALUE(@r, '$.reason') AS reason;
 
 CALL fractal_agent_outlier_intercept(
-    '[0.0, 1.0, 0.0]', 'agents_demo_badstates', 'emb', 0.5, @r);
+    '[0.0, 1.0, 0.0]', 'agents_demo_badstates', 'emb', 0.5, 'cosine', @r);
 SELECT JSON_VALUE(@r, '$.intercepted') AS intercepted, JSON_VALUE(@r, '$.reason') AS reason;
+
+-- 5b. The metric is an explicit argument (a threshold is calibrated
+-- against one metric, so the metric must be chosen by the caller; any
+-- other value, including NULL, is an error rather than a silent
+-- fallback). Same probe as the allow above: under exact L2 it is
+-- genuinely far from every bad state in raw magnitude too, so the
+-- decision is the opposite of a near-bad-state probe would be. This
+-- call also exercises the exact-L2 scan branch (MariaDB has no indexed
+-- <-> operator, so the L2 branch is an exact scan over the same corpus
+-- the cosine branch loads). The guard-argument ordering is the
+-- opposite of the cosine calls on purpose: the same probe gets the
+-- opposite decision under the two metrics.
+CALL fractal_agent_outlier_intercept(
+    '[0.0, 1.0, 0.0]', 'agents_demo_badstates', 'emb', 0.5, 'l2', @r);
+SELECT JSON_VALUE(@r, '$.intercepted') AS intercepted,
+       JSON_VALUE(@r, '$.nearest_distance') AS nearest_distance,
+       JSON_VALUE(@r, '$.metric') AS metric;
 
 -- 6. fractal_agent_recall_hybrid (happy path). Pure retrieval, no LLM.
 -- No session_id-as-id-col arg, state_vector's own row (agents_demo_mem's

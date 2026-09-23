@@ -110,6 +110,11 @@ REM Same VCPKG_ROOT convention as fractalsql-reasoning-http's own
 REM scripts\build-windows.ps1: default to C:\vcpkg (pre-installed at
 REM that exact path on GitHub's windows-latest/windows-2022 runners),
 REM overridable via the environment.
+REM ORDERING TRAP: VS's own vcvars64.bat/vsdevcmd.bat RESET VCPKG_ROOT
+REM to the VS-bundled vcpkg (VC\vcpkg), whose installed/ tree typically
+REM lacks the x64-windows-static triplet -- so set VCPKG_ROOT AFTER
+REM calling vcvars, not before, or the value you exported is silently
+REM overwritten before this script runs.
 if "%VCPKG_ROOT%"=="" if not "%VCPKG_INSTALLATION_ROOT%"=="" set VCPKG_ROOT=%VCPKG_INSTALLATION_ROOT%
 if "%VCPKG_ROOT%"=="" set VCPKG_ROOT=C:\vcpkg
 if not exist "%VCPKG_ROOT%\vcpkg.exe" (
@@ -122,6 +127,9 @@ set OPENSSL_DIR=%VCPKG_ROOT%\installed\x64-windows-static
 if not exist "%OPENSSL_DIR%\include\openssl\evp.h" (
     echo ==^> ERROR: OpenSSL headers not found under %OPENSSL_DIR%
     echo         Run: vcpkg install openssl:x64-windows-static
+    echo         If %OPENSSL_DIR% is the VS-bundled vcpkg (under VC\vcpkg^),
+    echo         vcvars64.bat overwrote VCPKG_ROOT -- set VCPKG_ROOT to
+    echo         your real vcpkg AFTER calling vcvars, then rerun.
     exit /b 1
 )
 echo ==^> OPENSSL_DIR    = %OPENSSL_DIR%

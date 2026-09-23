@@ -143,7 +143,7 @@ own recipe.
 | `fractal_sql_agent` | Self-correcting NL-to-SQL, retrying on validation failure, with an optional auto-execute step. |
 | `fractal_agent_plan_explore` | Scout-search-driven exploration of multiple non-overlapping strategy branches. |
 | `fractal_agent_trajectory_predict` | Forecasts future state from a delta against a table's historical rows. |
-| `fractal_agent_detect_loop` | Flags infinite/repetitive agent loops via a DFA scaling exponent. |
+| `fractal_agent_detect_loop` | Flags infinite/repetitive agent loops via SimHash state fingerprints and Brent's cycle detector, with a DFA drift check. |
 
 ### Safe Agency & Guardrails
 
@@ -177,6 +177,20 @@ of data and state, turning raw vectors into actionable structural insights.
 - **Drift (`fractal_dimension_drift`)**: Detects regime changes by
   comparing the DFA exponent of a recent window against a baseline.
 
+### Time-Series and Topology
+- **Change-Point Localization (`fractal_change_point_detect`)**: Localizes
+  where a series' mean or variance shifted, complementing DFA's overall
+  characterization.
+- **Periodogram (`fractal_periodogram`)**: Exact power spectrum (direct DFT)
+  for cadence detection such as network beaconing or retry loops.
+- **Persistence (`fractal_tda_persistence_diagram`)**: Exact 0-dimensional
+  persistence over a point cloud's Vietoris-Rips filtration, plus the graph
+  cycle rank as an informational Betti-number estimate.
+- **SimHash (`fractal_state_fingerprint`)**: Folds a state vector into a
+  Hamming-comparable fingerprint where nearly-identical states collide.
+- **Cycle Detection (`fractal_cycle_detect`)**: Streaming Brent's algorithm
+  over a fingerprint stream, one output per cycle closure.
+
 ### Domain-Specific Geometry
 FractalSQL provides optimized routines for pre-extracted biological and
 technical geometry: vascular networks (tortuosity, branch-density),
@@ -188,6 +202,16 @@ masks).
 `fractal_optimize_portfolio` uses the SFS engine to solve
 cardinality-constrained Sharpe-ratio maximization: the best $K$ assets in a
 large universe without the exponential cost of a brute-force search.
+`fractal_optimize_subset` generalizes the same search to value-weighted
+allocation over any scored item list with per-item bounds.
+
+### Vector Math
+- **$L_p$ Distance (`fractal_vector_lp_distance`)**: Generalized distance
+  for any $p > 0$ (for $0 < p < 1$ this is not a proper metric; use it
+  explicitly, never as a silent default).
+- **Quantization (`fractal_vector_quantize_int8` / `_binary`)**: 4x/32x
+  per-vector compression with Hamming pre-filtering
+  (`fractal_vector_hamming_distance`) ahead of a full-precision re-rank.
 
 ---
 

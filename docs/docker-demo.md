@@ -47,7 +47,7 @@ Confirm the UDF set loaded:
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
   "SELECT fractal_edition(), fractal_version();"
-# expect: Community, 2.0.3
+# expect: Community, 2.0.7
 ```
 
 Run any demo (re-runnable; each recreates its own fixture tables):
@@ -133,7 +133,7 @@ Discovery demos do not.)
 
 ### Level 3: Autonomous Agency
 *Focus: Building self-correcting, safe, and predictive agentic workflows.*
-- **Goal**: Learn to use loop detection (DFA), trajectory prediction, and self-correcting SQL agents. The reference blueprint agents ship inline in each vertical demo; the sixteen installable agents are exercised by `demo-agents.sql` (which uses the real, already-registered `sql/install_agents.sql` product path).
+- **Goal**: Learn to use loop detection (SimHash fingerprints + cycle detection), trajectory prediction, and self-correcting SQL agents. The reference blueprint agents ship inline in each vertical demo; the sixteen installable agents are exercised by `demo-agents.sql` (which uses the real, already-registered `sql/install_agents.sql` product path).
 - **Demos**:
   ```bash
   # DevOps: Autonomous Incident Triage & Self-Healing
@@ -144,6 +144,8 @@ Discovery demos do not.)
   docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-agentic-fintech-mcts.sql
   # Cyber: Threat Detection & Triage
   docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-cybersecurity-threat-detection.sql
+  # Edge Swarm: quantized swarm memory, loop detection, task routing (no reasoning needed)
+  docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vertical-agentic-edge-swarm.sql
   # The sixteen installable agents (already registered from docker-entrypoint-initdb.d)
   docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-agents.sql
   ```
@@ -157,10 +159,13 @@ does and when to use it.
 `demo-text-to-sql.sql`, `demo-vectorizer.sql`, `demo-fractal-vector.sql`,
 `benchmark.sql`, `benchmark-api-reference.sql`, the `text-to-sql-spike-*.sql`
 series, and the enterprise-tier `enterprise-qtl-audit.sql`/`enterprise-stress.sql`
-(see [`docs/enterprise.md`](enterprise.md)). Run any the same way. See
+(see [`docs/enterprise.md`](enterprise.md)). Run any the same way.
+`demo-vertical-biotech-genomics.sql` (TDA + L_p on a cyclic cell-cycle
+trajectory and gene-expression profiles, no reasoning needed) is in the
+image too. See
 [demo/README.md](../demo/README.md#industry-vertical-demos) for the full
-industry-vertical list, including the eight non-agentic verticals not called
-out above.
+industry-vertical list, including the ten non-agentic verticals (nine of
+which are called out above).
 
 ---
 

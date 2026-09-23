@@ -177,17 +177,67 @@ INSERT INTO vao_known_bad_states (state_id, description, state_vec) VALUES
 -- DEMONSTRATION
 -- -----------------------------------------------------------------------------
 
--- === 4. Loop Detection via DFA + short-period check ===
--- The state_hash sequence is a clean 12345<->67890 period-2 toggle. Its
--- DFA scaling exponent is well below the 0.9 threshold, so the DFA path
--- alone would NOT flag it -- but the short-period check does. Result:
--- loop_detected = true.
+-- === 4. Loop Detection over real state vectors (SimHash + Brent's cycle kernel) ===
+-- (v2.0.25 rewrite: fractal_agent_detect_loop now fingerprints real state
+-- vectors, not exact state hashes. Each state is SimHash-fingerprinted
+-- (Charikar 2002; n_bits random hyperplanes, deterministic from seed) and
+-- the fingerprint stream feeds a streaming Brent's-algorithm cycle kernel
+-- (Brent 1980), which catches near-identical repeats the old exact-hash
+-- period scan could not. The DFA exponent now runs over each state's L2
+-- norm across the trajectory instead of over the hashes themselves.)
+--
+-- Trajectory 1, 'bot-deploy-01': a deployment bot stuck re-deciding the
+-- same two actions back and forth ("cognitive wobble") -- 20 consecutive
+-- states alternating between two near-identical vectors (the second is a
+-- ~1.1% rotation of the first). The old exact-hash scan saw two distinct
+-- hashes toggling and could only catch them via the hash values repeating
+-- exactly. Live-verified behavior: the two vectors are SO close that
+-- SimHash's random-hyperplane rounding collapses both to the same
+-- fingerprint, so the stream is a period-1 loop and the kernel reports
+-- cycle_len=1, at_index=1, cycle_detected=true -- and dfa_exponent=NULL
+-- (the 1.1% norm wobble is below the DFA's fluctuation floor). Either
+-- way, the agent is flagged as looping. For a period-2 cycle_len=2
+-- closure, the two states must be far enough apart that their
+-- fingerprints actually differ (see build_test gate 24's distinct-states
+-- case).
+CREATE TABLE vao_agent_state_log (
+    agent_id  VARCHAR(64),
+    event_ts  INT,
+    state_vec JSON
+);
+INSERT INTO vao_agent_state_log VALUES
+  ('bot-deploy-01',  1, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01',  2, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01',  3, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01',  4, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01',  5, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01',  6, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01',  7, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01',  8, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01',  9, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01', 10, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01', 11, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01', 12, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01', 13, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01', 14, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01', 15, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01', 16, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01', 17, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01', 18, '[0.505, 0.495, 0.500]'),
+  ('bot-deploy-01', 19, '[0.500, 0.500, 0.500]'),
+  ('bot-deploy-01', 20, '[0.505, 0.495, 0.500]');
+
 CALL fractal_agent_detect_loop(
-    (SELECT JSON_ARRAYAGG(state_hash ORDER BY event_ts) FROM vao_incident_logs WHERE agent_id = 'bot-deploy-01'),
+    'bot-deploy-01',
+    (SELECT JSON_ARRAYAGG(state_vec ORDER BY event_ts)
+       FROM vao_agent_state_log WHERE agent_id = 'bot-deploy-01'),
+    16, 42.0, 2,
     @r);
-SELECT JSON_VALUE(@r, '$.recommendation') AS recommendation,
-       JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,
-       JSON_VALUE(@r, '$.loop_detected') AS loop_detected;
+SELECT JSON_VALUE(@r, '$.loop_detected')  AS loop_detected,
+       JSON_VALUE(@r, '$.cycle_detected') AS cycle_detected,
+       JSON_VALUE(@r, '$.cycle_len')      AS cycle_len,
+       JSON_VALUE(@r, '$.at_index')       AS at_index,
+       JSON_VALUE(@r, '$.dfa_exponent')   AS dfa_exponent;
 
 -- === 5. Multi-Agent Routing (fractal_agent_route_task) ===
 -- Real nearest-capability search over agent_capabilities.embedding.
@@ -205,11 +255,15 @@ SELECT JSON_VALUE(@r, '$.routed_to') AS routed_to,
 -- === 6. Outlier Interception (fractal_agent_outlier_intercept) ===
 -- Real cosine distance to the nearest known_bad_states row. This
 -- state_vec matches state_id 1 exactly (distance 0), so
--- intercepted = true.
+-- intercepted = true. The metric is an explicit argument (a threshold
+-- is calibrated against one metric, so the metric must be chosen by
+-- the caller; anything else, including NULL, is an error rather than a
+-- silent fallback) -- 'cosine' here, the metric this library's
+-- thresholds were calibrated against.
 CALL fractal_agent_outlier_intercept(
     '[0.5, 0.5, 0.5]',
     'vao_known_bad_states', 'state_vec',
-    0.8,
+    0.8, 'cosine',
     @r);
 SELECT JSON_VALUE(@r, '$.intercepted') AS intercepted,
        JSON_VALUE(@r, '$.reason') AS reason;

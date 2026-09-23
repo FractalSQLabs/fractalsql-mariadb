@@ -34,6 +34,7 @@
 #include <mysql.h>
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -601,3 +602,288 @@ FRACTAL_VECTOR_CANONICALIZE(fractal_vector_to_float8_array,
     "kept as a distinct name to document conversion direction at the call site.")
 
 #undef FRACTAL_VECTOR_CANONICALIZE
+
+/* ==================================================================== */
+/* v2.0.25 additions: Lp distance, int8/binary quantization, Hamming    */
+/* distance. Same conventions as the rest of this file -- ships         */
+/* unconditionally, no gating.                                          */
+/* ==================================================================== */
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_vector_lp_distance(a, b, p)                     */
+/*                                                                    */
+/* (sum(|a[i]-b[i]|^p))^(1/p), p > 0. Real caveat, not a stability     */
+/* one: for 0 < p < 1 this does not satisfy the triangle inequality   */
+/* (a mathematical property of Lp spaces themselves, true of ANY      */
+/* correct implementation, not something this codebase gets wrong).   */
+/* Ships as an explicit, separately-named function -- never a silent  */
+/* default in place of fractal_vector_l2_distance/cosine_distance.    */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_vector_lp_distance_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 3) {
+        SFS_INIT_ERROR(message,
+            "fractal_vector_lp_distance(a, b, p): expected 3 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = STRING_RESULT;
+    args->arg_type[2] = REAL_RESULT;
+    initid->maybe_null = 1;
+    return false;
+}
+
+FRACTAL_EXPORT void
+fractal_vector_lp_distance_deinit(UDF_INIT *initid) { (void) initid; }
+
+FRACTAL_EXPORT double
+fractal_vector_lp_distance(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
+{
+    char   errbuf[MYSQL_ERRMSG_SIZE];
+    float *a = NULL, *b = NULL;
+    size_t dim = 0;
+    double p;
+    float  out;
+    int    rc;
+    (void) initid;
+
+    if (args->args[0] == NULL || args->args[1] == NULL || args->args[2] == NULL) {
+        *is_null = 1; return 0.0;
+    }
+    if (args->lengths[0] > FSQL_VECTOR_MAX_BYTES ||
+        args->lengths[1] > FSQL_VECTOR_MAX_BYTES) { *error = 1; return 0.0; }
+
+    p = *(double *) args->args[2];
+    if (p <= 0.0) { *error = 1; return 0.0; }
+
+    if (!load_pair(args, &a, &b, &dim, errbuf)) { *error = 1; return 0.0; }
+    rc = fsql_vector_lp_distance(a, b, dim, (float) p, &out);
+    free(a); free(b);
+    if (rc != FSQL_OK) { *error = 1; return 0.0; }
+
+    *is_null = 0;
+    return (double) out;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_vector_quantize_int8(vec)                       */
+/*                                                                    */
+/* Per-vector symmetric int8 quantization (4x compression). Returns   */
+/* {"scale":<f>,"values":[i1,i2,...]}; dequantize via                 */
+/* v[i] ~= values[i] * scale.                                         */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_vector_quantize_int8_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 1) {
+        SFS_INIT_ERROR(message,
+            "fractal_vector_quantize_int8(vec): expected 1 argument, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_vector_quantize_int8_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_vector_quantize_int8(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                             unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char    errbuf[MYSQL_ERRMSG_SIZE];
+    float  *v = NULL;
+    int8_t *out = NULL;
+    float   scale;
+    size_t  dim = 0, pos;
+    int     rc;
+    (void) result;
+
+    if (args->args[0] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > FSQL_VECTOR_MAX_BYTES) { *error = 1; return NULL; }
+    if (!load_vector(args->args[0], args->lengths[0], &v, &dim, errbuf)) {
+        *error = 1; return NULL;
+    }
+    out = malloc(dim > 0 ? dim : 1);
+    if (out == NULL) { free(v); *error = 1; return NULL; }
+
+    rc = fsql_vector_quantize_int8(v, dim, out, &scale);
+    free(v);
+    if (rc != FSQL_OK) { free(out); *error = 1; return NULL; }
+
+    if (!json_out_ensure(jo, dim * 8 + 32)) { free(out); *error = 1; return NULL; }
+    pos = (size_t) snprintf(jo->buf, jo->cap, "{\"scale\":%.10g,\"values\":[", (double) scale);
+    for (size_t i = 0; i < dim; i++) {
+        int flen = snprintf(jo->buf + pos, jo->cap - pos, "%s%d",
+                            i > 0 ? "," : "", (int) out[i]);
+        if (flen < 0 || (size_t) flen >= jo->cap - pos) { free(out); *error = 1; return NULL; }
+        pos += (size_t) flen;
+    }
+    free(out);
+    if (!json_out_ensure(jo, pos + 4)) { *error = 1; return NULL; }
+    pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos, "]}");
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_vector_quantize_binary(vec)                     */
+/*                                                                    */
+/* Binary (1-bit) quantization (32x compression), sign of v[i] packed */
+/* MSB-first. Returns a JSON array of the (dim+7)/8 output bytes,     */
+/* e.g. "[145,3]" -- pairs with fractal_vector_hamming_distance for   */
+/* cheap candidate filtering.                                         */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_vector_quantize_binary_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 1) {
+        SFS_INIT_ERROR(message,
+            "fractal_vector_quantize_binary(vec): expected 1 argument, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_vector_quantize_binary_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_vector_quantize_binary(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                               unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char     errbuf[MYSQL_ERRMSG_SIZE];
+    float   *v = NULL;
+    uint8_t *out = NULL;
+    size_t   dim = 0, n_bytes, pos;
+    int      rc;
+    (void) result;
+
+    if (args->args[0] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > FSQL_VECTOR_MAX_BYTES) { *error = 1; return NULL; }
+    if (!load_vector(args->args[0], args->lengths[0], &v, &dim, errbuf)) {
+        *error = 1; return NULL;
+    }
+    n_bytes = (dim + 7) / 8;
+    out = malloc(n_bytes > 0 ? n_bytes : 1);
+    if (out == NULL) { free(v); *error = 1; return NULL; }
+
+    rc = fsql_vector_quantize_binary(v, dim, out);
+    free(v);
+    if (rc != FSQL_OK) { free(out); *error = 1; return NULL; }
+
+    if (!json_out_ensure(jo, n_bytes * 4 + 4)) { free(out); *error = 1; return NULL; }
+    jo->buf[0] = '['; pos = 1;
+    for (size_t i = 0; i < n_bytes; i++) {
+        int flen = snprintf(jo->buf + pos, jo->cap - pos, "%s%u",
+                            i > 0 ? "," : "", (unsigned) out[i]);
+        if (flen < 0 || (size_t) flen >= jo->cap - pos) { free(out); *error = 1; return NULL; }
+        pos += (size_t) flen;
+    }
+    free(out);
+    jo->buf[pos++] = ']';
+    jo->buf[pos]   = '\0';
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* Parses a JSON/CSV array of small non-negative integers (0-255) into
+ * a caller-owned uint8_t buffer -- local to this TU, mirroring
+ * fractalsql.c's own parse_byte_array (this repo's established
+ * per-TU-duplication convention for small shared helpers). */
+static bool
+parse_byte_array(const char *s, size_t slen, uint8_t **out, size_t *n_out, char *errbuf)
+{
+    double  *dv = NULL;
+    size_t   n = 0;
+    uint8_t *bv;
+
+    if (!parse_vector_csv(s, slen, &dv, &n, errbuf)) return false;
+    bv = malloc(n > 0 ? n : 1);
+    if (bv == NULL) {
+        SFS_INIT_ERROR(errbuf, "fractal_vector: oom");
+        free(dv);
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (dv[i] < 0.0 || dv[i] > 255.0 || dv[i] != (double) (int) dv[i]) {
+            SFS_INIT_ERROR(errbuf, "fractal_vector: byte array element %zu out of range [0,255]", i);
+            free(dv); free(bv);
+            return false;
+        }
+        bv[i] = (uint8_t) dv[i];
+    }
+    free(dv);
+    *out   = bv;
+    *n_out = n;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_vector_hamming_distance(a_bytes_json, b_bytes_json) */
+/*                                                                    */
+/* Hamming distance between two binary-quantized vectors, as packed   */
+/* by fractal_vector_quantize_binary (JSON array of bytes). Requires  */
+/* equal byte length.                                                 */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_vector_hamming_distance_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 2) {
+        SFS_INIT_ERROR(message,
+            "fractal_vector_hamming_distance(a_bytes, b_bytes): expected 2 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    args->arg_type[1] = STRING_RESULT;
+    initid->maybe_null = 1;
+    return false;
+}
+
+FRACTAL_EXPORT void
+fractal_vector_hamming_distance_deinit(UDF_INIT *initid) { (void) initid; }
+
+FRACTAL_EXPORT long long
+fractal_vector_hamming_distance(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
+{
+    char     errbuf[MYSQL_ERRMSG_SIZE];
+    uint8_t *a = NULL, *b = NULL;
+    size_t   na = 0, nb = 0, out;
+    int      rc;
+    (void) initid;
+
+    if (args->args[0] == NULL || args->args[1] == NULL) { *is_null = 1; return 0; }
+    if (args->lengths[0] > FSQL_VECTOR_MAX_BYTES ||
+        args->lengths[1] > FSQL_VECTOR_MAX_BYTES) { *error = 1; return 0; }
+
+    if (!parse_byte_array(args->args[0], args->lengths[0], &a, &na, errbuf)) {
+        *error = 1; return 0;
+    }
+    if (!parse_byte_array(args->args[1], args->lengths[1], &b, &nb, errbuf)) {
+        free(a); *error = 1; return 0;
+    }
+    if (na != nb) { free(a); free(b); *error = 1; return 0; }
+
+    rc = fsql_vector_hamming_distance(a, b, na, &out);
+    free(a); free(b);
+    if (rc != FSQL_OK) { *error = 1; return 0; }
+
+    *is_null = 0;
+    return (long long) out;
+}

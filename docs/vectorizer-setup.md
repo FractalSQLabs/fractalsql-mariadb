@@ -117,6 +117,22 @@ SELECT fractal_vector_add(a, b), fractal_vector_sub(a, b), fractal_vector_scale(
 SELECT fractal_vector_dims(a);
 ```
 
+### Quantization & L_p helpers (portable path)
+| Function | What it does |
+| --- | --- |
+| `fractal_vector_lp_distance(a, b, p)` | Generalized $L_p$ distance, any $p > 0$ (for $0 < p < 1$ this is not a proper metric; use explicitly, never as a silent substitute for the search primitives' own cosine) |
+| `fractal_vector_quantize_int8(a)` | Symmetric int8 quantization, 4x compression, returns `{"scale":..,"values":[..]}` |
+| `fractal_vector_quantize_binary(a)` | 1-bit quantization, up to 32x compression, MSB-first sign bits as a JSON byte array |
+| `fractal_vector_hamming_distance(a, b)` | Hamming distance between two `fractal_vector_quantize_binary` outputs (cheap candidate filtering ahead of a full-precision re-rank) |
+
+```sql
+-- Cheap candidate filtering ahead of a full-precision cosine re-rank:
+SELECT fractal_vector_hamming_distance(
+    fractal_vector_quantize_binary(a.embedding),
+    fractal_vector_quantize_binary('[1,-2,3]'))
+FROM docs a WHERE a.embedding IS NOT NULL;
+```
+
 ---
 
 ## Endpoint Providers

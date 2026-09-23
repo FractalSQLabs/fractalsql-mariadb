@@ -50,3 +50,8 @@ __pycache__/
 *~
 .DS_Store
 Thumbs.db
+
+# Local-only Docker Compose override (LAN reasoning endpoint)
+docker-compose.override.yml
+demo-run-logs/
+run-all-demos.sh

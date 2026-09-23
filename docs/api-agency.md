@@ -251,22 +251,33 @@ blocking.
 | `p_history_table` | `VARCHAR(128)` | table of known-bad states |
 | `p_emb_col` | `VARCHAR(64)` | that table's embedding column |
 | `p_threshold` | `DOUBLE` | distance below which the action is intercepted |
-| `p_result` (OUT) | `JSON` | `{"intercepted":true\|false, "reason":".."}` |
+| `p_metric` | `VARCHAR(16)` | `'cosine'` or `'l2'` — the metric the threshold is calibrated against |
+| `p_result` (OUT) | `JSON` | `{"intercepted":true\|false, "nearest_distance":.., "nearest_doc_id":.., "metric":"..", "reason":".."}` |
 
-**How it works.** (1) `fractal_search_telemetry(history_table, emb_col,
-state_vec, 1)` finds the nearest known-bad state by real cosine distance.
-(2) `intercepted = (nearest_distance < threshold)`, a real comparison, not
-a heuristic. (3) `fractal_reason` justifies the decision.
+**How it works.** The metric is an explicit argument — a threshold is
+calibrated against one metric, so the metric must be chosen by the caller.
+(1) `metric='cosine'` (the default the shipped engine and its demos were
+calibrated against) uses `fractal_search_telemetry(history_table, emb_col,
+state_vec, 1)` to find the nearest known-bad state by real cosine distance.
+`metric='l2'` finds the nearest bad state with an exact O(n·dim) scan
+(MariaDB has no indexed `<->` operator), each row's distance computed via
+`fractal_vector_lp_distance` at `p=2`. (2) `intercepted =
+(nearest_distance < threshold)`, a real comparison, not a heuristic.
+(3) `fractal_reason` justifies the decision, naming the metric used so the
+threshold's own basis is auditable.
 
 **Example**
 ```sql
-CALL fractal_agent_outlier_intercept('[0.95,0.05,0]', 'bt_history', 'emb', 0.1, @result);
+CALL fractal_agent_outlier_intercept('[0.95,0.05,0]', 'bt_history', 'emb', 0.1, 'cosine', @result);
 SELECT @result;
 ```
 
 **Notes.** `p_history_table` must have at least one row, or the underlying
 search primitive `SIGNAL`s cleanly rather than returning a meaningless
-result.
+result. Any `p_metric` other than `'cosine'` or `'l2'`, including NULL, is
+a hard `SIGNAL` error rather than a silent fallback. All history rows must
+have the same dimension as `state_vec` (a mismatching row is a clean
+`SIGNAL`, not a silent skip).
 
 ---
 
@@ -813,10 +824,17 @@ living in `sql/install_agents.sql` (five of them) and `sql/install_udf.sql`
   its own vector (`plan_trajectory`), and `score = 1 - distance`, as a JSON
   array in `p_result` (MariaDB has no `RETURNS TABLE`, so this replaces
   a set-returning function).
-- `fractal_agent_detect_loop(log_hashes, OUT result)`: a pure numeric
-  function needing no table access at all. It flags a loop if either the DFA
-  scaling exponent on `log_hashes` exceeds 0.9, or a tight discrete
-  repetition period is found (period search capped at n/4).
+- `fractal_agent_detect_loop(agent_id, state_log, n_bits, seed, hamming_threshold, OUT result)`: a pure numeric
+  procedure needing no table access at all, over the agent's own state-vector
+  trajectory (`state_log`, a JSON array of state vectors). It flags a loop if
+  either the DFA scaling exponent on the per-state L2 norms exceeds 0.9, or a
+  fingerprint cycle closes: each state is SimHash-fingerprinted
+  (`fractal_state_fingerprint`, `n_bits`/`seed`, NULL for the 64-bit/42.0
+  defaults) and the stream feeds a streaming Brent's-algorithm cycle kernel
+  (`fractal_cycle_detect`, `hamming_threshold`, 0 = exact-match only). The
+  cycle kernel catches near-identical repeats the old exact-hash period scan
+  could not; `agent_id` is echoed back for auditability, and the result adds
+  `cycle_detected`/`cycle_len`/`at_index` detail.
 
 Each of these six is a MariaDB stored PROCEDURE with a trailing `OUT`
 parameter, called with `CALL ...(..., @result); SELECT @result;`, the
@@ -856,17 +874,17 @@ the 16 recipes above.
 
 ## Reference blueprints: Domain Agents
 
-The three agentic-vertical demos (`demo/demo-vertical-agentic-ops-devops.sql` for DevOps/SRE, `-fintech-mcts.sql` for FinTech, `-customer-support.sql` for Customer Support) are reference blueprints for the shipped agent procedures in a concrete domain: SOC incident triage and task routing, portfolio rebalancing with scenario exploration, and churn-drift forecasting with hybrid memory recall and diverse retention offers. Unlike fractalsql-postgresql, there's no separate hand-written blueprint layer to keep as a comment here — `sql/install_agents.sql`'s sixteen recipes were the agent layer from the start, so each demo just calls them directly against real tables and data. To try them: run `SOURCE sql/install_udf.sql;` then `SOURCE sql/install_agents.sql;`, configure reasoning (see [reasoning-setup.md](reasoning-setup.md)) and, for the DevOps/SRE and FinTech demos, an embeddings endpoint (see [vectorizer-setup.md](vectorizer-setup.md)), then run a demo end to end (`mariadb -u root -p <your_database> < demo/demo-vertical-agentic-customer-support.sql`) and read its own header comment and `CALL fractal_agent_x(...)` calls to see exactly how each one is composed. Eight further industry-vertical demos ship alongside these three; see [demo/README.md](../demo/README.md#industry-vertical-demos) for the full list.
+The three agentic-vertical demos (`demo/demo-vertical-agentic-ops-devops.sql` for DevOps/SRE, `-fintech-mcts.sql` for FinTech, `-customer-support.sql` for Customer Support) are reference blueprints for the shipped agent procedures in a concrete domain: SOC incident triage and task routing, portfolio rebalancing with scenario exploration, and churn-drift forecasting with hybrid memory recall and diverse retention offers. There's no separate hand-written blueprint layer to keep in sync here — `sql/install_agents.sql`'s sixteen recipes were the agent layer from the start, so each demo just calls them directly against real tables and data. To try them: run `SOURCE sql/install_udf.sql;` then `SOURCE sql/install_agents.sql;`, configure reasoning (see [reasoning-setup.md](reasoning-setup.md)) and, for the DevOps/SRE and FinTech demos, an embeddings endpoint (see [vectorizer-setup.md](vectorizer-setup.md)), then run a demo end to end (`mariadb -u root -p <your_database> < demo/demo-vertical-agentic-customer-support.sql`) and read its own header comment and `CALL fractal_agent_x(...)` calls to see exactly how each one is composed. Eight further industry-vertical demos ship alongside these three; see [demo/README.md](../demo/README.md#industry-vertical-demos) for the full list.
 
 ### DevOps / SRE — `demo/demo-vertical-agentic-ops-devops.sql`
 
 | Agent Procedure | Composes | Purpose |
 | --- | --- | --- |
 | `fractal_agent_route_task(task_desc, budget, cost_per_route, OUT result)` | `agent_capabilities` table scan + `fractal_reason` | Sub-agent dispatcher: matches an incoming task to the best capable sub-agent (`routed_to` is the real `capability_name` PK), plus token-budget accounting. |
-| `fractal_agent_outlier_intercept(state_vec, history_table, vector_col, threshold, OUT result)` | `fractal_search_telemetry` | Pre-commit safety barrier: screens a proposed action's state vector against known-bad state clusters, intercepting it when the nearest bad state is within `threshold`. |
+| `fractal_agent_outlier_intercept(state_vec, history_table, vector_col, threshold, metric, OUT result)` | `fractal_search_telemetry` (`'cosine'`) / `fractal_vector_lp_distance` (`'l2'`) | Pre-commit safety barrier: screens a proposed action's state vector against known-bad state clusters under the caller-chosen metric, intercepting it when the nearest bad state is within `threshold`. |
 | `fractal_agent_anomaly_triage(host_id, log_table, baseline_window, OUT result)` | `fractal_dimension_drift` + `fractal_reason` | Per-entity incident triage: scores drift on the host's latency series, then reasons a human-readable triage summary over the drift result. |
 
-Also exercises `fractal_agent_detect_loop` (period-2 loop detection, a pure numeric primitive with no table access) and `fractal_search_agent`/`fractal_rag_agent` (embed → Scout-search a real vectorized column → reason over the matched rows).
+Also exercises `fractal_agent_detect_loop` (SimHash fingerprint + streaming Brent's cycle kernel over a real state-vector trajectory, a pure numeric primitive with no table access) and `fractal_search_agent`/`fractal_rag_agent` (embed → Scout-search a real vectorized column → reason over the matched rows).
 
 ### FinTech — `demo/demo-vertical-agentic-fintech-mcts.sql`
 

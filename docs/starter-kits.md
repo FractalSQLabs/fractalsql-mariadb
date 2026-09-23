@@ -7,7 +7,7 @@
 You have the extension running ([getting-started.md](getting-started.md)). Now:
 **which end-to-end example do I run for *my* problem?**
 
-FractalSQL ships eleven runnable industry walkthroughs: eight **domain
+FractalSQL ships thirteen runnable industry walkthroughs: ten **domain
 verticals** (a single `mariadb <` each, mostly no-model) and three **agentic
 verticals** (composed multi-step agents, model-on). Each kit is a
 self-contained script: it builds its own synthetic dataset, runs the agents
@@ -38,7 +38,9 @@ file list.
 | Maritime / aviation track anomaly | `demo-vertical-maritime-defense.sql` | `fractal_agent_track_anomaly`, `fractal_search_trajectory`, `fractal_dimension_dfa` | [fractal_agent_track_anomaly](api-agency.md#track-anomaly-fractal_agent_track_anomaly) |
 | Fleet logistics / detour detection | `demo-vertical-fleet-logistics.sql` | `fractal_agent_detour_classify`, `fractal_search_trajectory`, `fractal_dimension_boxcount` | [fractal_agent_detour_classify](api-agency.md#detour-classify-fractal_agent_detour_classify) |
 | Smart cities / IoT sensor grids | `demo-vertical-smart-cities-iot.sql` | `fractal_agent_network_coverage_alert`, `fractal_dimension_boxcount`/`fractal_morphological_complexity`, `fractal_dimension_dfa`/`_drift`, Scout | [fractal_agent_network_coverage_alert](api-agency.md#network-coverage-alert-fractal_agent_network_coverage_alert) |
-| Cybersecurity / network behavior analytics | `demo-vertical-cybersecurity-threat-detection.sql` | `fractal_agent_track_anomaly`, `fractal_agent_regime_triage`, `fractal_search_trajectory`, `fractal_dimension_dfa`/`_drift` | [fractal_agent_track_anomaly](api-agency.md#track-anomaly-fractal_agent_track_anomaly), [fractal_agent_regime_triage](api-agency.md#regime-triage-fractal_agent_regime_triage-general-purpose-no-table-args) |
+| Cybersecurity / network behavior analytics | `demo-vertical-cybersecurity-threat-detection.sql` | `fractal_agent_track_anomaly`, `fractal_agent_regime_triage`, `fractal_search_trajectory`, `fractal_dimension_dfa`/`_drift`, `fractal_periodogram` | [fractal_agent_track_anomaly](api-agency.md#track-anomaly-fractal_agent_track_anomaly), [fractal_agent_regime_triage](api-agency.md#regime-triage-fractal_agent_regime_triage-general-purpose-no-table-args) |
+| Structural biology / single-cell genomics | `demo-vertical-biotech-genomics.sql` | `fractal_tda_persistence_diagram`, `fractal_vector_lp_distance` (raw primitives, no agents) | [api-analytics.md](api-analytics.md#time-series-and-topology) |
+| Edge swarm / robotics coordination | `demo-vertical-agentic-edge-swarm.sql` | `fractal_state_fingerprint` + `fractal_cycle_detect`, `fractal_vector_quantize_int8`/`_binary` + `fractal_vector_hamming_distance`, `fractal_optimize_subset` (raw primitives, no agents — despite the "agentic" name; see the [building blocks](api-agency.md#building-blocks-the-primitives-agents-compose) `fractal_agent_detect_loop` composes) | [api-analytics.md](api-analytics.md#time-series-and-topology), [api-analytics.md](api-analytics.md#vector-math-and-quantization) |
 | **Agentic:** DevOps / SRE dispatch + safety | `demo-vertical-agentic-ops-devops.sql` | `fractal_agent_route_task`, `fractal_agent_outlier_intercept`, `fractal_agent_anomaly_triage` + `fractal_agent_detect_loop`, `fractal_search_agent`/`fractal_rag_agent` | [fractal_agent_route_task](api-agency.md#route-task-fractal_agent_route_task), [fractal_agent_outlier_intercept](api-agency.md#outlier-intercept-fractal_agent_outlier_intercept), [fractal_agent_anomaly_triage](api-agency.md#anomaly-triage-fractal_agent_anomaly_triage) |
 | **Agentic:** FinTech portfolio rebalance + MCTS | `demo-vertical-agentic-fintech-mcts.sql` | `fractal_agent_rebalance_sibling`, `fractal_agent_plan_explore`, `fractal_sql_agent`, `fractal_optimize_portfolio` | [fractal_agent_rebalance_sibling](api-agency.md#rebalance-sibling-fractal_agent_rebalance_sibling), [fractal_agent_plan_explore](api-agency.md#building-blocks-the-primitives-agents-compose) |
 | **Agentic:** Customer support recall + recommend | `demo-vertical-agentic-customer-support.sql` | `fractal_agent_recall_hybrid`, `fractal_agent_recommend_diverse`, `fractal_agent_trajectory_predict` | [fractal_agent_recall_hybrid](api-agency.md#recall-hybrid-fractal_agent_recall_hybrid-pure-retrieval-no-llm), [fractal_agent_recommend_diverse](api-agency.md#recommend-diverse-fractal_agent_recommend_diverse-pure-retrieval-no-llm) |
@@ -49,14 +51,14 @@ file list.
 
 ## Domain kits (run with no model)
 
-These eight run almost entirely **without a reasoning endpoint**: only the
+These ten run almost entirely **without a reasoning endpoint**: only the
 closing `fractal_reason()` narrative needs one, so you can see the
 retrieval/optimization/geometry results immediately and pull a model later
 just for the summary. Every vector column in every kit uses the portable
 JSON-array path (a `JSON` column of numbers), not the native `VECTOR(n)`
 type: MariaDB has no `CREATE TYPE`/type-modifier mechanism, so this is the one
-storage convention all eleven kits share. See
-[vectorizer-setup.md](vectorizer-setup.md#native-vectorn-storage-mariadb-117)
+storage convention all thirteen kits share. See
+[vectorizer-setup.md](vectorizer-setup.md#native-vectorn-support-mariadb-117)
 if you want to use native `VECTOR(n)` (11.7+) in your own tables instead.
 
 ### Quantitative Finance — `demo-vertical-quant-finance.sql`
@@ -129,6 +131,30 @@ hunting, a zone-restricted ("DMZ only") search, compromise detection via
 Productized form: `fractal_agent_track_anomaly` and
 `fractal_agent_regime_triage`.
 
+### Biotech / Genomics — `demo-vertical-biotech-genomics.sql`
+Two showcases for the newest primitives, no agents involved:
+`fractal_tda_persistence_diagram` over a synthetic point cloud standing
+in for a PCA/UMAP-reduced single-cell trajectory that loops back on
+itself (a cell-cycle progression: G1 → S → G2/M → G1) — topological
+data analysis is a real, published technique for detecting exactly this
+cyclic structure — and `fractal_vector_lp_distance` comparing synthetic
+gene-expression profiles under L1 (Manhattan, the more standard
+genomics choice) vs the extension's default L2, with the narrative
+explaining why they disagree. Carries the TDA scope note (betti1 is the
+1-skeleton cycle rank, not full homology) from the install script
+verbatim.
+
+### Agentic Edge Swarms — `demo-vertical-agentic-edge-swarm.sql`
+Despite the "agentic" name, no agent procedures and no reasoning: pure
+primitives picked for a resource-constrained edge envelope.
+`fractal_vector_quantize_int8`/`_binary` +
+`fractal_vector_hamming_distance` compress a swarm agent's local
+observation memory 4x/32x, `fractal_state_fingerprint` +
+`fractal_cycle_detect` catch an agent stuck in a "cognitive wobble"
+period-2 loop with O(1) memory per step (the SimHash + Brent composition
+`fractal_agent_detect_loop` wraps), and `fractal_optimize_subset` does
+battery-constrained task routing.
+
 ## Agentic kits (model-on, composed agents)
 
 These three compose the six C-level **Universal Agents** into multi-step
@@ -181,4 +207,4 @@ endpoint configured at all.
 - **A specific industry, against a domain-shaped dataset** →
   `mariadb -uroot -p <your_database> < demo/demo-vertical-<name>.sql`, see
   [demo/README.md](../demo/README.md#industry-vertical-demos) for the full
-  list of eleven.
+  list of thirteen.

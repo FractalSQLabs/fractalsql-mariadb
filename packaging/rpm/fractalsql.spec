@@ -10,7 +10,7 @@
 # it is not exercised by any workflow in this repo.
 
 Name:           fractalsql-mariadb
-Version:        2.0.3
+Version:        2.0.7
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 
@@ -59,6 +59,13 @@ install -Dm0644 sql/install_agents.sql \
 %{sharedir}/install_agents.sql
 
 %changelog
+* Tue Sep 23 2026 FractalSQLabs - 2.0.7-1
+- v2.0.7: 10 new v2.0.25-core analytics/vector primitives as UDFs
+  (change-point detection, periodogram, SimHash state fingerprint,
+  streaming cycle detection, TDA persistence, k-subset allocation,
+  Lp distance, int8/binary quantization, Hamming distance), agent
+  loop-detection rewrite over real state fingerprints, JSON_VALUE
+  boolean-contract fix in shipped procedures.
 * Sun Aug 30 2026 FractalSQLabs - 2.0.0-1
 - Full v2.0.0: Discovery/Vector/Cognition/Text-to-SQL/Vectorizer/
   Agency/Enterprise-activation tiers. Single generic package (no

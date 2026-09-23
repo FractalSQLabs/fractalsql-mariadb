@@ -316,6 +316,52 @@ SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.rationale') AS rationale;
 
 -- ------------------------------------------------------------------
+-- 5b. Periodogram over host 7's connection-rate series (Schuster
+-- 1898): DFA above picks up the regime change (structure gets more
+-- regular after t=220), but a periodogram is the more direct tool for
+-- a SOC analyst's actual next question -- IS there a beaconing
+-- interval, and how often? C2 beaconing is characteristically
+-- periodic (checking in every N minutes); the classical periodogram
+-- surfaces that interval as a power spike directly, rather than
+-- inferring "more regular" from a scaling exponent.
+--
+-- Run live against this file's actual series: the single strongest
+-- peak is the calmer PRE-t=220 baseline period (~20 samples/cycle,
+-- spanning 219 of the 300 samples -- more total power just from
+-- covering most of the series), with the beaconing segment's ~4.5
+-- samples/cycle interval clearly visible as the very next cluster of
+-- peaks, smeared across 2-3 adjacent frequency bins because it only
+-- spans the last ~80 samples and starts/stops abruptly (classic
+-- short-window DFT leakage, not a defect in the primitive). A real
+-- deployment would run this over a short trailing window per host
+-- (matching fractal_dimension_drift's own recent-vs-baseline framing
+-- above) rather than one whole-series call, so an active beacon would
+-- dominate its own window instead of competing against a longer,
+-- calmer history -- this demo runs the whole series in one call to
+-- show what the primitive surfaces, not as the recommended production
+-- windowing strategy.
+-- ------------------------------------------------------------------
+-- === 5b. fractal_periodogram: host 7 beaconing-interval detection ===
+
+SET @vcy_conn_csv = (SELECT CONCAT('[', GROUP_CONCAT(conn_rate ORDER BY t), ']') FROM vcy_conn_series);
+SET @vcy_periodogram = fractal_periodogram(@vcy_conn_csv, 5);
+
+SELECT jt.freq,
+       jp.power,
+       1.0 / jt.freq AS samples_per_cycle
+  FROM JSON_TABLE(@vcy_periodogram, '$.freqs[*]' COLUMNS (
+           freq DOUBLE PATH '$', ord FOR ORDINALITY)) jt
+  JOIN JSON_TABLE(@vcy_periodogram, '$.power[*]' COLUMNS (
+           power DOUBLE PATH '$', ord FOR ORDINALITY)) jp ON jp.ord = jt.ord
+ ORDER BY jp.power DESC;
+-- Two distinct periodic intervals should be visible in the top 5
+-- (see this section's header note above for why the baseline one
+-- outranks the beaconing one on raw power, and why the beaconing one
+-- is smeared across a few adjacent bins): ~20.3 samples/cycle
+-- (pre-t=220 baseline, SIN(t * 0.31)) and ~4.5 samples/cycle
+-- (post-t=220 beaconing, SIN(t * 1.4), period = 2*pi/1.4).
+
+-- ------------------------------------------------------------------
 -- 6. Reasoning: the SOC triage narrative for host 7 is now split across
 -- the two Section 5 preset rationales -- fractal_agent_track_anomaly
 -- (the baseline->current_pos drift + connection-rate DFA) and

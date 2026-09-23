@@ -164,6 +164,38 @@ SELECT
     (SELECT OCTET_LENGTH(embedding) FROM docs_fv_float8 LIMIT 1)
         AS float8_array_bytes_json;
 
+-- === Section 7: L_p distance and quantization ===
+-- Known 3-dim inputs, so the outputs are readable at a glance.
+
+-- Generalized L_p distance, an explicit function rather than a default:
+-- p=2 is the plain Euclidean distance (0.1414 for these two vectors).
+-- p=0.5 is shown for contrast but is NOT a proper metric -- fractional
+-- L_p breaks the triangle inequality and hurts recall on trained/
+-- cosine-calibrated embeddings, so pass it deliberately, never as a
+-- silent substitute for the search primitives' own cosine metric.
+SELECT
+    fractal_vector_lp_distance(
+        '[1,0,0]', '[0.9,0.1,0]', 2.0)  AS lp2_distance,
+    fractal_vector_lp_distance(
+        '[1,0,0]', '[0.9,0.1,0]', 0.5) AS lp_half_distance;
+
+-- Symmetric int8 quantization: 4x compression. values is one signed
+-- byte per dimension (decode client-side); scale dequantizes via
+-- v[i] ~= values[i] * scale.
+SELECT fractal_vector_quantize_int8('[1,-2,3]') AS int8_quantized;
+
+-- Binary (1-bit) quantization: up to 32x compression, one bit per
+-- dimension packed MSB-first into a JSON byte array, paired with
+-- fractal_vector_hamming_distance for cheap candidate filtering ahead
+-- of a full-precision cosine/L2 re-rank. These two vectors differ in
+-- exactly one sign bit, so the Hamming distance is 1.
+SELECT fractal_vector_quantize_binary('[1,-2,3]') AS binary_a,
+       fractal_vector_quantize_binary('[1,2,3]')  AS binary_b;
+SELECT fractal_vector_hamming_distance(
+    fractal_vector_quantize_binary('[1,-2,3]'),
+    fractal_vector_quantize_binary('[1,2,3]')
+) AS hamming_distance;
+
 -- This demo is re-runnable: the vectorizer config + queue + tables are
 -- torn down at the top of the file (Section 1), so it can be re-run
 -- without manual cleanup.

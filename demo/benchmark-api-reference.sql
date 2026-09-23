@@ -7,8 +7,8 @@
 --     (see docs/api-discovery.md), demonstrated in Section 1 below.
 --   - fractal_store_morphology and fractal_mine_topology_negatives
 --     (Section 8, "Named feature store") are stored PROCEDUREs here
---     (CALL + OUT param), not the C-level SPI-backed functions
---     fractalsql-postgresql has; see docs/api-analytics.md.
+--     (CALL + OUT param), composing the existing fractal_vector_l2_squared
+--     UDF over a fixed internal table; see docs/api-analytics.md.
 --   - fractal_search_telemetry/_hybrid_clinical_search/
 --     _search_trajectory/_cross_modal_search are PROCEDUREs with a
 --     trailing OUT p_result JSON here (sql/install_udf.sql), not
@@ -17,8 +17,9 @@
 --     objects use the key "dist".
 --
 -- A coverage pass over every callable function in sql/install_udf.sql
--- (roughly 36 functions: 9 core, a 4-function vectorizer group, 21
--- v2.x additions, and the 2-procedure Named Feature Store), grouped by
+-- (roughly 46 functions: 9 core, a 4-function vectorizer group, 31
+-- v2.x additions including the 10 v2.0.25 analytics/vector primitives
+-- (Section 10), and the 2-procedure Named Feature Store), grouped by
 -- area. Distinct from demo/benchmark.sql (a
 -- narrower Sniper/Scout/vectorizer head-to-head), this one's job is
 -- coverage, not comparison.
@@ -252,8 +253,7 @@ SELECT fractal_morphological_complexity(
 -- fractal_store_morphology / fractal_mine_topology_negatives are
 -- stored PROCEDUREs here (CALL + OUT param), composing the existing
 -- fractal_vector_l2_squared UDF over a fixed internal table
--- (fractalsql_feature_store), not the C-level SPI-backed functions
--- fractalsql-postgresql has. See docs/api-analytics.md.
+-- (fractalsql_feature_store). See docs/api-analytics.md.
 CALL fractal_store_morphology(1, '[0.1,0.2,0.3]');
 CALL fractal_store_morphology(2, '[0.9,0.8,0.7]');
 CALL fractal_store_morphology(3, '[0.15,0.22,0.28]');
@@ -289,6 +289,91 @@ CALL fractal_cross_modal_search(
     'bmk_modal', 'combined_vec', '[0.5,0.5]', '[-0.5,-0.5]', 0.5, 3, @bmk_r4);
 SELECT JSON_VALUE(r, '$.doc_id') AS doc_id, JSON_VALUE(r, '$.dist') AS dist
 FROM JSON_TABLE(@bmk_r4, '$[*]' COLUMNS (r JSON PATH '$')) t;
+
+-- ------------------------------------------------------------------
+-- 10. New analytics + vector quantization (10 functions)
+-- ------------------------------------------------------------------
+-- The v2.0.25 primitives: change-point detection, periodogram, SimHash
+-- state fingerprinting, streaming Brent's cycle detection, the TDA
+-- persistence diagram, and the four vector quantization/L_p helpers.
+
+-- Regime shift at t=50 (0.0 -> 2.0): expect a boundary near 50.
+SELECT fractal_change_point_detect(
+    (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t), ']') FROM (
+        WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 100)
+        SELECT t, CASE WHEN t < 50 THEN 0.0 ELSE 2.0 END + (RAND()-0.5)*0.1 AS v FROM seq
+    ) c),
+    16, 2.0, 16
+) AS change_points;
+
+-- Pure 8-sample-period sine: expect the top bin at freq = 0.125 (1/8).
+SET @bmk_pg = fractal_periodogram(
+    (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t), ']') FROM (
+        WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 64)
+        SELECT t, SIN(2*PI()*t/8.0) AS v FROM seq
+    ) c),
+    4
+);
+SELECT JSON_EXTRACT(@bmk_pg, '$.freqs[0]') AS top_freq,
+       JSON_EXTRACT(@bmk_pg, '$.power[0]') AS top_power;
+
+-- SimHash state fingerprint: a JSON array of the (n_bits+7)/8 output
+-- bytes; nearly-identical states collapse to near-identical fingerprints
+-- (an exact hash would not).
+SET @bmk_fp_a = fractal_state_fingerprint('[0.1, 0.0]', 128, 42.0);
+SET @bmk_fp_b = fractal_state_fingerprint('[0.0, 0.1]', 128, 42.0);
+SELECT @bmk_fp_a AS fingerprint_a, @bmk_fp_b AS fingerprint_b;
+
+-- Alternating A/B/A/B/A/B stream: the detector closes a cycle at index 2
+-- (length 2), re-arms, and closes again at index 4. The fingerprints are
+-- concatenated as-is (the byte parser inside skips '[', ']', ',').
+SELECT fractal_cycle_detect(
+    CONCAT(@bmk_fp_a, @bmk_fp_b, @bmk_fp_a, @bmk_fp_b, @bmk_fp_a, @bmk_fp_b),
+    (128 + 7) DIV 8, 0
+) AS cycles;
+
+-- Two tight 6-point clusters in dim 2: h0_bars should carry one dominant
+-- bar per cluster. betti1 is the graph cycle rank: each cluster forms a
+-- complete 6-point graph (15 edges) at this scale, so
+-- betti1 = 15+15-12+2 = 20 -- the informational over-count vs. true H1
+-- the TDA section in docs/api-analytics.md documents (the triangles are
+-- not subtracted out).
+SELECT fractal_tda_persistence_diagram(
+    '[0,0, 0.1,0, 0,0.1, 0.1,0.1, 0.05,0.05, 0.1,0.05, 5,5, 5.1,5, 5,5.1, 5.1,5.1, 5.05,5.05, 5.1,5.05]',
+    2, 1, 1.0, 64
+) AS tda;
+
+-- Generalized L_p distance, an explicit function rather than a default
+-- metric: p=2 is the plain Euclidean distance (0.1414 for these two
+-- vectors); p=0.5 is shown for contrast but is NOT a proper metric --
+-- fractional L_p breaks the triangle inequality, so pass it deliberately,
+-- never as a silent substitute for the search primitives' own cosine.
+SELECT
+    fractal_vector_lp_distance('[1,0,0]', '[0.9,0.1,0]', 2.0)  AS lp2_distance,
+    fractal_vector_lp_distance('[1,0,0]', '[0.9,0.1,0]', 0.5) AS lp_half_distance;
+
+-- 4x / up-to-32x compression. bit i = (v[i] >= 0) packed MSB-first, so a
+-- and b differ in exactly one sign bit -> Hamming distance 1.
+SELECT fractal_vector_quantize_int8('[1,-2,3]') AS int8_quantized;
+SELECT fractal_vector_quantize_binary('[1,-2,3]') AS binary_a,
+       fractal_vector_quantize_binary('[1,2,3]')  AS binary_b;
+SELECT fractal_vector_hamming_distance(
+    fractal_vector_quantize_binary('[1,-2,3]'),
+    fractal_vector_quantize_binary('[1,2,3]')
+) AS hamming_distance;
+
+-- Cardinality-constrained subset optimization (generalizes Section 6's
+-- portfolio search with per-item upper bounds): maximize the
+-- value-weighted allocation over 5 items, at most k=2 nonzero, each
+-- item capped at 0.6. Bounds must leave the allocation feasible --
+-- weights sum to 1.0, so with k=2 each cap must allow the pair to
+-- reach 1.0 (0.6+0.4 works; 0.4+0.4 would not, and an infeasible
+-- instance comes back NULL rather than an error).
+SELECT fractal_optimize_subset(
+    '[0.12, 0.09, 0.15, 0.06, 0.11]',
+    '[0.6, 0.6, 0.6, 0.6, 0.6]',
+    2, '{}'
+) AS subset_allocation;
 
 -- Benchmark complete, full API surface exercised. Tables left in
 -- place for inspection. Clean up with:

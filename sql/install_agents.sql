@@ -27,11 +27,12 @@
 -- compositional style (embed/search/reason over a caller-named table):
 -- fractal_agent_trajectory_predict, fractal_search_agent,
 -- fractal_rag_agent, fractal_agent_plan_explore, and
--- fractal_agent_detect_loop. Each runs its table scan via dynamic SQL
--- (PREPARE/EXECUTE) inside a stored PROCEDURE, the same mechanism
--- fractal_search_telemetry/_hybrid_clinical_search/_search_trajectory
--- (sql/install_udf.sql) already use (see each one's own header comment
--- below for behavioral notes).
+-- fractal_agent_detect_loop. The four table-backed ones run their table
+-- scan via dynamic SQL (PREPARE/EXECUTE) inside a stored PROCEDURE, the
+-- same mechanism fractal_search_telemetry/_hybrid_clinical_search/
+-- _search_trajectory (sql/install_udf.sql) already use; detect_loop is
+-- pure numeric, no table access (see each one's own header comment below
+-- for behavioral notes).
 --
 -- Three simplifications apply across every engine below:
 --
@@ -253,12 +254,20 @@ END$$
 -- Engine D: fractal_agent_outlier_intercept
 -- fractal_search_telemetry + fractal_reason. intercepted = (nearest
 -- known-bad-state distance < threshold), a real comparison.
+--
+-- The distance metric is an explicit argument. A threshold is calibrated
+-- against one metric, so the metric must be chosen by the caller; the
+-- default stays 'cosine' because the shipped engine and its demo/gate
+-- assertions were calibrated against cosine, and flipping the default
+-- would silently recalibrate every existing caller. Any other value,
+-- including NULL, is an error rather than a silent fallback.
 -- =====================================================================
 CREATE PROCEDURE fractal_agent_outlier_intercept(
     IN  p_state_vec     JSON,
     IN  p_history_table VARCHAR(128),
     IN  p_emb_col       VARCHAR(64),
     IN  p_threshold     DOUBLE,
+    IN  p_metric        VARCHAR(16),
     OUT p_result        JSON
 )
 SQL SECURITY INVOKER
@@ -269,32 +278,86 @@ BEGIN
     DECLARE v_intercepted BOOLEAN;
     DECLARE v_reason     TEXT;
     DECLARE v_audit      BIGINT DEFAULT 0;
+    DECLARE v_corpus     JSON;
+    DECLARE v_ids        JSON;
+    DECLARE v_dim        INT;
+    DECLARE v_n          INT;
+    DECLARE v_i          INT DEFAULT 0;
+    DECLARE v_row        TEXT;
+    DECLARE v_d          DOUBLE;
+    DECLARE v_nearest    JSON;
 
+    IF p_metric IS NULL OR p_metric NOT IN ('cosine', 'l2') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: metric must be ''cosine'' or ''l2''';
+    END IF;
     IF p_history_table IS NULL OR p_emb_col IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: identifier arguments must not be NULL';
     END IF;
 
-    CALL fractal_search_telemetry(p_history_table, p_emb_col, p_state_vec, 1, v_telemetry);
-    IF v_telemetry IS NULL OR JSON_LENGTH(v_telemetry) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: no bad-state rows found';
+    IF p_metric = 'cosine' THEN
+        -- The exact telemetry engine, as calibrated. Works for JSON and
+        -- native VECTOR columns alike (the scan helper handles both).
+        CALL fractal_search_telemetry(p_history_table, p_emb_col, p_state_vec, 1, v_telemetry);
+        IF v_telemetry IS NULL OR JSON_LENGTH(v_telemetry) = 0 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: no bad-state rows found';
+        END IF;
+
+        SET v_dist    = JSON_VALUE(v_telemetry, '$[0].dist');
+        SET v_nearest = JSON_EXTRACT(v_telemetry, '$[0].doc_id');
+    ELSE
+        -- Exact L2 scan: MariaDB has no indexed <-> operator, so the
+        -- nearest-bad-state search is an exact O(n*dim) scan over the
+        -- same corpus the cosine path loads (same cost envelope as
+        -- _fractalsql_telemetry_topk's own full-corpus load). Each
+        -- row's distance comes from fractal_vector_lp_distance at
+        -- p=2; the UDF's parser accepts raw JSON-array text directly
+        -- (it skips '[', ']', ',' and whitespace), so no CSV
+        -- reformatting is needed here.
+        CALL _fractalsql_scan_corpus(p_history_table, p_emb_col, v_corpus, v_ids);
+        IF v_corpus IS NULL OR JSON_LENGTH(v_corpus) = 0 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: no bad-state rows found';
+        END IF;
+
+        SET v_dim = JSON_LENGTH(p_state_vec);
+        IF v_dim IS NULL OR v_dim < 1 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: state_vec must be a non-empty JSON array of numbers';
+        END IF;
+
+        SET v_n = JSON_LENGTH(v_corpus);
+        WHILE v_i < v_n DO
+            SET v_row = CAST(JSON_EXTRACT(v_corpus, CONCAT('$[', v_i, ']')) AS CHAR);
+            IF JSON_LENGTH(v_row) <> v_dim THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: a history row''s dimension differs from state_vec''s';
+            END IF;
+            SET v_d = fractal_vector_lp_distance(v_row, p_state_vec, 2.0);
+            IF v_d IS NULL THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: L2 distance computation failed for a history row';
+            END IF;
+            IF v_dist IS NULL OR v_d < v_dist THEN
+                SET v_dist    = v_d;
+                SET v_nearest = JSON_EXTRACT(v_ids, CONCAT('$[', v_i, ']'));
+            END IF;
+            SET v_i = v_i + 1;
+        END WHILE;
     END IF;
 
-    SET v_dist = JSON_VALUE(v_telemetry, '$[0].dist');
     SET v_intercepted = (v_dist < p_threshold);
 
     SET v_reason = fractal_reason(v_session_id,
-        CONCAT('Outlier intercept: nearest known-bad state is at cosine distance ', v_dist,
+        CONCAT('Outlier intercept: nearest known-bad state is at ', p_metric, ' distance ', v_dist,
                ', threshold ', p_threshold, ', so ',
                IF(v_intercepted, 'INTERCEPT', 'allow'),
                '. Justify the decision in one sentence.'),
-        JSON_OBJECT('threshold', p_threshold, 'intercepted', v_intercepted));
+        JSON_OBJECT('threshold', p_threshold, 'metric', p_metric, 'intercepted', v_intercepted));
 
     -- High-value trail: this engine can block a proposed state/action.
     SET v_audit = fractal_audit_log('agent_outlier_intercept', JSON_OBJECT(
         'intercepted', v_intercepted, 'nearest_distance', v_dist,
-        'threshold', p_threshold, 'reason', v_reason));
+        'threshold', p_threshold, 'metric', p_metric, 'reason', v_reason));
 
-    SET p_result = JSON_OBJECT('intercepted', v_intercepted, 'reason', v_reason);
+    SET p_result = JSON_OBJECT('intercepted', v_intercepted,
+                               'nearest_distance', v_dist, 'nearest_doc_id', v_nearest,
+                               'metric', p_metric, 'reason', v_reason);
 END$$
 
 -- =====================================================================
@@ -1348,66 +1411,159 @@ BEGIN
     SET p_result = v_branches;
 END$$
 
--- fractal_agent_detect_loop(log_hashes, OUT result)
--- A pure numeric function, no table access at all (unlike the four
+-- fractal_agent_detect_loop(agent_id, state_log, n_bits, seed,
+--   hamming_threshold, OUT result)
+-- A pure numeric procedure, no table access at all (unlike the
 -- table-backed Universal Agent procedures above, this one needs no
--- dynamic SQL). log_hashes is a JSON array of integer state hashes
--- (e.g. a session/action log). Flags a loop if EITHER the DFA scaling
--- exponent exceeds 0.9 (drift-to-chaos / random-walk-like cycling, via
--- the existing fractal_dimension_dfa UDF) OR a tight discrete
--- repetition period is found (clean toggles like 12345<->67890 that
--- DFA scores as low alpha). Period search is capped at n/4.
+-- dynamic SQL). agent_id is echoed back in the result so a caller's
+-- audit trail can attribute the verdict to the agent it screened.
+--
+-- Rewritten for the core v2.0.25 drop: loop detection now runs over
+-- REAL state vectors, not exact state hashes. state_log is a JSON array
+-- of state vectors (array of arrays, this repo's usual corpus shape --
+-- the successive internal states an agent visited, in order). Each
+-- state is fingerprinted via fractal_state_fingerprint (random-hyperplane
+-- SimHash, Charikar 2002: n_bits projections, deterministic from seed;
+-- pass NULL for the 64-bit/42.0 defaults) and the fingerprint stream is
+-- fed through fractal_cycle_detect's streaming Brent's-algorithm cycle
+-- kernel (Brent 1980; hamming_threshold: 0 = exact-match only, tolerant
+-- above that), which catches loops of any length INCLUDING near-identical
+-- (not just byte-identical) repeats -- the old version's brute-force
+-- exact-hash period scan could not. dfa_exponent is still computed, now
+-- over each state's L2 norm across the trajectory (a real continuous
+-- signal, unlike the old DFA-over-hash-values); alpha > 0.9 still
+-- additionally flags a random-walk-like wander the fingerprint-cycle
+-- check can miss if it never closes within hamming_threshold. DFA needs
+-- >= 16 points (core's own minimum); with fewer, dfa_exponent comes back
+-- NULL and the cycle check alone decides loop_detected.
 CREATE PROCEDURE fractal_agent_detect_loop(
-    IN  p_log_hashes  JSON,
-    OUT p_result      JSON
+    IN  p_agent_id          VARCHAR(128),
+    IN  p_state_log         JSON,
+    IN  p_n_bits            INT,      -- NULL -> 64
+    IN  p_seed              DOUBLE,   -- NULL -> 42.0
+    IN  p_hamming_threshold INT,      -- NULL -> 0
+    OUT p_result            JSON
 )
 SQL SECURITY INVOKER
 BEGIN
-    DECLARE v_n      INT;
-    DECLARE v_series TEXT DEFAULT '';
-    DECLARE v_i      INT DEFAULT 0;
-    DECLARE v_alpha  DOUBLE;
-    DECLARE v_max_p  INT;
-    DECLARE v_period INT DEFAULT 0;
-    DECLARE v_p      INT DEFAULT 1;
-    DECLARE v_ok     BOOLEAN;
-    DECLARE v_j      INT;
+    DECLARE v_n_states  INT;
+    DECLARE v_n_bits    INT;
+    DECLARE v_seed      DOUBLE;
+    DECLARE v_hamming   INT;
+    DECLARE v_n_bytes   INT;
+    DECLARE v_i         INT DEFAULT 0;
+    DECLARE v_j         INT;
+    DECLARE v_dim       INT;
+    DECLARE v_first_dim INT;
+    DECLARE v_state     TEXT;
+    DECLARE v_fp        TEXT;
+    DECLARE v_fp_stream TEXT DEFAULT '';
+    DECLARE v_norms_csv TEXT DEFAULT '';
+    DECLARE v_sq        DOUBLE;
+    DECLARE v_x         DOUBLE;
+    DECLARE v_min_norm  DOUBLE;
+    DECLARE v_max_norm  DOUBLE;
+    DECLARE v_norm      DOUBLE;
+    DECLARE v_cycle     TEXT;
+    DECLARE v_alpha     DOUBLE;
+    DECLARE v_cycle_hit BOOLEAN DEFAULT FALSE;
+    DECLARE v_cycle_len INT;
+    DECLARE v_at_index  INT;
 
-    IF p_log_hashes IS NULL OR JSON_LENGTH(p_log_hashes) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: log_hashes must be a non-empty JSON array';
+    IF p_agent_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: agent_id must not be NULL';
     END IF;
-    SET v_n = JSON_LENGTH(p_log_hashes);
+    IF p_state_log IS NULL OR JSON_LENGTH(p_state_log) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: state_log must be a non-empty JSON array of state vectors';
+    END IF;
 
-    WHILE v_i < v_n DO
-        IF v_i > 0 THEN
-            SET v_series = CONCAT(v_series, ',');
+    SET v_n_bits  = IFNULL(p_n_bits, 64);
+    SET v_seed    = IFNULL(p_seed, 42.0);
+    SET v_hamming = IFNULL(p_hamming_threshold, 0);
+    IF v_n_bits < 1 OR v_n_bits > 512 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: n_bits must be 1..512';
+    END IF;
+    IF v_hamming < 0 OR v_hamming >= v_n_bits THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: hamming_threshold must be 0..n_bits-1';
+    END IF;
+    SET v_n_bytes = (v_n_bits + 7) DIV 8;
+
+    SET v_n_states = JSON_LENGTH(p_state_log);
+
+    WHILE v_i < v_n_states DO
+        SET v_state = CAST(JSON_EXTRACT(p_state_log, CONCAT('$[', v_i, ']')) AS CHAR);
+        SET v_dim   = JSON_LENGTH(v_state);
+        IF v_dim IS NULL OR v_dim < 1 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: every state must be a non-empty JSON array of numbers';
         END IF;
-        SET v_series = CONCAT(v_series, CAST(JSON_VALUE(p_log_hashes, CONCAT('$[', v_i, ']')) AS CHAR));
+        IF v_i = 0 THEN
+            SET v_first_dim = v_dim;
+        ELSEIF v_dim <> v_first_dim THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: all states must have the same dimension';
+        END IF;
+
+        -- SimHash fingerprint; the parser inside accepts the raw JSON
+        -- array text, so no CSV reformatting is needed. The output is
+        -- itself a JSON byte array, and fractal_cycle_detect's parser
+        -- skips '[', ']', ',' and whitespace, so the streams can be
+        -- concatenated as-is.
+        SET v_fp = fractal_state_fingerprint(v_state, v_n_bits, v_seed);
+        IF v_fp IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: fingerprinting failed for a state (check state values are finite numbers)';
+        END IF;
+        SET v_fp_stream = CONCAT(v_fp_stream, v_fp);
+
+        -- Per-state L2 norm: the continuous signal the DFA exponent runs
+        -- over (replaces the old DFA-over-hash-values, which quantized
+        -- the signal away before DFA ever saw it).
+        SET v_sq = 0.0;
+        SET v_j  = 0;
+        WHILE v_j < v_dim DO
+            SET v_x = CAST(JSON_VALUE(v_state, CONCAT('$[', v_j, ']')) AS DOUBLE);
+            SET v_sq = v_sq + v_x * v_x;
+            SET v_j = v_j + 1;
+        END WHILE;
+        IF v_i > 0 THEN
+            SET v_norms_csv = CONCAT(v_norms_csv, ',');
+        END IF;
+        SET v_norm = SQRT(v_sq);
+        SET v_norms_csv = CONCAT(v_norms_csv, v_norm);
+        IF v_min_norm IS NULL OR v_norm < v_min_norm THEN SET v_min_norm = v_norm; END IF;
+        IF v_max_norm IS NULL OR v_norm > v_max_norm THEN SET v_max_norm = v_norm; END IF;
         SET v_i = v_i + 1;
     END WHILE;
 
-    SET v_alpha = fractal_dimension_dfa(v_series);
+    -- Brent's streaming cycle kernel over the fingerprint stream.
+    SET v_cycle = fractal_cycle_detect(v_fp_stream, v_n_bytes, v_hamming);
+    IF v_cycle IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: cycle detection failed (check n_bytes vs the fingerprint stream)';
+    END IF;
+    -- JSON_VALUE stringifies a JSON boolean as '1'/'0' on this server
+    -- family (JSON_EXTRACT preserves 'true'/'false'; JSON_VALUE does
+    -- not), so comparing against 'true' alone would never fire -- accept
+    -- both spellings.
+    SET v_cycle_hit = (JSON_VALUE(v_cycle, '$.detected') IN ('true', '1'));
+    SET v_cycle_len = JSON_VALUE(v_cycle, '$.cycle_len');
+    SET v_at_index  = JSON_VALUE(v_cycle, '$.at_index');
 
-    SET v_max_p = v_n DIV 4;
-    WHILE v_p <= v_max_p AND v_period = 0 DO
-        SET v_ok = TRUE;
-        SET v_j = 0;
-        WHILE v_j < v_n - v_p AND v_ok DO
-            IF JSON_VALUE(p_log_hashes, CONCAT('$[', v_j, ']')) <> JSON_VALUE(p_log_hashes, CONCAT('$[', v_j + v_p, ']')) THEN
-                SET v_ok = FALSE;
-            END IF;
-            SET v_j = v_j + 1;
-        END WHILE;
-        IF v_ok THEN
-            SET v_period = v_p;
-        END IF;
-        SET v_p = v_p + 1;
-    END WHILE;
+    -- DFA over the per-state norms. Needs >= 16 points (core's own
+    -- minimum); with fewer, leave dfa_exponent NULL and let the cycle
+    -- check alone decide loop_detected. Skip it too for an exactly
+    -- constant-norm trajectory (zero fluctuations: core's own DFA
+    -- errors out on that degenerate input, which would abort this
+    -- whole CALL) -- the cycle check is the right decider for it
+    -- anyway.
+    IF v_n_states >= 16 AND v_max_norm <> v_min_norm THEN
+        SET v_alpha = fractal_dimension_dfa(v_norms_csv);
+    END IF;
 
     SET p_result = JSON_OBJECT(
-        'recommendation', 'monitor',
-        'dfa_exponent', v_alpha,
-        'loop_detected', (v_alpha > 0.9 OR v_period > 0));
+        'agent_id',       p_agent_id,
+        'dfa_exponent',   v_alpha,
+        'loop_detected',  v_cycle_hit OR (v_alpha IS NOT NULL AND v_alpha > 0.9),
+        'cycle_detected', v_cycle_hit,
+        'cycle_len',      v_cycle_len,
+        'at_index',       v_at_index);
 END$$
 
 DELIMITER ;

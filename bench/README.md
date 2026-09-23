@@ -119,8 +119,9 @@ is O(N x D) per evaluation. The SFS core evaluates fitness well beyond a
 flat population_size x iterations product (diffusion offspring plus
 per-generation update passes each add more), so a population=50,
 iterations=8 run makes on the order of ~2500 evaluations per query, not
-400 -- see `fractalsql-postgresql/bench/README.md`'s "Scaling notes" for
-the same ~2500 figure at the same defaults, same underlying engine.
+400 -- the exact multiplier depends on the SFS core's own diffusion and
+update schedule; the ~2500 order of magnitude is what to expect at
+these defaults.
 Real measured output from `bench/scale_sweep.sh 127.0.0.1
 3306 <password>` against this repo's own Docker demo container (dim=128,
 5 queries averaged per N, every row measured, none extrapolated):

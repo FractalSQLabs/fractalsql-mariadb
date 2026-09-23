@@ -80,11 +80,12 @@ A composition is a pipeline with up to four stages:
 3. **Act** (optional): `fractal_sql_agent` (or `fractal_text_to_sql`,
    see [`docs/text-to-sql-setup.md`](text-to-sql-setup.md)) when the agent
    must run a query, under a guardrailed account (below).
-4. **Guard** (optional): `CALL fractal_agent_detect_loop(log_hashes, @result)`
-   on the agent's own state-hash log (same DFA math `anomaly_triage`/
-   `regime_triage` already use for a different signal, plus a short-period
-   repetition check), and/or an `outlier_intercept`-style
-   distance-to-known-bad-state screen before a proposed action runs.
+4. **Guard** (optional): `CALL fractal_agent_detect_loop(agent_id, state_log,
+   @result)` on the agent's own state-vector trajectory (SimHash fingerprint +
+   streaming Brent's cycle kernel over the states, plus the DFA exponent over
+   their L2 norms — catches near-identical repeats, not just exact ones), and/or an
+   `outlier_intercept`-style distance-to-known-bad-state screen (under an
+   explicitly chosen `'cosine'` or `'l2'` metric) before a proposed action runs.
 
 Stages 1–2 are the common case (most "answer my data" agents). Add 3 when
 the agent must *do* something. Add 4 any time the agent is autonomous.

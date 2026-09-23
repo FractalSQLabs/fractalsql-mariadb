@@ -303,10 +303,10 @@ load_cfg_once(void)
     g_cfg.http_think_provider = dup_env("FRACTALSQL_HTTP_THINK_PROVIDER");
     g_cfg.http_native_url     = dup_env("FRACTALSQL_HTTP_NATIVE_URL");
     g_cfg.http_num_ctx        = dup_env("FRACTALSQL_HTTP_NUM_CTX");
-    /* No FRACTALSQL_* bridge for this one, by design -- matches
-     * fractalsql-postgresql's own g_response_mode_boot, which likewise
-     * reads the plugin's raw FSQL_REASONING_HTTP_RESPONSE_MODE directly
-     * rather than through a fractalsql.* GUC. Captured once here so
+    /* No FRACTALSQL_* bridge for this one, by design -- the plugin's
+     * raw FSQL_REASONING_HTTP_RESPONSE_MODE is read directly, rather
+     * than through a session/config-level FRACTALSQL_* variable.
+     * Captured once here so
      * apply_reason_env_locked() can assert this value on every reason-ctx
      * (re)load instead of trusting whatever fractal_t2s_generate's own
      * RESPONSE_MODE=code left in the process environment -- see that

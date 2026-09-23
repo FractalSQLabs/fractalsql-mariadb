@@ -48,8 +48,8 @@
 --     result_json, never aborts this script. For INSERT/UPDATE
 --     candidates the execute step also runs inside a SAVEPOINT,
 --     rolled back to on failure -- MariaDB/InnoDB's nearest equivalent
---     to fractalsql-postgresql's SPI-subtransaction wrap for this same
---     call, since PREPARE/EXECUTE has no such wrapper of its own.
+--     to a subtransaction wrap around the execute step, since
+--     PREPARE/EXECUTE has no such wrapper of its own.
 --   - fractal_agent_rebalance_sibling's trailing args are (seed BIGINT,
 --     context TEXT), see sql/install_agents.sql's own Engine K comment
 --     and demo-vertical-quant-finance.sql's identical note.
