@@ -130,7 +130,7 @@ jobs:
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "2.0.7"
+              test "${VERSION}" = "2.0.8"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -275,6 +275,23 @@ jobs:
                   | grep -E '/usr/lib64/mysql/plugin/fractalsql-reasoning-http\.so$'
           done
 
+      # easy_install.sh is arch-independent (pure bash), so stamp it once
+      # from the amd64 leg only, not once per matrix arch. Uploading the
+      # identical file from both the amd64 and arm64 package jobs would
+      # race two concurrent release-asset uploads of the same name.
+      - name: Stamp version into easy_install.sh
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              FSQL_VERSION="${{ github.ref_name }}"
+              FSQL_VERSION="${FSQL_VERSION#v}"
+          else
+              FSQL_VERSION="$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' src/fractalsql.c)"
+          fi
+          sed "s/@@FSQL_VERSION@@/${FSQL_VERSION}/" scripts/easy_install.sh > dist/packages/easy_install.sh
+          chmod +x dist/packages/easy_install.sh
+
       - name: Upload package artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -364,7 +381,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: |
           set -euo pipefail
-          curl -fsSLO https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
+          curl -fsSLO --proto '=https' https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
           echo "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2  openssl-3.5.8.tar.gz" | shasum -a 256 -c -
           tar xf openssl-3.5.8.tar.gz
           cd openssl-3.5.8
@@ -548,7 +565,7 @@ jobs:
           cp sql/install_agents.sql "${STAGE}/install_agents.sql"
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
-          fractalsql-mariadb 2.0.7 Community (${{ matrix.platform_tag }})
+          fractalsql-mariadb 2.0.8 Community (${{ matrix.platform_tag }})
 
           Unsigned MariaDB UDF for macOS. Compatible with MariaDB
           10.6 / 10.11 / 11.4 LTS / 12.3 LTS via Homebrew.
@@ -847,6 +864,31 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/windows/FractalSQL-MariaDB-${{ matrix.mariadb_major }}-*-${{ matrix.arch }}.msi
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # easy_install.ps1 is MariaDB-major-independent (it detects installs at
+      # runtime), so stamp and upload it from one matrix cell only, not once
+      # per (major, arch) cell, to avoid racing uploads of the same asset.
+      - name: Stamp version into easy_install.ps1
+        if: matrix.mariadb_major == '10.6'
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $ver = "${{ github.ref_name }}".Substring(1)
+          } else {
+            $m = Select-String -Path src\fractalsql.c -Pattern '^#define FSQL_VERSION "(.*)"$' | Select-Object -First 1
+            $ver = $m.Matches[0].Groups[1].Value
+          }
+          New-Item -ItemType Directory -Force -Path dist\windows | Out-Null
+          (Get-Content scripts\windows\easy_install.ps1 -Raw) -replace '@@FSQL_VERSION@@', $ver | Set-Content -Path dist\windows\easy_install.ps1 -Encoding utf8
+
+      - name: Upload easy_install.ps1 to Release
+        if: matrix.mariadb_major == '10.6' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: dist/windows/easy_install.ps1
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -47,7 +47,7 @@ Confirm the UDF set loaded:
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
   "SELECT fractal_edition(), fractal_version();"
-# expect: Community, 2.0.7
+# expect: Community, 2.0.8
 ```
 
 Run any demo (re-runnable; each recreates its own fixture tables):

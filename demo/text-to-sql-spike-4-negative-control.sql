@@ -33,7 +33,8 @@ UPDATE spike_negative_control SET review = fractal_t2s_review(
     CONNECTION_ID(),
     'For each service, show the count of alerts broken down by severity level, but only include services that have logged at least one critical-severity alert.',
     sql_text
-);
+)
+WHERE 1=1;
 
 SELECT id, review FROM spike_negative_control;
 

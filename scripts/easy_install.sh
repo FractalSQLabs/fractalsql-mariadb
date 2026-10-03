@@ -320,14 +320,14 @@ phase_b_install() {
         debian)
             local asset="fractalsql-mariadb-${ARCH_DEB}.deb"
             log "Downloading ${asset}..."
-            curl -fsSL "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
+            curl -fsSL --proto '=https' "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
             log "sudo apt-get install -y ${TMP_DIR}/${asset}"
             [[ "${DRY_RUN}" -eq 1 ]] || sudo apt-get install -y "${TMP_DIR}/${asset}"
             ;;
         rhel)
             local asset="fractalsql-mariadb-${ARCH_DEB}.rpm"
             log "Downloading ${asset}..."
-            curl -fsSL "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
+            curl -fsSL --proto '=https' "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
             if [[ "${PKG_MGR}" == "zypper" ]]; then
                 # zypper enforces signature checks by default, even for a
                 # locally-supplied file; dnf/yum don't.
@@ -344,7 +344,7 @@ phase_b_install() {
             [[ "${ARCH_DARWIN}" == "arm64" ]] && platform_tag="osx_arm64"
             local asset="fractalsql-mariadb-${platform_tag}.zip"
             log "Downloading ${asset}..."
-            curl -fsSL "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
+            curl -fsSL --proto '=https' "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
             (cd "${TMP_DIR}" && unzip -q "${asset}" -d extracted)
             log "Running the bundled install.sh (reused, not reimplemented)..."
             local mdb_bin; mdb_bin="$(dirname "${MDB_CONFIG_BIN}")/mariadb"
@@ -374,14 +374,16 @@ envq() {
 
 FSQL_ENV_ALL_KEYS=(FRACTALSQL_REASONING_PLUGIN FRACTALSQL_HTTP_URL FRACTALSQL_HTTP_TOKEN
     FRACTALSQL_HTTP_MODEL FRACTALSQL_HTTP_ALLOW_PLAINTEXT FRACTALSQL_HTTP_EMBED_URL
-    FRACTALSQL_HTTP_EMBED_MODEL FRACTALSQL_HTTP_THINK FRACTALSQL_HTTP_THINK_PROVIDER)
+    FRACTALSQL_HTTP_EMBED_MODEL FRACTALSQL_HTTP_THINK FRACTALSQL_HTTP_THINK_PROVIDER
+    FSQL_REASONING_HTTP_TIMEOUT_MS FSQL_REASONING_HTTP_LOW_SPEED_SECS)
 # bash 3.2 -- macOS's stock shell -- has no associative arrays ("declare -A"
 # fails outright there), so the wizard's config state is two parallel
 # indexed arrays, kept in insertion order by env_set.
 FSQL_ENV_KEYS=()
 FSQL_ENV_VALUES=()
-env_set() {
-    local k="FRACTALSQL_$1" i
+env_set() { env_set_raw "FRACTALSQL_$1" "$2"; }
+env_set_raw() {
+    local k="$1" i
     for i in "${!FSQL_ENV_KEYS[@]}"; do
         if [[ "${FSQL_ENV_KEYS[i]}" = "${k}" ]]; then
             FSQL_ENV_VALUES[i]="$2"
@@ -516,6 +518,17 @@ apply_env_and_restart() {
     esac
 }
 
+# A cold-loading local model (for example, a large Ollama model pulled
+# onto constrained hardware) can take minutes to produce its first
+# answer, longer than the reasoning plugin's default HTTP timeout. These
+# are the same values easy_install.ps1 applies on Windows.
+offer_cold_start_timeout() {
+    confirm "Local models can be slow to answer the first time while they load into memory or VRAM. Raise the reasoning HTTP timeout to handle that? It is applied with the mariadbd restart below, which drops active connections." \
+        || return 0
+    env_set_raw FSQL_REASONING_HTTP_TIMEOUT_MS 330000
+    env_set_raw FSQL_REASONING_HTTP_LOW_SPEED_SECS 300
+}
+
 phase_c_wizard() {
     # UDFs (sql/install_udf.sql) are server-global (mysql.func), no
     # database needed. Agent procedures (sql/install_agents.sql) are
@@ -581,6 +594,10 @@ phase_c_wizard() {
             ;;
         *) die "unknown --provider '${PROVIDER}' (expected ollama, openai-compatible, or skip)" ;;
     esac
+
+    if [[ "${PROVIDER}" == "ollama" ]]; then
+        offer_cold_start_timeout
+    fi
 
     local applied=1
     if [[ "${PROVIDER}" != "skip" ]]; then

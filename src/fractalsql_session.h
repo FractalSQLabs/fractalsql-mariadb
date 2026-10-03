@@ -38,9 +38,13 @@
  * sweep can never free a ctx a caller is actively holding, even under a
  * misused/shared session_id. For the search ctx specifically, where a
  * second thread would race the core itself rather than just the
- * registry's bookkeeping, the exclusive acquire variant fails such
- * concurrent reuse up front instead (see
- * fractal_session_acquire_exclusive).
+ * registry's bookkeeping, both acquire paths refuse up front instead of
+ * racing: the exclusive acquire variant fails against a second
+ * concurrent exclusive acquire (see fractal_session_acquire_exclusive),
+ * and the plain acquire fails with NULL if the entry is currently held
+ * exclusively (an in-flight search), since a tuning/read call mutating
+ * or reading the same ctx's Diversify state while a search is using it
+ * would race the core just the same.
  */
 #ifndef FRACTALSQL_SESSION_H
 #define FRACTALSQL_SESSION_H
@@ -63,7 +67,10 @@ extern "C" {
  * itself is NOT freed by release (only eviction/close frees it).
  * Returns NULL on OOM, or if the registry is at capacity with every
  * existing entry currently pinned (refcount > 0). That cap is an
- * administrative limit, not expected to be hit in normal operation. */
+ * administrative limit, not expected to be hit in normal operation.
+ * Also returns NULL if session_id's entry is currently held by
+ * fractal_session_acquire_exclusive (an in-flight search) -- see this
+ * header's THREAD SAFETY note above. */
 fsql_ctx *fractal_session_acquire(unsigned long long session_id);
 
 /* Same acquire/create/refcount/LRU contract as fractal_session_acquire,

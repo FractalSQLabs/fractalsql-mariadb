@@ -10,7 +10,7 @@
 # it is not exercised by any workflow in this repo.
 
 Name:           fractalsql-mariadb
-Version:        2.0.7
+Version:        2.0.8
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 

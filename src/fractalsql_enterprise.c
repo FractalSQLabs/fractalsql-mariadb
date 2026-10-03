@@ -298,7 +298,8 @@ ent_dlopen_verified_copy(const char *orig_path,
     {
         const char *slash    = strrchr(orig_path, '/');
         const char *backlash = strrchr(orig_path, '\\');
-        const char *sep      = (backlash > slash) ? backlash : slash;
+        const char *sep      = slash;
+        if (backlash != NULL && (sep == NULL || backlash > sep)) sep = backlash;
         size_t      dir_len  = (sep != NULL) ? (size_t) (sep - orig_path + 1) : 0;
 
         if (dir_len >= sizeof tmp_path) return NULL;

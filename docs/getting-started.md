@@ -57,7 +57,7 @@ You should see:
 
 ```
 edition   version
-Community 2.0.7
+Community 2.0.8
 ```
 
 MariaDB has no `CREATE EXTENSION` mechanism and nothing equivalent to

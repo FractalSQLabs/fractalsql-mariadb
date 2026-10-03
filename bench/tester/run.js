@@ -35,7 +35,7 @@ function queryCsv(dim) {
 }
 
 function quantile(sorted, q) {
-  if (sorted.length === 0) return NaN;
+  if (sorted.length === 0) return Number.NaN;
   const i = Math.min(sorted.length - 1, Math.floor(q * sorted.length));
   return sorted[i];
 }

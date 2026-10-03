@@ -92,7 +92,8 @@ UPDATE vmd_vessels
         JSON_EXTRACT(baseline,'$[0]') + (RAND()-0.5)*0.05,
         JSON_EXTRACT(baseline,'$[1]') + (RAND()-0.5)*0.05,
         JSON_EXTRACT(baseline,'$[2]') + (RAND()-0.5)*0.1,
-        JSON_EXTRACT(baseline,'$[3]') + (RAND()-0.5)*0.1);
+        JSON_EXTRACT(baseline,'$[3]') + (RAND()-0.5)*0.1)
+ WHERE 1=1;
 
 -- Vessel 7's deliberate deviation: large heading/speed change from
 -- baseline. JSON_EXTRACT reads the per-element value directly (no

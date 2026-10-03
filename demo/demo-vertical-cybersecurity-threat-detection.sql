@@ -115,7 +115,8 @@ UPDATE vcy_hosts
         JSON_EXTRACT(baseline, '$[0]') + (RAND()-0.5)*0.06,
         JSON_EXTRACT(baseline, '$[1]') + (RAND()-0.5)*0.06,
         JSON_EXTRACT(baseline, '$[2]') + (RAND()-0.5)*0.06,
-        JSON_EXTRACT(baseline, '$[3]') + (RAND()-0.5)*0.06);
+        JSON_EXTRACT(baseline, '$[3]') + (RAND()-0.5)*0.06)
+ WHERE 1=1;
 
 -- Host 7's deliberate compromise: outbound connections, destination
 -- ports, and DNS query volume all spike; failed-auth barely moves.

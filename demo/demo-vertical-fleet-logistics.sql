@@ -107,7 +107,8 @@ UPDATE vfl_vehicles
         JSON_EXTRACT(baseline, '$[0]') + (RAND()-0.5)*0.06,
         JSON_EXTRACT(baseline, '$[1]') + (RAND()-0.5)*0.06,
         JSON_EXTRACT(baseline, '$[2]') + (RAND()-0.5)*0.06,
-        JSON_EXTRACT(baseline, '$[3]') + (RAND()-0.5)*0.06);
+        JSON_EXTRACT(baseline, '$[3]') + (RAND()-0.5)*0.06)
+ WHERE 1=1;
 
 -- Vehicle 5's deliberate detour: current route vector far from its
 -- plan. Overrides the ordinary-noise current_pos just set above for

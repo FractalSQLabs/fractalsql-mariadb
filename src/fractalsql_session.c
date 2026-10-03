@@ -264,6 +264,17 @@ fractal_session_acquire(unsigned long long session_id)
     session_lock();
     sweep_stale(FSQL_SESSION_SWEEP_SCAN_LIMIT);
 
+    /* An exclusive holder (fractal_search's in-flight call on this same
+     * session_id) owns e->ctx's diversify state for the duration; a
+     * tuning/read call here would race it. Refuse up front, same as
+     * fractal_session_acquire_exclusive does against a second exclusive
+     * acquire, rather than mutating ctx state out from under the search. */
+    fsql_session_entry *busy_check = find_entry(session_id);
+    if (busy_check != NULL && busy_check->busy) {
+        session_unlock();
+        return NULL;
+    }
+
     fsql_session_entry *e = find_or_create_entry_locked(session_id);
     if (e == NULL) { session_unlock(); return NULL; }
 

@@ -321,7 +321,8 @@ SELECT gs, JSON_ARRAY(RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1) FROM seq;
 UPDATE agents_demo_vehicles
    SET current_pos = JSON_ARRAY(
         JSON_EXTRACT(baseline,'$[0]')+0.05, JSON_EXTRACT(baseline,'$[1]')+0.05,
-        JSON_EXTRACT(baseline,'$[2]')+0.05, JSON_EXTRACT(baseline,'$[3]')+0.05);
+        JSON_EXTRACT(baseline,'$[2]')+0.05, JSON_EXTRACT(baseline,'$[3]')+0.05)
+ WHERE 1=1;
 UPDATE agents_demo_vehicles
    SET current_pos = JSON_ARRAY(
         JSON_EXTRACT(baseline,'$[0]')-0.7, JSON_EXTRACT(baseline,'$[1]')+0.6,
@@ -359,7 +360,8 @@ SELECT gs, JSON_ARRAY(RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1) FROM seq;
 UPDATE agents_demo_tracks
    SET current_pos = JSON_ARRAY(
         JSON_EXTRACT(baseline,'$[0]')+0.04, JSON_EXTRACT(baseline,'$[1]')+0.04,
-        JSON_EXTRACT(baseline,'$[2]')+0.04, JSON_EXTRACT(baseline,'$[3]')+0.04);
+        JSON_EXTRACT(baseline,'$[2]')+0.04, JSON_EXTRACT(baseline,'$[3]')+0.04)
+ WHERE 1=1;
 UPDATE agents_demo_tracks
    SET current_pos = JSON_ARRAY(
         JSON_EXTRACT(baseline,'$[0]')+0.6, JSON_EXTRACT(baseline,'$[1]')-0.5,
