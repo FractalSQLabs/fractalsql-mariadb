@@ -1,0 +1,96 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+ *
+ * Function registry for FSQ protocol v2. X(sql, kind, cls) per row. kind:
+ * STR (STRING result), INT (INTEGER result), REAL (REAL result). sql is the
+ * bare C identifier that CREATE FUNCTION ... SONAME 'fractalsql.so' names,
+ * and the name a client sends in UDF_INIT and UDF_CALL (see SPEC.md). There
+ * is no numeric opcode per function. The shim and the daemon both get this
+ * table through scripts/gen_udf.py, so there is one source.
+ *
+ * cls classifies what a re-execution after a dropped-mid-flight call costs
+ * (see SPEC.md's retry section). The daemon ignores it; the shim table
+ * carries it:
+ *   r -- pure: no side effects, deterministic; safe to transport-retry with
+ *        a fresh request (vector, dimensions, search inputs, portfolio
+ *        math, topology geometry, and the read-only ledger/audit probes).
+ *   s -- stateful: mutates daemon state (diversify params, sessions,
+ *        feedback, the ledger, the audit log); NOT retried with a fresh
+ *        request -- the shim may resend once carrying the same idempotency
+ *        token so the daemon can replay a cached result (SPEC.md).
+ *   e -- expensive/external: a provider round trip the caller pays for
+ *        (reasoning, embeddings, LLM text-to-SQL generation). A dropped
+ *        call surfaces an error; retry is the caller's choice.
+ */
+
+/* Search and discovery */
+X(fractal_search, STR, r)
+X(fractal_search_explore, STR, r)
+/* Dimension, analytics, and informational */
+X(fractal_version, STR, r)
+X(fractal_edition, STR, r)
+X(fractal_dimension_dfa, REAL, r)
+X(fractal_dimension_boxcount, REAL, r)
+X(fractal_dimension_drift, STR, r)
+X(fractal_change_point_detect, STR, r)
+X(fractal_periodogram, STR, r)
+X(fractal_state_fingerprint, STR, r)
+X(fractal_cycle_detect, STR, r)
+X(fractal_tda_persistence_diagram, STR, r)
+X(fractal_isolate_background, INT, r)
+/* Portfolio and optimize */
+X(fractal_optimize_portfolio, STR, r)
+X(fractal_optimize_subset, STR, r)
+X(fractal_optimize_portfolio_multimodal, STR, r)
+X(fractal_optimize_portfolio_multimodal_ex, STR, r)
+X(fractal_optimize_portfolio_multimodal_pareto, STR, r)
+/* Vector */
+X(fractal_vector_dims, INT, r)
+X(fractal_vector_norm, REAL, r)
+X(fractal_vector_normalize, STR, r)
+X(fractal_vector_add, STR, r)
+X(fractal_vector_sub, STR, r)
+X(fractal_vector_scale, STR, r)
+X(fractal_vector_l2_distance, REAL, r)
+X(fractal_vector_l2_squared, REAL, r)
+X(fractal_vector_cosine_distance, REAL, r)
+X(fractal_vector_cosine_similarity, REAL, r)
+X(fractal_vector_negative_inner_product, REAL, r)
+X(fractal_vector_from_float8_array, STR, r)
+X(fractal_vector_to_float8_array, STR, r)
+X(fractal_vector_lp_distance, REAL, r)
+X(fractal_vector_quantize_int8, STR, r)
+X(fractal_vector_quantize_binary, STR, r)
+X(fractal_vector_hamming_distance, INT, r)
+/* Cognition */
+X(fractal_reason, STR, e)
+X(fractal_embed, STR, e)
+/* Text-to-SQL */
+X(fractal_t2s_config, STR, r)
+X(fractal_t2s_generate, STR, e)
+X(fractal_t2s_review, STR, e)
+X(fractal_t2s_check_allowlist, STR, r)
+/* Diversify and feedback */
+X(fractal_diversify_enable, INT, s)
+X(fractal_diversify_disable, INT, s)
+X(fractal_diversify_set_params, INT, s)
+X(fractal_detect_collapse, REAL, r)
+X(fractal_explain_result, STR, r)
+X(fractal_session_close, INT, s)
+X(fractal_feedback_report, INT, s)
+/* Ledger and audit (enterprise-gated) */
+X(fractal_ledger_flush, INT, s)
+X(fractal_ledger_load, INT, s)
+X(fractal_ledger_compact, INT, s)
+X(fractal_ledger_reset_soft, INT, s)
+X(fractal_ledger_reset_hard, INT, s)
+X(fractal_ledger_truth_count, INT, r)
+X(fractal_ledger_shadow_count, INT, r)
+X(fractal_ledger_verify, STR, r)
+X(fractal_audit_log, INT, s)
+X(fractal_audit_unpack, STR, r)
+/* Topology and geometry */
+X(fractal_vascular_network, STR, r)
+X(fractal_cortical_folding, STR, r)
+X(fractal_nerve_plexus_metric, STR, r)
+X(fractal_morphological_complexity, STR, r)

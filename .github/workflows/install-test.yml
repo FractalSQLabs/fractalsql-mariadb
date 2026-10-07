@@ -1,0 +1,1082 @@
+name: Install test (packaging)
+
+# End-to-end validation of the shipped .deb and .rpm packages, across
+# every MariaDB major in the compat matrix (10.6 / 10.11 / 11.4 LTS /
+# 12.3 LTS), not just whatever major each distro's own default
+# repo happens to carry. Builds the artifacts, installs them into a
+# clean per-major MariaDB (via the MariaDB Foundation's own repo setup
+# script, which auto-detects apt vs. yum), loads the UDFs, exercises
+# fractal_search and
+# its params-bounds caps, then a reasoning round-trip against a
+# mock OpenAI-compatible endpoint (one gated major per family, so the
+# same fixed-reply mock is never run N times redundantly). Also covers a
+# native macOS (Homebrew) build+install, which doesn't fit the
+# per-major matrix model.
+#
+# NOTE: this workflow is drafted against MariaDB Foundation's
+# documented repo-setup flow (downloads.mariadb.com/MariaDB/
+# mariadb_repo_setup) but has not yet been run against real GitHub
+# Actions infrastructure. First real run may need small fixes to the
+# repo-setup invocation; everything else (package layout, UDF install,
+# smoke checks) mirrors build_test.sh's already-verified assertions.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-artifacts:
+    name: Build .so + .deb + .rpm (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - name: Build fractalsql.so and fractalsqld
+        run: |
+          chmod +x build.sh
+          ./build.sh amd64
+      - name: Install fpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+      - name: Package .deb and .rpm (modern)
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh amd64
+
+      - run: ls -l dist/packages
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages/*
+          retention-days: 1
+          if-no-files-found: error
+
+  debian-install:
+    name: Debian, install + UDF exec (mdb${{ matrix.mdb }})
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mdb: ['10.6', '10.11', '11.4', '12.3']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      # MariaDB's apt repo carries 10.6 only through jammy (the mirror's
+      # repo/10.6/ubuntu/dists listing stops at jammy -- no noble), so
+      # the 10.6 cell runs the 22.04 image; jammy's glibc 2.35 still
+      # satisfies the .deb's libc6 >= 2.34 dependency.
+      - name: Install + verify in ${{ matrix.mdb == '10.6' && 'ubuntu:22.04' || 'ubuntu:24.04' }} with mariadb-server ${{ matrix.mdb }}
+        env:
+          MDB_VER: ${{ matrix.mdb }}
+          MDB_IMAGE: ${{ matrix.mdb == '10.6' && 'ubuntu:22.04' || 'ubuntu:24.04' }}
+        run: |
+          cat > test-deb.sh <<SCRIPT
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y curl gnupg lsb-release ca-certificates
+
+          # MariaDB Foundation's repo setup pins one specific major
+          # (Ubuntu's own repos only ship one MariaDB major per
+          # release, hence the pinned-version repo setup).
+          curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+          chmod +x mariadb_repo_setup
+          ./mariadb_repo_setup --mariadb-server-version="mariadb-\${MDB_VER}" --skip-maxscale
+          apt-get update -qq
+          apt-get install -qq -y mariadb-server mariadb-client
+
+          mkdir -p /var/run/mysqld
+          chown mysql:mysql /var/run/mysqld
+
+          # Provider settings wiring: fractalsqld.conf (the daemon's own
+          # config file, the -c file below) is the preferred source for
+          # all of them (reasoning_plugin/reasoning_url/reasoning_token/
+          # reasoning_model/reasoning_allow_plaintext/embed_url/
+          # embed_model/think/think_provider and the enterprise keys),
+          # applied by daemon startup and by `fsqlctl reload`. This file
+          # sets no provider keys, so conf-first falls through to the
+          # FRACTALSQL_* process-environment fallback, read once by the
+          # daemon at its startup -- which is why the exports below have
+          # to be in the environment when the `runuser .../fractalsqld`
+          # started later inherits them. Not a sysvar. Exported
+          # unconditionally; harmless on majors where this job's later
+          # reasoning step is skipped.
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib/mysql/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
+          mariadbd --user=mysql &
+          for i in \$(seq 1 120); do
+              mariadb-admin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb-admin ping
+
+          apt-get install -qq -y ./dist/packages/fractalsql-mariadb-amd64.deb
+
+          # postinst.sh just added mysql to the fractalsql group so
+          # mariadbd can traverse /etc/fractalsql (mode 0750, group
+          # fractalsql) and read the shim's config -- but mariadbd was
+          # already running, and a process's supplementary groups are
+          # resolved at exec time, not re-read live. No systemd in
+          # this bare container to restart it automatically (postinst.sh
+          # tries that, but only under systemd), so do it by hand, same
+          # as postinst.sh's own printed instruction says to.
+          mariadb-admin shutdown
+          for i in \$(seq 1 60); do mariadb-admin ping >/dev/null 2>&1 || break; sleep 0.5; done
+          mariadbd --user=mysql &
+          for i in \$(seq 1 120); do
+              mariadb-admin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb-admin ping
+
+          # fractalsqld itself is in the same boat: postinst.sh's
+          # "systemctl restart fractalsqld.service" is a silent no-op
+          # with no systemd around, and systemd's own unit is what
+          # creates /run/fractalsql (RuntimeDirectory=) on a real host
+          # -- neither happened here, so start it by hand the same way.
+          mkdir -p /run/fractalsql
+          chown fractalsql:fractalsql /run/fractalsql
+          chmod 0750 /run/fractalsql
+          runuser -u fractalsql -- /usr/libexec/fractalsql/fractalsqld -c /etc/fractalsql/fractalsqld.conf &
+          for i in \$(seq 1 50); do [ -S /run/fractalsql/fractalsqld.sock ] && break; sleep 0.2; done
+          test -S /run/fractalsql/fractalsqld.sock \\
+              || { echo "FAIL: fractalsqld never created its socket"; exit 1; }
+
+          PLUGIN_DIR=\$(mariadb -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="\${PLUGIN_DIR%/}"
+          echo "plugin_dir: \$PLUGIN_DIR"
+          test -f "\$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from \$PLUGIN_DIR"; ls -la "\$PLUGIN_DIR" || true; exit 1; }
+          test -f "\$PLUGIN_DIR/fractalsql-reasoning-http.so" \
+              || { echo "FAIL: fractalsql-reasoning-http.so missing from \$PLUGIN_DIR"; exit 1; }
+          ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
+              || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
+
+          # install_udf.sql registers the fractal_schema_context stored
+          # procedure after the global CREATE FUNCTIONs -- CREATE/DROP
+          # PROCEDURE need a database selected (ERROR 1046 "No database
+          # selected" otherwise), even though the FUNCTIONs themselves
+          # are server-global.
+          mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mariadb fractalsql_ci < /work/sql/install_udf.sql
+          mariadb fractalsql_ci < /work/sql/install_agents.sql
+
+          EDITION=\$(mariadb -N -B -e "SELECT fractal_edition()" | tr -d '\r')
+          VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
+          echo "edition=\$EDITION version=\$VERSION"
+          test "\$EDITION" = "Community"
+          test "\$VERSION" = "2.0.9"
+
+          # End-to-end fractal_search smoke. Trivial 4-row corpus, query
+          # equals row 0; expect a JSON document with dim/n_corpus/top_k.
+          RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
+          echo "\$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+
+          # Params caps match the documented bounds (iterations<=10000,
+          # pop_size<=100000, diff_factor<=32). Verify each just-over-cap
+          # value is rejected (UDF sets *error=1, client shows NULL).
+          for over_params in \
+              '{"iterations":10001}' \
+              '{"population_size":100001}' \
+              '{"diffusion_factor":33}'; do
+              # A UDF that sets *error surfaces as a NULL result with a
+              # zero client exit, not as a non-zero exit, so "empty or
+              # NULL" is the rejection signal here.
+              OUT=\$(mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
+              if [ -n "\$OUT" ] && [ "\$OUT" != "NULL" ]; then
+                  echo "FAIL: expected rejection on params=\$over_params, got \$OUT"; exit 1
+              fi
+              echo "ok: params-bound cap rejects \$over_params"
+          done
+          echo "ok: Debian install + UDF exec (mdb\${MDB_VER})"
+
+          # --- Reasoning + text-to-sql round-trip against a mock LLM --
+          # One major carries this: every major runs the identical
+          # mock, so N-major redundancy buys nothing beyond proving the
+          # plugin loads/links, which the ldd check above already
+          # covers on every cell.
+          if [ "\${MDB_VER}" = "11.4" ]; then
+              apt-get install -qq -y python3
+              python3 /work/scripts/ci/mock_llm.py 18080 &
+              MOCK_PID=\$!
+              for i in \$(seq 1 50); do
+                  (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+                  sleep 0.2
+              done
+
+              REASON=\$(mariadb -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
+              echo "reason reply: \${REASON:0:80}"
+              echo "\$REASON" | grep -qi sql \
+                  || { echo "FAIL: reasoning round-trip returned '\$REASON'"; kill \$MOCK_PID 2>/dev/null || true; exit 1; }
+              echo "ok: reasoning round-trip via mock endpoint (mdb\${MDB_VER})"
+
+              T2S=\$(mariadb -N -B -e "SELECT fractal_t2s_generate(CONNECTION_ID(), 'how many rows', '', NULL)")
+              echo "t2s generate: \${T2S:0:80}"
+              echo "\$T2S" | grep -qi select \
+                  || { echo "FAIL: text-to-sql GENERATE returned '\$T2S'"; kill \$MOCK_PID 2>/dev/null || true; exit 1; }
+              echo "ok: text-to-sql GENERATE round-trip via mock endpoint (mdb\${MDB_VER})"
+
+              kill \$MOCK_PID 2>/dev/null || true
+          fi
+          SCRIPT
+          chmod +x test-deb.sh
+          docker run --rm \
+              -e MDB_VER="${MDB_VER}" \
+              -v "${{ github.workspace }}:/work" -w /work \
+              "${MDB_IMAGE}" bash /work/test-deb.sh
+
+  # Runs inside a bare ubuntu:24.04 container with no systemd (mariadbd
+  # started directly, same as debian-install above) -- this deliberately
+  # exercises scripts/easy_install.sh's non-systemd restart fallback
+  # (restart_mariadbd_direct), not just the systemctl path a real Debian
+  # host would take. See easy_install.sh's own header comment for why
+  # that fallback exists at all.
+  easy-install-linux:
+    name: "easy_install.sh: Debian wizard, non-interactive (mdb11.4)"
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install package, then run easy_install.sh against a mock LLM
+        run: |
+          cat > test-easy-install.sh <<'SCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y curl gnupg lsb-release ca-certificates python3
+
+          curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+          chmod +x mariadb_repo_setup
+          ./mariadb_repo_setup --mariadb-server-version="mariadb-11.4" --skip-maxscale
+          apt-get update -qq
+          apt-get install -qq -y mariadb-server mariadb-client
+
+          mkdir -p /var/run/mysqld /var/log/mysql
+          chown mysql:mysql /var/run/mysqld /var/log/mysql
+          mariadbd --user=mysql >/var/log/mysql/boot.log 2>&1 &
+          for i in $(seq 1 60); do mariadb-admin ping >/dev/null 2>&1 && break; sleep 1; done
+          mariadb-admin ping
+          mariadb -u root -e "CREATE DATABASE fractalsql_ci;"
+
+          # Package already installed manually here (mirrors debian-install)
+          # so is_installed() detects it and Phase B (--no-install) is
+          # never exercised, same as anyone who ran apt install first.
+          apt-get install -qq -y ./dist/packages/fractalsql-mariadb-amd64.deb
+
+          # postinst.sh just added mysql to the fractalsql group so
+          # mariadbd can traverse /etc/fractalsql (mode 0750, group
+          # fractalsql) and read the shim's config -- but mariadbd was
+          # already running, and a process's supplementary groups are
+          # resolved at exec time, not re-read live. No systemd in this
+          # bare container to restart it automatically (postinst.sh
+          # tries that, but only under systemd), so do it by hand.
+          mariadb-admin shutdown
+          for i in $(seq 1 60); do mariadb-admin ping >/dev/null 2>&1 || break; sleep 0.5; done
+          mariadbd --user=mysql >/var/log/mysql/boot.log 2>&1 &
+          for i in $(seq 1 60); do mariadb-admin ping >/dev/null 2>&1 && break; sleep 1; done
+          mariadb-admin ping
+
+          # fractalsqld itself is in the same boat: postinst.sh's
+          # "systemctl restart fractalsqld.service" is a silent no-op
+          # with no systemd around, and systemd's own unit is what
+          # creates /run/fractalsql (RuntimeDirectory=) on a real host
+          # -- neither happened here, so start it by hand the same way.
+          mkdir -p /run/fractalsql
+          chown fractalsql:fractalsql /run/fractalsql
+          chmod 0750 /run/fractalsql
+          runuser -u fractalsql -- /usr/libexec/fractalsql/fractalsqld -c /etc/fractalsql/fractalsqld.conf &
+          for i in $(seq 1 50); do [ -S /run/fractalsql/fractalsqld.sock ] && break; sleep 0.2; done
+          test -S /run/fractalsql/fractalsqld.sock \
+              || { echo "FAIL: fractalsqld never created its socket"; exit 1; }
+
+          python3 scripts/ci/mock_llm.py 18080 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          # ollama mode sets reasoning_allow_plaintext = 1 in
+          # fractalsqld.conf; openai-compatible doesn't.
+          chmod +x scripts/easy_install.sh
+          ./scripts/easy_install.sh \
+              --no-install --yes --database fractalsql_ci \
+              --provider ollama \
+              --url http://127.0.0.1:18080/v1/chat/completions \
+              --model mock-model \
+              --embed-url http://127.0.0.1:18080/v1/embeddings \
+              --embed-model mock-embed --think off | tee /tmp/easy-install.log
+
+          kill ${MOCK_PID} 2>/dev/null || true
+
+          # scripts/ci/mock_llm.py's canned chat reply is a fenced
+          # ```sql SELECT 1``` block (shared with build_test.sh's
+          # reasoning-tier gates -- see that script's own header
+          # comment).
+          grep -qi 'select 1' /tmp/easy-install.log \
+              || { echo "FAIL: reasoning round-trip via easy_install.sh didn't reach the mock reply"; exit 1; }
+
+          # The wizard writes provider settings into the daemon's conf
+          # file (its preferred source), not the FRACTALSQL_* env vars:
+          grep -q '^reasoning_plugin = ' /etc/fractalsql/fractalsqld.conf \
+              || { echo "FAIL: wizard didn't write reasoning_plugin into fractalsqld.conf"; exit 1; }
+          grep -q '^reasoning_url = ' /etc/fractalsql/fractalsqld.conf \
+              || { echo "FAIL: wizard didn't write reasoning_url into fractalsqld.conf"; exit 1; }
+          grep -q '^reasoning_allow_plaintext = 1' /etc/fractalsql/fractalsqld.conf \
+              || { echo "FAIL: wizard didn't set reasoning_allow_plaintext in fractalsqld.conf"; exit 1; }
+          if grep -q 'FRACTALSQL_HTTP_' /etc/fractalsql/fractalsqld.env 2>/dev/null; then
+              echo "FAIL: wizard still writes the legacy FRACTALSQL_HTTP_* env names"; exit 1
+          fi
+
+          EDITION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractal_edition();")
+          VERSION=$(mariadb -u root -D fractalsql_ci -N -B -e "SELECT fractal_version();")
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+
+          # Re-run to exercise the "already registered" pause + --force-reinstall.
+          ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --force-reinstall --provider skip
+
+          echo "ok: easy_install.sh end-to-end (Debian, non-systemd container)"
+          SCRIPT
+          chmod +x test-easy-install.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" -w /work \
+              ubuntu:24.04 bash /work/test-easy-install.sh
+
+  rpm-install:
+    name: RHEL (Rocky 9), install + UDF exec (mdb${{ matrix.mdb }})
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mdb: ['10.6', '10.11', '11.4', '12.3']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install + verify in rockylinux:9 with mariadb-server ${{ matrix.mdb }}
+        env:
+          MDB_VER: ${{ matrix.mdb }}
+        run: |
+          cat > test-rpm.sh <<SCRIPT
+          set -euo pipefail
+
+          # mariadb_repo_setup itself needs curl; rockylinux:9's minimal
+          # image ships only curl-minimal, which provides /usr/bin/curl
+          # but not the "curl" package name its yum check requires, and a
+          # plain dnf install of curl then conflicts with it.
+          dnf install -qy --allowerasing curl
+
+          # MariaDB Foundation's repo setup, same script as the Debian
+          # job, auto-detects dnf and pins the requested major.
+          curl -LsSO https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+          chmod +x mariadb_repo_setup
+          ./mariadb_repo_setup --mariadb-server-version="mariadb-\${MDB_VER}" --skip-maxscale
+          dnf install -qy MariaDB-server MariaDB-client
+
+          mkdir -p /var/lib/mysql /var/log/mariadb /var/run/mariadb
+          chown -R mysql:mysql /var/lib/mysql /var/log/mariadb /var/run/mariadb
+          mariadb-install-db --user=mysql --datadir=/var/lib/mysql
+
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
+          mariadbd --user=mysql &
+          for i in \$(seq 1 120); do
+              mariadb-admin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb-admin ping
+
+          dnf install -qy ./dist/packages/fractalsql-mariadb-amd64.rpm
+
+          # postinst.sh (fpm's --after-install, shared with the .deb)
+          # just added mysql to the fractalsql group so mariadbd can
+          # traverse /etc/fractalsql (mode 0750, group fractalsql) and
+          # read the shim's config -- but mariadbd was already running,
+          # and a process's supplementary groups are resolved at exec
+          # time, not re-read live. No systemd in this bare container
+          # to restart it automatically (postinst.sh tries that, but
+          # only under systemd), so do it by hand.
+          mariadb-admin shutdown
+          for i in \$(seq 1 60); do mariadb-admin ping >/dev/null 2>&1 || break; sleep 0.5; done
+          mariadbd --user=mysql &
+          for i in \$(seq 1 120); do
+              mariadb-admin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb-admin ping
+
+          # fractalsqld itself is in the same boat: postinst.sh's
+          # "systemctl restart fractalsqld.service" is a silent no-op
+          # with no systemd around, and systemd's own unit is what
+          # creates /run/fractalsql (RuntimeDirectory=) on a real host
+          # -- neither happened here, so start it by hand the same way.
+          mkdir -p /run/fractalsql
+          chown fractalsql:fractalsql /run/fractalsql
+          chmod 0750 /run/fractalsql
+          runuser -u fractalsql -- /usr/libexec/fractalsql/fractalsqld -c /etc/fractalsql/fractalsqld.conf &
+          for i in \$(seq 1 50); do [ -S /run/fractalsql/fractalsqld.sock ] && break; sleep 0.2; done
+          test -S /run/fractalsql/fractalsqld.sock \\
+              || { echo "FAIL: fractalsqld never created its socket"; exit 1; }
+
+          PLUGIN_DIR=\$(mariadb -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="\${PLUGIN_DIR%/}"
+          echo "plugin_dir: \$PLUGIN_DIR"
+          test -f "\$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from \$PLUGIN_DIR"; ls -la "\$PLUGIN_DIR" || true; exit 1; }
+          test -f "\$PLUGIN_DIR/fractalsql-reasoning-http.so" \
+              || { echo "FAIL: fractalsql-reasoning-http.so missing from \$PLUGIN_DIR"; exit 1; }
+          ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
+              || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
+
+          # install_udf.sql registers the fractal_schema_context stored
+          # procedure after the global CREATE FUNCTIONs -- CREATE/DROP
+          # PROCEDURE need a database selected (ERROR 1046 "No database
+          # selected" otherwise), even though the FUNCTIONs themselves
+          # are server-global.
+          mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mariadb fractalsql_ci < /work/sql/install_udf.sql
+          mariadb fractalsql_ci < /work/sql/install_agents.sql
+
+          EDITION=\$(mariadb -N -B -e "SELECT fractal_edition()" | tr -d '\r')
+          VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
+          echo "edition=\$EDITION version=\$VERSION"
+          test "\$EDITION" = "Community"
+          test "\$VERSION" = "2.0.9"
+
+          RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
+          echo "\$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+
+          for over_params in \
+              '{"iterations":10001}' \
+              '{"population_size":100001}' \
+              '{"diffusion_factor":33}'; do
+              # A UDF that sets *error surfaces as a NULL result with a
+              # zero client exit, not as a non-zero exit, so "empty or
+              # NULL" is the rejection signal here.
+              OUT=\$(mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
+              if [ -n "\$OUT" ] && [ "\$OUT" != "NULL" ]; then
+                  echo "FAIL: expected rejection on params=\$over_params, got \$OUT"; exit 1
+              fi
+              echo "ok: params-bound cap rejects \$over_params"
+          done
+          echo "ok: RPM install + UDF exec (mdb\${MDB_VER})"
+
+          if [ "\${MDB_VER}" = "11.4" ]; then
+              dnf install -qy python3
+              python3 /work/scripts/ci/mock_llm.py 18080 &
+              MOCK_PID=\$!
+              for i in \$(seq 1 50); do
+                  (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+                  sleep 0.2
+              done
+
+              REASON=\$(mariadb -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
+              echo "reason reply: \${REASON:0:80}"
+              echo "\$REASON" | grep -qi sql \
+                  || { echo "FAIL: reasoning round-trip returned '\$REASON'"; kill \$MOCK_PID 2>/dev/null || true; exit 1; }
+              echo "ok: reasoning round-trip via mock endpoint (mdb\${MDB_VER})"
+
+              kill \$MOCK_PID 2>/dev/null || true
+          fi
+          SCRIPT
+          chmod +x test-rpm.sh
+          docker run --rm \
+              -e MDB_VER="${MDB_VER}" \
+              -v "${{ github.workspace }}:/work" -w /work \
+              rockylinux:9 bash /work/test-rpm.sh
+
+  macos-install:
+    name: macOS, build + install + reason (Homebrew, arm64)
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB (Homebrew) + client headers
+        run: |
+          set -euo pipefail
+          brew install mariadb mariadb-connector-c pkg-config openssl@3
+          brew services start mariadb
+          # No -uroot: Homebrew's MariaDB 12.x post-install creates
+          # root@localhost with unix_socket auth only (connection denied
+          # to everyone but the OS root user), plus a same-named
+          # all-privilege account for the invoking user
+          # (e.g. runner@localhost). The bare client connects as that
+          # invoking user over the unix socket.
+          for i in $(seq 1 30); do
+              mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb -e 'SELECT 1'
+
+      - name: Build fractalsql.so (shim) and fractalsqld (daemon)
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
+          make -C service clean
+          make -C service MDB_CFLAGS="$(pkg-config --cflags libmariadb)" all scan
+          ls -l service/build/fractalsql.so service/build/fractalsqld
+
+      - name: Install via scripts/macos/install.sh + register UDFs
+        run: |
+          set -euo pipefail
+          # Stage exactly what the release zip ships, and run the real
+          # installer against it -- this is the only CI coverage
+          # install.sh itself gets; a hand-rolled install here would
+          # never catch a bug in the actual installer users run.
+          STAGE="$(mktemp -d)"
+          cp service/build/fractalsql.so "${STAGE}/fractalsql.dylib"
+          install -m 0755 service/build/fractalsqld "${STAGE}/fractalsqld"
+          install -m 0755 include/darwin-arm64/fractalsql-reasoning-http.so "${STAGE}/fractalsql-reasoning-http.so"
+          install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist "${STAGE}/"
+          cp sql/install_udf.sql sql/install_agents.sql "${STAGE}/"
+          install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
+          ( cd "${STAGE}" && ./install.sh )
+          rm -rf "${STAGE}"
+
+          mariadb -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mariadb fractalsql_ci < sql/install_udf.sql
+          mariadb fractalsql_ci < sql/install_agents.sql
+
+          EDITION=$(mariadb -N -B -e "SELECT fractal_edition();")
+          VERSION=$(mariadb -N -B -e "SELECT fractal_version();")
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+          test "${VERSION}" = "2.0.9"
+
+          RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
+          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "ok: macOS build + install + fractal_search"
+
+      - name: Reasoning round-trip against a mock endpoint
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/mock_llm.py 18080 >/tmp/mock_llm.out 2>&1 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              nc -z 127.0.0.1 18080 >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          # Provider settings: fractalsqld.conf (the file passed to -c
+          # two commands below) is the preferred source, and `fsqlctl
+          # reload` applies conf changes live -- but this job wires a
+          # throwaway daemon by hand, so it uses the FRACTALSQL_*
+          # process-environment fallback instead: the exports below are
+          # read once by fractalsqld at its own startup, never re-read
+          # after that. Either way it's fractalsqld that consumes the
+          # settings, so only its own process ever sees them here.
+          # mariadbd (and the
+          # shim inside it) is untouched and keeps running the
+          # whole time; the shim only cares that the socket path in
+          # its own config still points at a live daemon, not which
+          # daemon process is listening there.
+          #
+          # The reasoning core requires a canonical plugin path: the
+          # configured value must equal its own realpath. @@plugin_dir
+          # here is both slash-terminated (giving plugin//file.so) and,
+          # under Homebrew, a symlink to the versioned Cellar dir;
+          # resolving to the physical path is what makes it canonical
+          # (caught live: the core rejected the raw @@plugin_dir form
+          # with "reasoning plugin path is not canonical").
+          PLUGIN_DIR=$(mariadb -N -B -e "SELECT @@plugin_dir")
+          PLUGIN_DIR="$(cd "${PLUGIN_DIR}" && pwd -P)"
+
+          launchctl bootout "gui/$(id -u)/com.fractalsqlabs.fractalsqld" 2>/dev/null \
+              || launchctl unload -w ~/Library/LaunchAgents/com.fractalsqlabs.fractalsqld.plist 2>/dev/null \
+              || true
+          sleep 1
+
+          export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+          export FRACTALSQL_HTTP_URL="http://127.0.0.1:18080/v1/chat/completions"
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+          /usr/local/libexec/fractalsql/fractalsqld -c /etc/fractalsql/fractalsqld.conf &
+          FSQD_PID=$!
+          for i in $(seq 1 50); do
+              test -S /usr/local/var/run/fractalsql/fractalsqld.sock && break
+              sleep 0.2
+          done
+
+          # 2>&1 on purpose: a NULL without a UDF error and a UDF that
+          # failed to initialize ("ERROR 1123 ... Can't initialize
+          # function 'fractal_reason'; <reason>") look identical on
+          # stdout -- the error text is the discriminator between a
+          # plugin-load failure and a dispatch failure.
+          REPLY=$(mariadb -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');" 2>&1) || true
+          echo "reason reply: ${REPLY:0:80}"
+          # Environment actually inside the daemon process, captured
+          # before it's killed: BSD ps -E shows it, and it separates
+          # "the exports never reached fractalsqld" from everything else.
+          FSQD_ENV=$(ps -E -p "${FSQD_PID}" -o command= 2>/dev/null || true)
+          # Diagnose BEFORE any kill -- a reachability probe after the
+          # mock is dead can only ever print "no" (caught live: this
+          # branch once ran its nc/cat after the kills and reported
+          # nothing useful).
+          echo "--- server still reachable? ---"
+          mariadb -N -B -e "SELECT @@plugin_dir" 2>&1 || true
+          echo "--- mock still reachable? ---"
+          nc -z 127.0.0.1 18080 && echo "yes" || echo "no"
+          echo "--- mock requests seen this run (if any) ---"
+          cat /tmp/mock_llm.out 2>/dev/null || echo "(no mock output)"
+          # Standalone dlopen of the staged plugin, outside fractalsqld:
+          # its dlerror text separates "this file will not load in any
+          # process" (bad mode/arch/signature/dependency) from "loads
+          # standalone but fails inside the daemon".
+          echo "--- standalone dlopen probe ---"
+          python3 - <<'PY' || true
+          import ctypes
+          import os
+          so = os.environ.get("FRACTALSQL_REASONING_PLUGIN", "")
+          if not so:
+              print("standalone dlopen: skipped, no FRACTALSQL_REASONING_PLUGIN")
+          else:
+              try:
+                  # RTLD_LAZY, not ctypes' RTLD_NOW default: mirrors the
+                  # daemon's dlopen and keeps loadability (mode/arch/
+                  # signature/dependencies) the verdict, not any lazy
+                  # undefined symbol.
+                  ctypes.CDLL(so, mode=os.RTLD_LAZY)
+                  print("standalone dlopen: OK")
+              except OSError as e:
+                  print("standalone dlopen FAILED:", e)
+          PY
+          ls -l "${PLUGIN_DIR}"
+          kill "${MOCK_PID}" 2>/dev/null || true
+          kill "${FSQD_PID}" 2>/dev/null || true
+          echo "$REPLY" | grep -qi sql \
+              || { echo "FAIL: reasoning round-trip returned '${REPLY}'"
+                   echo "--- reasoning env in this shell ---"
+                   env | grep '^FRACTALSQL_' || echo "(none)"
+                   echo "--- env as fractalsqld sees it (ps -E) ---"
+                   echo "${FSQD_ENV:-(fractalsqld already exited; could not read)}"
+                   exit 1; }
+          echo "ok: macOS reasoning round-trip via mock endpoint"
+
+  # -Provider skip only: scripts/easy_install.sh's own darwin branch of
+  # apply_env_and_restart deliberately doesn't automate a reasoning
+  # restart (launchd plist edits vary per Homebrew version -- see that
+  # function's own comment). This job exercises what CAN be
+  # automated on macOS: package detection, idempotent UDF/procedure
+  # registration, and the "already registered" pause + -ForceReinstall.
+  # The mock-LLM round-trip is covered by easy-install-linux instead.
+  easy-install-macos:
+    name: "easy_install.sh: macOS wizard, non-interactive (arm64)"
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB (Homebrew) and start it
+        run: |
+          set -euo pipefail
+          brew install mariadb mariadb-connector-c pkg-config openssl@3
+          brew services start mariadb
+          # No -uroot: Homebrew's MariaDB 12.x post-install creates
+          # root@localhost with unix_socket auth only (connection denied
+          # to everyone but the OS root user), plus a same-named
+          # all-privilege account for the invoking user
+          # (e.g. runner@localhost). The bare client connects as that
+          # invoking user over the unix socket.
+          for i in $(seq 1 30); do
+              mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mariadb -e 'SELECT 1'
+
+      - name: Build + install via scripts/macos/install.sh manually first
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
+          make -C service clean
+          make -C service MDB_CFLAGS="$(pkg-config --cflags libmariadb)" all scan
+          mkdir -p /tmp/fsql-stage
+          cp service/build/fractalsql.so /tmp/fsql-stage/fractalsql.dylib
+          install -m 0755 service/build/fractalsqld /tmp/fsql-stage/fractalsqld
+          install -m 0755 include/darwin-arm64/fractalsql-reasoning-http.so /tmp/fsql-stage/
+          install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist /tmp/fsql-stage/
+          chmod +x scripts/macos/install.sh
+          cp scripts/macos/install.sh /tmp/fsql-stage/
+          MARIADB_BIN="$(brew --prefix mariadb)/bin/mariadb" /tmp/fsql-stage/install.sh
+          test -f "$(mariadb -N -B -e 'SELECT @@plugin_dir;')/fractalsql.so"
+          test -x /usr/local/libexec/fractalsql/fractalsqld
+          test -S /usr/local/var/run/fractalsql/fractalsqld.sock
+
+      - name: Run easy_install.sh wizard (provider skip)
+        run: |
+          set -euo pipefail
+          mariadb -e 'CREATE DATABASE fractalsql_ci;'
+          chmod +x scripts/easy_install.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" \
+            ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --provider skip | tee /tmp/easy-install.log
+
+          EDITION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractal_edition();')
+          VERSION=$(mariadb -D fractalsql_ci -N -B -e 'SELECT fractal_version();')
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+
+          # Re-run to exercise the "already registered" pause + --force-reinstall.
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" \
+            ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --force-reinstall --provider skip
+
+          echo "ok: easy_install.sh end-to-end (macOS, provider skip)"
+
+  # Unlike release.yml's build-windows-msi job, this one also installs a
+  # real MariaDB server through the official winx64.msi's own
+  # silent-install properties, not just the headers-only winx64.zip.
+  # That's because easy_install.ps1 detects the server through the
+  # "MariaDB" Windows Service the real installer registers (the default
+  # service name since MariaDB 10.4), which the zip alone never creates.
+  easy-install-windows:
+    name: "easy_install.ps1: Windows wizard, non-interactive (mdb11.4)"
+    runs-on: windows-latest
+    env:
+      MDB_VER: "11.4"
+      MARIADB_VER: "11.4.4"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+
+      - name: Install a real MariaDB server (official .msi, unattended)
+        shell: pwsh
+        run: |
+          $url = "https://archive.mariadb.org/mariadb-$env:MARIADB_VER/winx64-packages/mariadb-$env:MARIADB_VER-winx64.msi"
+          Write-Host "Fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile mariadb.msi -UseBasicParsing
+          $p = Start-Process msiexec.exe -ArgumentList @(
+              '/i', 'mariadb.msi',
+              'SERVICENAME=MariaDB', 'PASSWORD=fractalsql-ci', 'PORT=3306',
+              'ALLOWREMOTEROOTACCESS=1', '/qn'
+          ) -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Host "FATAL: msiexec exited $($p.ExitCode)"; exit 1 }
+          Get-Service MariaDB
+
+      - name: Download + unpack MariaDB binaries (headers for building)
+        shell: pwsh
+        run: |
+          $zipName = "mariadb-$env:MARIADB_VER-winx64.zip"
+          $url = "https://archive.mariadb.org/mariadb-$env:MARIADB_VER/winx64-packages/$zipName"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mdb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mdb.zip" -DestinationPath "deps\mariadb" -Force
+          Rename-Item -Path "deps\mariadb\mariadb-$env:MARIADB_VER-winx64" -NewName "root"
+
+      - name: Build fractalsql.dll and fractalsqld.exe (scripts\windows\build.bat)
+        shell: cmd
+        env:
+          MARIADB_MAJOR: ${{ env.MDB_VER }}
+          # Pin VCPKG_ROOT to the pre-installed C:\vcpkg the install
+          # below populates: newer runner images ship VS-bundled vcpkg
+          # with VCPKG_ROOT pointing at it, and build.bat would resolve
+          # OPENSSL_DIR against that empty install tree. Same pin as
+          # release.yml's build-windows-msi job.
+          VCPKG_ROOT: 'C:\vcpkg'
+        run: |
+          set MARIADB_DIR=%CD%\deps\mariadb\root
+          set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%
+          if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          REM OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+          REM check, not vendored in the core drop. Same vcpkg tool and
+          REM install path fractalsql-reasoning-http's own Windows build
+          REM already uses for libcurl (pre-installed on this runner image).
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+          call scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          copy /Y "%OUT_DIR%\fractalsql.dll" fractalsql.dll
+          if not exist "fractalsql.dll" (
+              echo FATAL: fractalsql.dll not found after build.bat
+              exit /b 1
+          )
+          copy /Y "%OUT_DIR%\fractalsqld.exe" fractalsqld.exe
+          if not exist "fractalsqld.exe" (
+              echo FATAL: fractalsqld.exe not found after build.bat
+              exit /b 1
+          )
+
+      - name: Install our plugin into the running MariaDB server
+        shell: pwsh
+        run: |
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MariaDB'"
+          # MariaDB Windows installs register the service under either
+          # server binary name (mysqld.exe on older/most MSI layouts,
+          # mariadbd.exe elsewhere); both are the same binary.
+          $exePath = ($svc.PathName -replace '^"?([^"]+[\\/](mariadbd|mysqld)\.exe)".*$', '$1')
+          $mdbDir = Split-Path (Split-Path $exePath -Parent) -Parent
+          $env:MYSQL_PWD = 'fractalsql-ci'
+          $mdbExe = Join-Path $mdbDir 'bin\mariadb.exe'
+          & $mdbExe -u root -e "SELECT 1;"
+          & $mdbExe -u root -e "CREATE DATABASE fractalsql_ci;"
+          # Live @@plugin_dir, not a 'lib\plugin' guess under the install
+          # root, same approach as easy_install.ps1's own
+          # Resolve-PluginDir: a static guess for a MariaDB plugin
+          # directory can differ from the server's own live value.
+          $pluginDir = (& $mdbExe -u root -N -B -e "SELECT @@plugin_dir;").Trim().TrimEnd('\')
+          if (-not $pluginDir) { Write-Host "FATAL: SELECT @@plugin_dir returned nothing"; exit 1 }
+          Write-Host "plugin_dir: $pluginDir"
+          Copy-Item "fractalsql.dll" (Join-Path $pluginDir 'fractalsql.dll')
+          # easy_install.ps1 points reasoning_plugin (in
+          # fractalsqld.conf) at <plugin_dir>\fractalsql-reasoning-http.dll,
+          # so the vendored reasoning plugin must sit next to
+          # fractalsql.dll -- without it fractal_reason() can't dlopen
+          # anything and NULLs. (The FRACTALSQL_* env names that used to
+          # be the wizard's wiring are only the fallback for keys the
+          # conf omits.)
+          Copy-Item "include\windows-x86_64\fractalsql-reasoning-http.dll" (Join-Path $pluginDir 'fractalsql-reasoning-http.dll')
+
+      # fractalsql.dll (the shim, just staged above) is only half of
+      # it: every UDF call forwards to fractalsqld over a named pipe,
+      # and nothing here has installed, configured, or started that
+      # daemon at all yet -- easy_install.ps1 runs with -NoInstall (it
+      # assumes a human already provisioned the daemon, mirroring the
+      # Linux/macOS install-test jobs, which stage the daemon manually
+      # too), so without this step every UDF call fails with "cannot
+      # read fractalsql.conf" and the daemon is never reachable.
+      - name: Install and start the fractalsqld Windows service
+        shell: pwsh
+        run: |
+          $fsqlDir = 'C:\ProgramData\FractalSQL'
+          New-Item -ItemType Directory -Force -Path $fsqlDir | Out-Null
+
+          $bytes = New-Object byte[] 32
+          [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $hmacHex = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+          $keyPath = Join-Path $fsqlDir 'hmac.key'
+          Set-Content -Path $keyPath -Value $hmacHex -NoNewline -Encoding ascii
+
+          # The daemon's per-connection check (allowed_pipe_sid) only
+          # admits this SID -- it must be the account the "MariaDB"
+          # service (and so the shim, which runs inside it) actually
+          # runs as, not whatever account installed the package. See
+          # fractalsqld-service.ps1's own header comment for why.
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MariaDB'"
+          $startName = $svc.StartName
+          if ([string]::IsNullOrEmpty($startName) -or $startName -eq 'LocalSystem') {
+              $sid = 'S-1-5-18'   # LocalSystem's well-known SID; NTAccount can't translate the bare name
+          } else {
+              $sid = (New-Object System.Security.Principal.NTAccount($startName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          }
+          Write-Host "mariadbd runs as '$startName' (SID $sid)"
+
+          $pipeName = 'socket_path = \\.\pipe\fractalsqld'
+          $fsqldConf = Join-Path $fsqlDir 'fractalsqld.conf'
+          @(
+              $pipeName,
+              "hmac_key_file = $keyPath",
+              "allowed_pipe_sid = $sid"
+          ) | Set-Content -Path $fsqldConf -Encoding ascii
+
+          # The shim's own config (read inside mariadbd): same pipe and
+          # key, no allowed_pipe_sid (that's the daemon's admission
+          # check, not something a client needs). Written to the
+          # shim's hardcoded default path, so no FRACTALSQL_CONFIG env
+          # var or mariadbd restart is needed -- the shim loads it
+          # lazily on its first UDF call, which hasn't happened yet.
+          $fsqlConf = Join-Path $fsqlDir 'fractalsql.conf'
+          @(
+              $pipeName,
+              "hmac_key_file = $keyPath"
+          ) | Set-Content -Path $fsqlConf -Encoding ascii
+
+          # Windows equivalent of the Linux postinst's chmod 600 on the
+          # key: the daemon refuses to start if hmac_key_file or its own
+          # conf is readable by Everyone, Authenticated Users or
+          # BUILTIN\Users (key_file_private() in
+          # service/daemon/fractalsqld.c), and ProgramData's default
+          # inheritance grants BUILTIN\Users RX to every file created
+          # here. Same recipe as scripts\windows\provision-fractalsqld.ps1
+          # (see its own comment -- confirmed live there: the service
+          # exits at once with a generic "cannot start service" and this
+          # exact key-permission complaint in its log without this).
+          #   - LOCAL SERVICE runs the daemon (reads the key + fractalsqld.conf)
+          #   - the MariaDB service account's shim inside mariadbd reads
+          #     the key (to sign pipe requests) and fractalsql.conf
+          $hardened = @(
+              @{ Path = $keyPath;  Grant = @('*S-1-5-18:(F)', '*S-1-5-32-544:(F)', '*S-1-5-19:(RX)', "*$($sid):(RX)") },
+              @{ Path = $fsqldConf; Grant = @('*S-1-5-18:(F)', '*S-1-5-32-544:(F)', '*S-1-5-19:(RX)', "*$($sid):(RX)") },
+              @{ Path = $fsqlConf;  Grant = @('*S-1-5-18:(F)', '*S-1-5-32-544:(F)', "*$($sid):(RX)") }
+          )
+          foreach ($entry in $hardened) {
+              icacls $entry.Path /inheritance:r /grant:r $entry.Grant | Out-Null
+              if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: icacls failed to restrict $($entry.Path)"; exit 1 }
+          }
+
+          $daemonExe = (Resolve-Path 'fractalsqld.exe').Path
+          & pwsh -File .\scripts\windows\fractalsqld-service.ps1 -Action install -Exe $daemonExe -Config $fsqldConf
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: fractalsqld-service.ps1 install failed"; exit 1 }
+          Start-Service fractalsqld
+
+          # Not a Connect(): the pipe's DACL (build_pipe_sd() in
+          # fractalsqld.c) only grants access to allowed_pipe_sid (the
+          # MariaDB service account) and the daemon's own account --
+          # never to whoever happens to run this step -- so a real
+          # connect attempt here would always be denied regardless of
+          # whether the daemon is healthy. Listing the pipe namespace
+          # only needs to see the name, not open it, so it proves the
+          # daemon reached CreateNamedPipe without fighting its DACL.
+          # The actual DACL-respecting round trip is proven two steps
+          # down, via easy_install.ps1's SQL running inside mariadbd
+          # (which runs as the allow-listed account).
+          # 100x200ms (20s), not 50x200ms (10s): generous room for a
+          # first-boot delay or a crash-loop restart (fractalsqld
+          # respawns on a ~5s cadence) to clear before giving up.
+          $pipeUp = $false
+          for ($i = 0; $i -lt 100; $i++) {
+              if ([System.IO.Directory]::GetFiles('\\.\pipe\') -contains '\\.\pipe\fractalsqld') {
+                  $pipeUp = $true
+                  break
+              }
+              Start-Sleep -Milliseconds 200
+          }
+          if (-not $pipeUp) {
+              Write-Host "FATAL: fractalsqld never opened its named pipe"
+              Get-Service fractalsqld | Format-List *
+              $fsqldLog = Join-Path $fsqlDir 'fractalsqld.log'
+              if (Test-Path $fsqldLog) {
+                  Write-Host "--- fractalsqld.log (tail) ---"
+                  Get-Content $fsqldLog -Tail 60
+              } else {
+                  Write-Host "fractalsqld.log does not exist at $fsqldLog -- the daemon never got far enough to open its log file"
+              }
+              exit 1
+          }
+          Write-Host "fractalsqld is up (named pipe exists)."
+
+      - name: Run easy_install.ps1 against a mock LLM
+        shell: pwsh
+        run: |
+          # Same launch discipline as build_test.ps1's own mock startup:
+          # quote the script path (Start-Process -ArgumentList joins the
+          # array with spaces without quoting), capture stdout/stderr so
+          # a bind failure is diagnosable instead of a silent NULL, and
+          # poll the port rather than assuming a fixed sleep was enough.
+          $mockLog = Join-Path $pwd 'mock_llm.log'
+          $py = (Get-Command python).Source
+          $null = Start-Process -FilePath $py `
+              -ArgumentList @("`"$pwd\scripts\ci\mock_llm.py`"", '18080') `
+              -RedirectStandardOutput $mockLog -RedirectStandardError "$mockLog.err" `
+              -PassThru -WindowStyle Hidden
+          $up = $false
+          for ($i = 0; $i -lt 50; $i++) {
+              $c = New-Object Net.Sockets.TcpClient
+              try { $c.Connect('127.0.0.1', 18080); $up = $true } catch { } finally { $c.Dispose() }
+              if ($up) { break }
+              Start-Sleep -Milliseconds 200
+          }
+          if (-not $up) {
+              Write-Host "FATAL: mock_llm.py never came up on 127.0.0.1:18080"
+              if (Test-Path "$mockLog.err") { Get-Content "$mockLog.err" }
+              if (Test-Path $mockLog)    { Get-Content $mockLog }
+              exit 1
+          }
+
+          # Deliberately no -MdbDir: this exercises the script's own
+          # Win32_Service-based auto-detection (Get-MariaDbTarget)
+          # against the real install above, not a manual override.
+          #
+          # -Provider ollama, not openai-compatible: ollama mode sets
+          # reasoning_allow_plaintext in the conf automatically, which
+          # this plaintext local mock needs.
+          & pwsh -File .\scripts\windows\easy_install.ps1 `
+              -RootPassword 'fractalsql-ci' -Database 'fractalsql_ci' `
+              -Provider ollama `
+              -Url 'http://127.0.0.1:18080/v1/chat/completions' `
+              -Model 'mock-model' `
+              -EmbedUrl 'http://127.0.0.1:18080/v1/embeddings' `
+              -EmbedModel 'mock-embed' -Think off `
+              -NoInstall -Yes 2>&1 | Tee-Object -FilePath easy-install.log
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "FATAL: easy_install.ps1 exited $LASTEXITCODE"
+              exit 1
+          }
+
+          # scripts/ci/mock_llm.py's canned chat reply is a fenced
+          # ```sql SELECT 1``` block (shared with build_test.ps1's
+          # reasoning-tier gates).
+          $hit = Select-String -Path easy-install.log -Pattern 'select 1' -Quiet
+          if (-not $hit) {
+              Write-Host "FAIL: reasoning round-trip via easy_install.ps1 didn't reach the mock reply"
+              Write-Host "--- mock_llm.log ---"
+              if (Test-Path mock_llm.log)     { Get-Content mock_llm.log }
+              if (Test-Path mock_llm.log.err) { Get-Content mock_llm.log.err }
+              # A bare client-visible NULL here tells us nothing: fractal_reason()'s
+              # only way to report *why* is SFS_INIT_ERROR mirroring the message to
+              # the daemon's own log (see its comment in fractalsql_cognition.c --
+              # a UDF runtime failure sets *error and returns NULL with no SQL-level
+              # error surfaced to the client, exactly what "NULL" above is).
+              $fsqldLog = 'C:\ProgramData\FractalSQL\fractalsqld.log'
+              if (Test-Path $fsqldLog) {
+                  Write-Host "--- fractalsqld.log (tail) ---"
+                  Get-Content $fsqldLog -Tail 60
+              } else {
+                  Write-Host "fractalsqld.log does not exist at $fsqldLog"
+              }
+              exit 1
+          }
+
+          $edition = Select-String -Path easy-install.log -Pattern 'fractal_edition\(\) = (\S+),' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
+          Write-Host "edition=$edition"
+          if ($edition -ne 'Community') {
+              Write-Host "FAIL: fractal_edition() line not found or unexpected in easy-install.log"
+              exit 1
+          }
+
+          # The wizard writes provider settings into the daemon's conf
+          # file (its preferred source; it applies at the service
+          # restart), not the legacy registry env names:
+          $conf = Select-String -Path 'C:\ProgramData\FractalSQL\fractalsqld.conf' `
+              -Pattern '^reasoning_url = ', '^reasoning_allow_plaintext = 1$'
+          if (@($conf).Count -lt 2) {
+              Write-Host "FAIL: wizard didn't write reasoning_url/reasoning_allow_plaintext into fractalsqld.conf"
+              Get-Content 'C:\ProgramData\FractalSQL\fractalsqld.conf'
+              exit 1
+          }
+          Write-Host "ok: easy_install.ps1 end-to-end (Windows, mdb11.4)"

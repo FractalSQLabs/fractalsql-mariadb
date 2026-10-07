@@ -1,0 +1,1303 @@
+/* src/fractalsql_textsql.c
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+ *
+ * Text-to-SQL C UDF layer: fractal_t2s_generate, fractal_t2s_review,
+ * fractal_t2s_check_allowlist, and fractal_t2s_config.
+ *
+ * Architecture note: validating and running a generated SQL candidate
+ * (EXPLAIN, catalog introspection) needs to run under the calling
+ * role's own privileges. Plain MariaDB UDFs have no way to do that: the
+ * UDF ABI (UDF_INIT/UDF_ARGS) gives a C function no handle back to
+ * the connection that called it, so it cannot run SQL against that
+ * session at all.
+ *
+ * fractal_text_to_sql and fractal_schema_context are therefore
+ * implemented as SQL SECURITY INVOKER stored procedures
+ * (sql/install_udf.sql), not C UDFs. They are called via CALL, not
+ * SELECT, which is a deliberate departure from every other function
+ * in this repo. SQL SECURITY INVOKER makes their PREPARE/EXPLAIN and
+ * information_schema queries run under the calling user's own grants.
+ * The alternative, a C UDF opening a second, separately credentialed
+ * loopback connection back to the server, would run those queries
+ * under a different set of grants than the caller's own: a
+ * privilege-model mismatch for a feature whose entire point is being
+ * safety-gated.
+ *
+ * This file supplies the pieces that genuinely need C: the LLM
+ * dispatch itself (fractal_t2s_generate, fractal_t2s_review) and pure
+ * text/lexical validation with no database access
+ * (fractal_t2s_check_allowlist). The orchestrating retry loop, the
+ * EXPLAIN-equivalent mechanical check (PREPARE/DEALLOCATE PREPARE;
+ * see the stored procedure's own comment for why PREPARE-only, never
+ * EXECUTE), and all information_schema introspection live in SQL/PSM
+ * in sql/install_udf.sql, where they naturally inherit the caller's
+ * privileges for free.
+ *
+ * Configuration lives with the fractalsqld daemon: its config file
+ * (fractalsqld.conf) is the preferred source per key, pushed in live
+ * via fractalsql_textsql_apply_provider (see fractalsql_provider.h;
+ * `fsqlctl reload` applies a change, and a key removed from the file
+ * reverts to the boot-environment fallback). That fallback is read
+ * once from the daemon's own process environment for the legacy
+ * variable names below (see fractalsql_cognition.c's file header for
+ * why this surface never became a my.cnf sysvar):
+ *   FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS        int, default 2
+ *   FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS  "select" (default) |
+ *                                               "select_insert_update"
+ *   FRACTALSQL_TEXT_TO_SQL_USE_REVIEW          "1" to enable, default off
+ * fractal_t2s_config() exposes the effective values as one JSON object
+ * so the orchestrating stored procedure, which runs inside MariaDB and
+ * has no builtin to read the daemon's process environment, can read
+ * them once per CALL.
+ *
+ * Plain MariaDB UDFs have no backend parser to call into for a real
+ * parse-tree inspection (see the architecture note above), so
+ * fractal_t2s_check_allowlist below is a hand-written,
+ * quote/comment/paren-aware lexical scanner. It classifies the
+ * statement's leading keyword (skipping past any WITH-clause CTE
+ * definitions first), rejects more than one top-level statement, and
+ * rejects a disallowed statement type. Two things this needed to get
+ * right, verified against MariaDB's own grammar:
+ *
+ *   1. MariaDB's WITH clause is SELECT-only at the CTE-body level.
+ *      "WITH d AS (DELETE FROM t ...) SELECT ..." is not valid
+ *      MariaDB syntax (a CTE body must be a query, not a DML
+ *      statement), so a data-modifying CTE hiding behind a top-level
+ *      SELECT is not a hazard this scanner needs to guard against.
+ *      (A CTE can still feed a top-level DML statement, e.g. "WITH
+ *      cte AS (SELECT ...) DELETE FROM t WHERE id IN (SELECT id FROM
+ *      cte)". That is exactly what the WITH-clause skip below is for:
+ *      finding the real leading keyword after the CTE definitions,
+ *      which in that example is DELETE and gets correctly rejected in
+ *      "select" mode.)
+ *   2. "SELECT ... INTO OUTFILE/DUMPFILE" is syntactically a SELECT
+ *      (it passes any leading-keyword classification as read-only)
+ *      but writes arbitrary content to the filesystem under the
+ *      MariaDB server's privileges. It is rejected unconditionally, in
+ *      every allowed_statements mode, by a whole-statement scan for
+ *      INTO OUTFILE/DUMPFILE.
+ *
+ * Known limitation, documented rather than silently ignored: this
+ * scanner assumes the default sql_mode (backslash escapes on) when
+ * skipping quoted strings. Under NO_BACKSLASH_ESCAPES it may mis-scan
+ * a quoted literal containing a trailing backslash. The failure
+ * direction is always toward over-rejecting (treating well-formed SQL
+ * as ambiguous and asking the GENERATE step to retry), never toward
+ * missing a real statement-shape violation, so this is an
+ * availability cost, not a safety gap.
+ */
+
+#include <mysql.h>
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "fractalsql.h"          /* FSQL_OK, fsql_last_error */
+#include "fractalsql_sql.h"      /* fsql_ctx, fsql_dispatch_ai, fsql_load_reasoning */
+#include "fractalsql_session.h"  /* fractal_session_acquire_reason/_t2s, ... */
+#include "fractalsql_provider.h"     /* fractalsql_textsql_{check,apply}_provider */
+#include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+#  include <Windows.h>
+#  define FRACTAL_EXPORT __declspec(dllexport)
+#else
+#  include <pthread.h>
+#  define FRACTAL_EXPORT
+#endif
+
+/* Same stderr-mirroring SFS_INIT_ERROR as fractalsql_cognition.c
+ * (duplicated per translation unit by this repo's established
+ * precedent): on the UDF runtime path the formatted buffer would
+ * otherwise be dropped, surfacing failures as bare NULLs. */
+#define SFS_INIT_ERROR(msg, ...)                                              \
+    do {                                                                      \
+        snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__);                      \
+        fprintf(stderr, "fractalsql: %s\n", (msg));                           \
+    } while (0)
+
+/* Same DoS-guard reasoning as fractalsql_cognition.c's
+ * FRACTAL_COGNITION_MAX_INPUT_BYTES: caller-controlled text drives
+ * both an allocation and an outbound HTTP request body. */
+#define FRACTAL_T2S_MAX_INPUT_BYTES ((unsigned long) 4u * 1024u * 1024u) /* 4 MiB */
+#define FRACTAL_T2S_MAX_SQL_BYTES   ((unsigned long) 256u * 1024u)       /* 256 KiB, sized for a single generated statement */
+
+/* Same bound/rationale as fractalsql_cognition.c's
+ * FRACTAL_MAX_AI_RESPONSE_BYTES. */
+#define FRACTAL_MAX_AI_RESPONSE_BYTES ((size_t) 16u * 1024u * 1024u) /* 16 MiB */
+
+/* ------------------------------------------------------------------ */
+/* Growable output buffer. Duplicated per translation unit, following  */
+/* this repo's established precedent (see fractalsql_cognition.c's    */
+/* identical comment on str_out_ctx).                                  */
+/* ------------------------------------------------------------------ */
+typedef struct str_out_ctx {
+    char  *buf;
+    size_t cap;
+} str_out_ctx;
+
+static bool
+str_out_ensure(str_out_ctx *so, size_t need)
+{
+    size_t ncap;
+    char  *nb;
+    if (need <= so->cap) return true;
+    ncap = so->cap ? so->cap : 256;
+    while (ncap < need) ncap *= 2;
+    nb = realloc(so->buf, ncap);
+    if (nb == NULL) return false;
+    so->buf = nb; so->cap = ncap;
+    return true;
+}
+
+static bool
+str_out_generic_init(UDF_INIT *initid, char *message, unsigned long max_length)
+{
+    str_out_ctx *so = calloc(1, sizeof(*so));
+    if (so == NULL) {
+        SFS_INIT_ERROR(message, "fractal_t2s: out of memory");
+        return true;
+    }
+    initid->ptr        = (char *) so;
+    initid->maybe_null = 1;
+    initid->max_length = max_length;
+    return false;
+}
+
+static void
+str_out_generic_deinit(UDF_INIT *initid)
+{
+    str_out_ctx *so = (str_out_ctx *) initid->ptr;
+    if (so == NULL) return;
+    free(so->buf);
+    free(so);
+    initid->ptr = NULL;
+}
+
+static char *
+str_out_set(str_out_ctx *so, const char *text, size_t len, unsigned long *out_len)
+{
+    if (!str_out_ensure(so, len + 1)) return NULL;
+    memcpy(so->buf, text, len);
+    so->buf[len] = '\0';
+    *out_len = (unsigned long) len;
+    return so->buf;
+}
+
+/* ------------------------------------------------------------------ */
+/* Portable lock and once-init shim. See fractalsql_session.c's        */
+/* identical comment; duplicated per translation unit by this repo's   */
+/* established precedent rather than shared.                           */
+/* ------------------------------------------------------------------ */
+#if defined(_WIN32)
+static CRITICAL_SECTION g_load_lock;
+static INIT_ONCE        g_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK
+init_load_lock_once(PINIT_ONCE ip, PVOID param, PVOID *ctx)
+{
+    (void) ip; (void) param; (void) ctx;
+    InitializeCriticalSection(&g_load_lock);
+    return TRUE;
+}
+static void load_lock(void)
+{
+    InitOnceExecuteOnce(&g_lock_once, init_load_lock_once, NULL, NULL);
+    EnterCriticalSection(&g_load_lock);
+}
+static void load_unlock(void) { LeaveCriticalSection(&g_load_lock); }
+#else
+static pthread_mutex_t g_load_lock = PTHREAD_MUTEX_INITIALIZER;
+static void load_lock(void)   { pthread_mutex_lock(&g_load_lock); }
+static void load_unlock(void) { pthread_mutex_unlock(&g_load_lock); }
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Provider config. Per key, in priority order (fractalsql_provider.h */
+/* for the rule): (1) fractalsqld.conf -- the daemon pushes values in */
+/* via fractalsql_textsql_apply_provider(), under our load lock;      */
+/* (2) the process environment -- the boot fallback, captured once;   */
+/* (3) unset/default.                                                 */
+/*                                                                    */
+/* Unlike fractalsql_cognition.c, the environment fallback here reads */
+/* only the LEGACY FRACTALSQL_* names (as it always did). Reasoning   */
+/* plugin path/HTTP config is shared with fractalsql_cognition.c's    */
+/* vars: same plugin, same endpoint, just a third dispatch purpose.   */
+/* Re-reading the environment here, rather than sharing it across     */
+/* translation units, matches this repo's convention of each source   */
+/* file owning its own config (see that file's own loader). With the  */
+/* daemon pushing conf-file values through, both tiers now get the    */
+/* same file-stored settings even though their env fallbacks read the */
+/* two different name families.                                       */
+/*                                                                    */
+/* g_env_fb is the boot-env fallback snapshot: owned strings, captured */
+/* once, never freed. g_cfg holds the EFFECTIVE values -- always its  */
+/* own owned copies, never aliases of g_env_fb's, so apply's           */
+/* free-and-replace can never dangle. Until the first provider apply, */
+/* g_cfg is initialized once from the snapshot, byte-identical to the */
+/* old env-only behavior.                                             */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    char *reasoning_plugin;
+    char *http_url;
+    char *http_token;
+    char *http_model;
+    bool  http_allow_plaintext;
+    int   max_attempts;
+    char  allowed_statements[24];   /* "select" | "select_insert_update" */
+    bool  use_review;
+    char *http_think;
+    char *http_think_provider;
+    char *http_native_url;
+    char *http_num_ctx;
+} t2s_config;
+
+static t2s_config g_cfg;     /* effective values */
+static t2s_config g_env_fb;  /* boot-env fallback snapshot */
+static bool g_env_captured;  /* g_env_fb filled (under load lock) */
+static bool g_cfg_initialized; /* g_cfg filled from the snapshot (until apply) */
+static bool g_provider_applied; /* g_cfg last written by apply_provider */
+
+static char *
+dup_env(const char *name)
+{
+    const char *v = getenv(name);
+    return (v && *v) ? strdup(v) : NULL;
+}
+
+/* strdup `s` (NULL stays NULL) into *out; 0, or -1 on allocation
+ * failure. */
+static int
+dup_or(const char *s, char **out)
+{
+    if (!s) { *out = NULL; return 0; }
+    *out = strdup(s);
+    return *out ? 0 : -1;
+}
+
+static void
+free_t2s_cfg(t2s_config *c)
+{
+    free(c->reasoning_plugin);
+    free(c->http_url);
+    free(c->http_token);
+    free(c->http_model);
+    free(c->http_think);
+    free(c->http_think_provider);
+    free(c->http_native_url);
+    free(c->http_num_ctx);
+    memset(c, 0, sizeof *c);
+}
+
+/* Owned duplicate of every `from` string into `to` (fixed-size fields
+ * copied as-is). 0, or -1 with `to` fully freed and zeroed on failure. */
+static int
+dup_t2s_cfg(const t2s_config *from, t2s_config *to)
+{
+    int rc = 0;
+    rc |= dup_or(from->reasoning_plugin,    &to->reasoning_plugin);
+    rc |= dup_or(from->http_url,            &to->http_url);
+    rc |= dup_or(from->http_token,          &to->http_token);
+    rc |= dup_or(from->http_model,          &to->http_model);
+    rc |= dup_or(from->http_think,          &to->http_think);
+    rc |= dup_or(from->http_think_provider, &to->http_think_provider);
+    rc |= dup_or(from->http_native_url,     &to->http_native_url);
+    rc |= dup_or(from->http_num_ctx,        &to->http_num_ctx);
+    to->http_allow_plaintext = from->http_allow_plaintext;
+    to->max_attempts         = from->max_attempts;
+    snprintf(to->allowed_statements, sizeof to->allowed_statements, "%s",
+             from->allowed_statements);
+    to->use_review = from->use_review;
+    if (rc != 0) {
+        free_t2s_cfg(to);
+        return -1;
+    }
+    return 0;
+}
+
+/* Called with the load lock held. Fills the boot-env fallback snapshot
+ * from the process environment exactly once. */
+static void
+capture_t2s_env_fb(void)
+{
+    const char *plain, *max_att, *allowed, *review;
+    if (g_env_captured) return;
+
+    g_env_fb.reasoning_plugin = dup_env("FRACTALSQL_REASONING_PLUGIN");
+    g_env_fb.http_url         = dup_env("FRACTALSQL_HTTP_URL");
+    g_env_fb.http_token       = dup_env("FRACTALSQL_HTTP_TOKEN");
+    g_env_fb.http_model       = dup_env("FRACTALSQL_HTTP_MODEL");
+    plain = getenv("FRACTALSQL_HTTP_ALLOW_PLAINTEXT");
+    g_env_fb.http_allow_plaintext = (plain && *plain && strcmp(plain, "0") != 0);
+    g_env_fb.http_think          = dup_env("FRACTALSQL_HTTP_THINK");
+    g_env_fb.http_think_provider = dup_env("FRACTALSQL_HTTP_THINK_PROVIDER");
+    g_env_fb.http_native_url     = dup_env("FRACTALSQL_HTTP_NATIVE_URL");
+    g_env_fb.http_num_ctx        = dup_env("FRACTALSQL_HTTP_NUM_CTX");
+
+    max_att = getenv("FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS");
+    g_env_fb.max_attempts = 2;
+    if (max_att && *max_att) {
+        int v = atoi(max_att);
+        if (v >= 1 && v <= 10) g_env_fb.max_attempts = v;
+    }
+
+    allowed = getenv("FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS");
+    if (allowed && strcmp(allowed, "select_insert_update") == 0)
+        snprintf(g_env_fb.allowed_statements, sizeof g_env_fb.allowed_statements, "select_insert_update");
+    else
+        snprintf(g_env_fb.allowed_statements, sizeof g_env_fb.allowed_statements, "select");
+
+    review = getenv("FRACTALSQL_TEXT_TO_SQL_USE_REVIEW");
+    g_env_fb.use_review = (review && *review && strcmp(review, "0") != 0);
+    g_env_captured = true;
+}
+
+static void
+ensure_env_config(void)
+{
+    /* Under the load lock: the snapshot capture would race a concurrent
+     * apply_provider, and the copies below assume both are settled. */
+    load_lock();
+    capture_t2s_env_fb();
+    if (!g_provider_applied && !g_cfg_initialized) {
+        /* Byte-identical to the old env-only first read. On OOM g_cfg
+         * stays zeroed and the dispatch path reports missing config;
+         * the next call retries this copy. */
+        if (dup_t2s_cfg(&g_env_fb, &g_cfg) == 0)
+            g_cfg_initialized = true;
+    }
+    load_unlock();
+}
+
+/* ------------------------------------------------------------------ */
+/* fractalsqld.conf push path (fractalsql_provider.h contract).       */
+/* ------------------------------------------------------------------ */
+
+int
+fractalsql_textsql_check_provider(const struct fsq_provider_cfg *c)
+{
+    /* The t2s/review tiers re-load their plugin from the cleared
+     * loaded-flags on the next dispatch, exactly like the cognition
+     * tiers; no cross-state constrains a swap. */
+    (void) c;
+    return 0;
+}
+
+/* This consumer ignores the embed/RESPONSE_MODE keys (the embed tier and
+ * the response-mode extractor are fractalsql_cognition.c's); every
+ * otherwise-untouched field reverts to the boot-env fallback exactly
+ * like a present-vs-absent key. */
+int
+fractalsql_textsql_apply_provider(const struct fsq_provider_cfg *c)
+{
+    t2s_config n;
+    char *np_plugin = NULL, *nurl = NULL, *ntok = NULL, *nmodel = NULL;
+    char *nthink = NULL, *nthink_provider = NULL, *nnative = NULL, *nnum_ctx = NULL;
+    const char *src;
+    int rc = -1;
+
+    /* We take the lock ourselves: the daemon calls this on startup and
+     * on FSQ_OP_RELOAD, and the swap must be ordered against every
+     * dispatch's read of g_cfg (apply_generate_env_locked et al). */
+    load_lock();
+    capture_t2s_env_fb();
+
+    src = (c->present & FSQL_PROV_REASONING_PLUGIN) ? c->reasoning_plugin
+                                                    : g_env_fb.reasoning_plugin;
+    if (dup_or(src, &np_plugin) != 0) goto oom;
+    src = (c->present & FSQL_PROV_REASONING_URL) ? c->reasoning_url
+                                                 : g_env_fb.http_url;
+    if (dup_or(src, &nurl) != 0) goto oom;
+    src = (c->present & FSQL_PROV_REASONING_TOKEN) ? c->reasoning_token
+                                                   : g_env_fb.http_token;
+    if (dup_or(src, &ntok) != 0) goto oom;
+    src = (c->present & FSQL_PROV_REASONING_MODEL) ? c->reasoning_model
+                                                   : g_env_fb.http_model;
+    if (dup_or(src, &nmodel) != 0) goto oom;
+    src = (c->present & FSQL_PROV_THINK) ? c->think : g_env_fb.http_think;
+    if (dup_or(src, &nthink) != 0) goto oom;
+    src = (c->present & FSQL_PROV_THINK_PROVIDER) ? c->think_provider
+                                                  : g_env_fb.http_think_provider;
+    if (dup_or(src, &nthink_provider) != 0) goto oom;
+    src = (c->present & FSQL_PROV_NATIVE_URL) ? c->think_native_url
+                                              : g_env_fb.http_native_url;
+    if (dup_or(src, &nnative) != 0) goto oom;
+    src = (c->present & FSQL_PROV_NUM_CTX) ? c->think_num_ctx_str
+                                           : g_env_fb.http_num_ctx;
+    if (dup_or(src, &nnum_ctx) != 0) goto oom;
+
+    n = g_env_fb;                        /* scalars + fixed-size fields */
+    n.reasoning_plugin    = np_plugin;   /* strings become the new copies */
+    n.http_url            = nurl;
+    n.http_token          = ntok;
+    n.http_model          = nmodel;
+    n.http_think          = nthink;
+    n.http_think_provider = nthink_provider;
+    n.http_native_url     = nnative;
+    n.http_num_ctx        = nnum_ctx;
+    if (c->present & FSQL_PROV_REASONING_PLAINTEXT)
+        n.http_allow_plaintext = c->reasoning_allow_plaintext;
+    if (c->present & FSQL_PROV_T2S_MAX_ATTEMPTS)
+        n.max_attempts = (int) c->t2s_max_attempts;
+    if (c->present & FSQL_PROV_T2S_ALLOWED)
+        snprintf(n.allowed_statements, sizeof n.allowed_statements, "%s",
+                 c->t2s_allowed_statements);
+    if (c->present & FSQL_PROV_T2S_USE_REVIEW)
+        n.use_review = c->t2s_use_review;
+
+    free_t2s_cfg(&g_cfg);
+    g_cfg              = n;
+    g_provider_applied = true;
+    g_cfg_initialized  = true;
+
+    /* Plugin loads are never attempted here (fractalsql_provider.h): a
+     * changed or failing path surfaces on the tier's next dispatch, when
+     * these cleared flags force a fresh fsql_load_reasoning. */
+    fractal_session_forget_t2s_loaded();
+    fractal_session_forget_review_loaded();
+    load_unlock();
+    return 0;
+
+oom:
+    free(np_plugin); free(nurl); free(ntok); free(nmodel);
+    free(nthink); free(nthink_provider); free(nnative); free(nnum_ctx);
+    load_unlock();
+    return -1;
+}
+
+/* ==================================================================== */
+/* fractal_t2s_config() -> JSON STRING                                  */
+/* {"max_attempts":2,"allowed_statements":"select","use_review":false}  */
+/* Lets the orchestrating stored procedure (sql/install_udf.sql) read   */
+/* this file's effective config once per CALL, since SQL/PSM, running    */
+/* inside MariaDB, has no built-in mechanism to read the daemon's        */
+/* process environment directly.                                        */
+/* ==================================================================== */
+
+FRACTAL_EXPORT bool
+fractal_t2s_config_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 0) {
+        SFS_INIT_ERROR(message, "fractal_t2s_config(): expected 0 arguments, got %u", args->arg_count);
+        return true;
+    }
+    return str_out_generic_init(initid, message, 256);
+}
+
+FRACTAL_EXPORT void
+fractal_t2s_config_deinit(UDF_INIT *initid) { str_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_t2s_config(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                   unsigned long *length, char *is_null, char *error)
+{
+    str_out_ctx *so = (str_out_ctx *) initid->ptr;
+    char buf[256];
+    int  n;
+    (void) args; (void) result;
+
+    ensure_env_config();
+
+    n = snprintf(buf, sizeof buf,
+                 "{\"max_attempts\":%d,\"allowed_statements\":\"%s\",\"use_review\":%s}",
+                 g_cfg.max_attempts, g_cfg.allowed_statements,
+                 g_cfg.use_review ? "true" : "false");
+    if (n < 0 || (size_t) n >= sizeof buf) { *error = 1; return NULL; }
+
+    char *s = str_out_set(so, buf, (size_t) n, length);
+    if (s == NULL) { *error = 1; return NULL; }
+    *is_null = 0;
+    return s;
+}
+
+/* ==================================================================== */
+/* Reasoning ctx bridge. See fractalsql_cognition.c's file header for   */
+/* the full setenv() race rationale; this is the same pattern for a     */
+/* third dispatch purpose (GENERATE, RESPONSE_MODE=code).               */
+/* ==================================================================== */
+
+/* "generate" mode: chat completions, RESPONSE_MODE=code so the
+ * plugin's fenced-block extraction pulls the SQL out of the model's
+ * ```sql ... ``` response. system_tag is caller-supplied (the
+ * orchestrating procedure derives it from VERSION(), e.g.
+ * "mariadb1011") rather than computed here, since a plain UDF has no
+ * access to the connected server's version the way a live SQL
+ * session does. Caller MUST hold g_load_lock. */
+static void
+apply_generate_env_locked(const char *system_tag)
+{
+    /* Same key-removal contract as apply_reason_env_locked (cognition):
+     * an absent g_cfg field is cleared, not left at its last applied
+     * value, so removing a conf key reverts that setting live. */
+    if (g_cfg.http_url)
+        setenv("FSQL_REASONING_HTTP_URL", g_cfg.http_url, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_URL");
+    if (g_cfg.http_token)
+        setenv("FSQL_REASONING_HTTP_TOKEN", g_cfg.http_token, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_TOKEN");
+    if (g_cfg.http_model)
+        setenv("FSQL_REASONING_HTTP_MODEL", g_cfg.http_model, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_MODEL");
+    if (g_cfg.http_allow_plaintext)
+        setenv("FSQL_REASONING_HTTP_ALLOW_PLAINTEXT", "1", 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_ALLOW_PLAINTEXT");
+    if (g_cfg.http_think)
+        setenv("FSQL_REASONING_HTTP_THINK", g_cfg.http_think, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_THINK");
+    if (g_cfg.http_think_provider)
+        setenv("FSQL_REASONING_HTTP_THINK_PROVIDER", g_cfg.http_think_provider, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_THINK_PROVIDER");
+    if (g_cfg.http_native_url)
+        setenv("FSQL_REASONING_HTTP_NATIVE_URL", g_cfg.http_native_url, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_NATIVE_URL");
+    if (g_cfg.http_num_ctx)
+        setenv("FSQL_REASONING_HTTP_NUM_CTX", g_cfg.http_num_ctx, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_NUM_CTX");
+    unsetenv("FSQL_REASONING_HTTP_MODE");
+    setenv("FSQL_REASONING_HTTP_RESPONSE_MODE", "code", 1);
+    if (system_tag && *system_tag)
+        setenv("FSQL_REASONING_HTTP_SYSTEM_TAG", system_tag, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_SYSTEM_TAG");
+}
+
+/* "review" mode: plain chat, its own ctx slot (review_ctx, acquired via
+ * fractal_session_acquire_review -- NOT reason_ctx). RESPONSE_MODE is
+ * hardcoded unset here, always, regardless of what an operator has set
+ * FSQL_REASONING_HTTP_RESPONSE_MODE to for fractal_reason(): RESPONSE_MODE
+ * is read once at plugin-load time and baked into a ctx for its whole
+ * lifetime (no per-dispatch override in the reasoning-http plugin's ABI),
+ * so if review shared reason_ctx, the operator's own fractal_reason()
+ * setting would silently apply to review too -- a code-mode extractor
+ * could pull a quoted SQL fragment out of review's PASS/FAIL explanation
+ * instead of the verdict text, and a json-mode extractor would almost
+ * never produce a response starting with "PASS"/"FAIL" at all, since the
+ * fractal_t2s_review UDF's parser hardcodes that check. RESPONSE_MODE is
+ * fractal_reason()'s own opt-in lever, not review's. Caller MUST hold
+ * g_load_lock. */
+static void
+apply_review_env_locked(void)
+{
+    /* Same key-removal contract as the reason/generate applies. */
+    if (g_cfg.http_url)
+        setenv("FSQL_REASONING_HTTP_URL", g_cfg.http_url, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_URL");
+    if (g_cfg.http_token)
+        setenv("FSQL_REASONING_HTTP_TOKEN", g_cfg.http_token, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_TOKEN");
+    if (g_cfg.http_model)
+        setenv("FSQL_REASONING_HTTP_MODEL", g_cfg.http_model, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_MODEL");
+    if (g_cfg.http_allow_plaintext)
+        setenv("FSQL_REASONING_HTTP_ALLOW_PLAINTEXT", "1", 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_ALLOW_PLAINTEXT");
+    if (g_cfg.http_think)
+        setenv("FSQL_REASONING_HTTP_THINK", g_cfg.http_think, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_THINK");
+    if (g_cfg.http_think_provider)
+        setenv("FSQL_REASONING_HTTP_THINK_PROVIDER", g_cfg.http_think_provider, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_THINK_PROVIDER");
+    if (g_cfg.http_native_url)
+        setenv("FSQL_REASONING_HTTP_NATIVE_URL", g_cfg.http_native_url, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_NATIVE_URL");
+    if (g_cfg.http_num_ctx)
+        setenv("FSQL_REASONING_HTTP_NUM_CTX", g_cfg.http_num_ctx, 1);
+    else
+        unsetenv("FSQL_REASONING_HTTP_NUM_CTX");
+    unsetenv("FSQL_REASONING_HTTP_MODE");
+    unsetenv("FSQL_REASONING_HTTP_RESPONSE_MODE");
+    unsetenv("FSQL_REASONING_HTTP_SYSTEM_TAG");
+}
+
+static bool
+ensure_generate_loaded(unsigned long long session_id, fsql_ctx *ctx,
+                       bool already_loaded, const char *system_tag, char *errbuf)
+{
+    int rc;
+    if (already_loaded) return true;
+    ensure_env_config();
+    if (!g_cfg.reasoning_plugin) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: no reasoning plugin configured. Set reasoning_plugin "
+            "in fractalsqld.conf and run `fsqlctl reload`, or set "
+            "FRACTALSQL_REASONING_PLUGIN in fractalsqld's environment at startup");
+        return false;
+    }
+    load_lock();
+    apply_generate_env_locked(system_tag);
+    rc = fsql_load_reasoning(ctx, g_cfg.reasoning_plugin);
+    load_unlock();
+    if (rc != FSQL_OK) {
+        const char *err = fsql_last_error(ctx);
+        SFS_INIT_ERROR(errbuf, "fractal_t2s_generate: failed to load reasoning plugin (rc=%d): %s",
+                       rc, err && *err ? err : "(no detail)");
+        return false;
+    }
+    fractal_session_mark_t2s_loaded(session_id);
+    return true;
+}
+
+static bool
+ensure_review_loaded(unsigned long long session_id, fsql_ctx *ctx,
+                     bool already_loaded, char *errbuf)
+{
+    int rc;
+    if (already_loaded) return true;
+    ensure_env_config();
+    if (!g_cfg.reasoning_plugin) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: no reasoning plugin configured. Set reasoning_plugin "
+            "in fractalsqld.conf and run `fsqlctl reload`, or set "
+            "FRACTALSQL_REASONING_PLUGIN in fractalsqld's environment at startup");
+        return false;
+    }
+    load_lock();
+    apply_review_env_locked();
+    rc = fsql_load_reasoning(ctx, g_cfg.reasoning_plugin);
+    load_unlock();
+    if (rc != FSQL_OK) {
+        const char *err = fsql_last_error(ctx);
+        SFS_INIT_ERROR(errbuf, "fractal_t2s_review: failed to load reasoning plugin (rc=%d): %s",
+                       rc, err && *err ? err : "(no detail)");
+        return false;
+    }
+    fractal_session_mark_review_loaded(session_id);
+    return true;
+}
+
+/* ==================================================================== */
+/* fractal_t2s_generate(session_id, prompt, context_text, system_tag)   */
+/*   -> TEXT (candidate SQL, code-mode-extracted)                       */
+/* ==================================================================== */
+
+FRACTAL_EXPORT bool
+fractal_t2s_generate_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 4) {
+        SFS_INIT_ERROR(message,
+            "fractal_t2s_generate(session_id, prompt, context_text, system_tag): "
+            "expected 4 arguments, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = INT_RESULT;
+    args->arg_type[1] = STRING_RESULT;
+    args->arg_type[2] = STRING_RESULT;
+    args->arg_type[3] = STRING_RESULT;
+    return str_out_generic_init(initid, message, FRACTAL_MAX_AI_RESPONSE_BYTES);
+}
+
+FRACTAL_EXPORT void
+fractal_t2s_generate_deinit(UDF_INIT *initid) { str_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                     unsigned long *length, char *is_null, char *error)
+{
+    str_out_ctx *so = (str_out_ctx *) initid->ptr;
+    char    errbuf[MYSQL_ERRMSG_SIZE];
+    unsigned long long sid;
+    const char *context_json; unsigned long context_len;
+    const char *system_tag;
+    bool    loaded = false;
+    fsql_ctx *ctx;
+    fsql_ai_response_t resp;
+    int     rc;
+    char   *s;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[1] > FRACTAL_T2S_MAX_INPUT_BYTES) { *error = 1; return NULL; }
+
+    if (args->args[2] != NULL) {
+        if (args->lengths[2] > FRACTAL_T2S_MAX_INPUT_BYTES) { *error = 1; return NULL; }
+        context_json = args->args[2];
+        context_len  = args->lengths[2];
+    } else {
+        context_json = "{}";
+        context_len  = 2;
+    }
+    /* Copy with the ABI-given length and NUL-terminate: the UDF ABI does
+     * not terminate string arguments (the same fact the session/ctx
+     * comment below concedes for args[1]/[2]), and a raw pointer here
+     * would let setenv()'s strlen run off the end of the record buffer. */
+    char system_tag_buf[64];
+    if (args->args[3] != NULL && args->lengths[3] > 0) {
+        if (args->lengths[3] >= sizeof system_tag_buf) {
+            *error = 1; return NULL;
+        }
+        memcpy(system_tag_buf, args->args[3], args->lengths[3]);
+        system_tag_buf[args->lengths[3]] = '\0';
+        system_tag = system_tag_buf;
+    } else {
+        system_tag = NULL;   /* ensure_generate_loaded tolerates it */
+    }
+
+    sid = (unsigned long long) *(long long *) args->args[0];
+
+    ctx = fractal_session_acquire_t2s(sid, &loaded);
+    if (ctx == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: session acquire failed for id %llu", sid);
+        *error = 1; return NULL;
+    }
+
+    if (!ensure_generate_loaded(sid, ctx, loaded, system_tag, errbuf)) {
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+
+    memset(&resp, 0, sizeof(resp));
+    /* The plugin library is shared by all four tiers, so the endpoint and
+     * mode it dispatches with are whatever the last load or dispatch left.
+     * Re-apply this tier's settings under the load lock, right before it. */
+    load_lock();
+    apply_generate_env_locked(system_tag);
+    rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1],
+                          context_json, context_len, &resp);
+    load_unlock();
+    if (rc != FSQL_OK || resp.rc != 0) {
+        const char *err = fsql_last_error(ctx);
+        /* Mirrored to stderr via SFS_INIT_ERROR: a plain *error=1 here
+         * surfaces only as the orchestrating procedure's generic
+         * "generate dispatch failed" NULL, hiding the plugin's actual
+         * reason (e.g. code-mode fence extraction failure). */
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: dispatch failed (rc=%d, resp.rc=%d): %s",
+            rc, resp.rc, err && *err ? err : "(no detail)");
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+    if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: response %zu bytes exceeds "
+            "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+    /* The rc==0 dispatch contract says summary is non-NULL, but the
+     * copy below would crash on a contract-violating plugin -- a
+     * plugin bug gets a clean error, not a segfault. */
+    if (resp.summary == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: reasoning plugin returned a NULL summary "
+            "on a success status -- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+
+    s = str_out_set(so, resp.summary, resp.summary_len, length);
+    fsql_ai_response_free(&resp);
+    fractal_session_release(sid);
+    if (s == NULL) { *error = 1; return NULL; }
+    *is_null = 0;
+    return s;
+}
+
+/* ==================================================================== */
+/* fractal_t2s_review(session_id, question, candidate_sql)              */
+/*   -> TEXT (NULL = PASS, else the model's critique, which feeds       */
+/*      straight back into the next GENERATE attempt as retry feedback, */
+/*      the same NULL-means-pass convention as                         */
+/*      fractal_t2s_check_allowlist)                                    */
+/* ==================================================================== */
+
+FRACTAL_EXPORT bool
+fractal_t2s_review_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 3) {
+        SFS_INIT_ERROR(message,
+            "fractal_t2s_review(session_id, question, candidate_sql): "
+            "expected 3 arguments, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = INT_RESULT;
+    args->arg_type[1] = STRING_RESULT;
+    args->arg_type[2] = STRING_RESULT;
+    return str_out_generic_init(initid, message, FRACTAL_MAX_AI_RESPONSE_BYTES);
+}
+
+FRACTAL_EXPORT void
+fractal_t2s_review_deinit(UDF_INIT *initid) { str_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                   unsigned long *length, char *is_null, char *error)
+{
+    str_out_ctx *so = (str_out_ctx *) initid->ptr;
+    char    errbuf[MYSQL_ERRMSG_SIZE];
+    unsigned long long sid;
+    bool    loaded = false;
+    fsql_ctx *ctx;
+    fsql_ai_response_t resp;
+    int     rc;
+    char    prompt[8192];
+    int     n;
+    const char *p;
+    size_t  plen;
+    bool    passed;
+    char   *s;
+    (void) result;
+
+    if (args->args[0] == NULL || args->args[1] == NULL || args->args[2] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[1] > FRACTAL_T2S_MAX_INPUT_BYTES ||
+        args->lengths[2] > FRACTAL_T2S_MAX_SQL_BYTES) { *error = 1; return NULL; }
+
+    sid = (unsigned long long) *(long long *) args->args[0];
+
+    ctx = fractal_session_acquire_review(sid, &loaded);
+    if (ctx == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: session acquire failed for id %llu", sid);
+        *error = 1; return NULL;
+    }
+
+    if (!ensure_review_loaded(sid, ctx, loaded, errbuf)) {
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+
+    /* args->args[1]/[2] are not guaranteed NUL-terminated by the UDF
+     * ABI; %.*s bounds both by their explicit lengths. Truncating a
+     * pathologically long question/candidate into this fixed prompt
+     * buffer is acceptable here: review is an optional quality pass
+     * (default off), not a security boundary. */
+    n = snprintf(prompt, sizeof prompt,
+        "Original request: %.*s\n\n"
+        "Candidate SQL:\n%.*s\n\n"
+        "Does this candidate correctly and completely answer the request? "
+        "Answer PASS or FAIL on the first line, then explain briefly.",
+        (int) args->lengths[1], args->args[1],
+        (int) args->lengths[2], args->args[2]);
+    if (n < 0) { fractal_session_release(sid); *error = 1; return NULL; }
+    plen = (size_t) n < sizeof prompt ? (size_t) n : sizeof prompt - 1;
+
+    memset(&resp, 0, sizeof(resp));
+    load_lock();
+    apply_review_env_locked();
+    rc = fsql_dispatch_ai(ctx, prompt, plen, "{}", 2, &resp);
+    load_unlock();
+    if (rc != FSQL_OK || resp.rc != 0) {
+        const char *err = fsql_last_error(ctx);
+        /* Same stderr mirror as fractal_t2s_generate's dispatch branch:
+         * a bare *error=1 would only ever show as a NULL review verdict. */
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: dispatch failed (rc=%d, resp.rc=%d): %s",
+            rc, resp.rc, err && *err ? err : "(no detail)");
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+    if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: response %zu bytes exceeds "
+            "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+    /* The rc==0 dispatch contract says summary is non-NULL, but the
+     * scan/copy below would deref NULL on a contract-violating plugin
+     * -- a plugin bug gets a clean error, not a segfault. */
+    if (resp.summary == NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: reasoning plugin returned a NULL summary "
+            "on a success status -- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *error = 1; return NULL;
+    }
+
+    p = resp.summary;
+    size_t rem = resp.summary_len;
+    while (rem > 0 && isspace((unsigned char) *p)) { p++; rem--; }
+    passed = (rem >= 4 &&
+              tolower((unsigned char) p[0]) == 'p' && tolower((unsigned char) p[1]) == 'a' &&
+              tolower((unsigned char) p[2]) == 's' && tolower((unsigned char) p[3]) == 's');
+
+    if (passed) {
+        fsql_ai_response_free(&resp);
+        fractal_session_release(sid);
+        *is_null = 1;
+        return NULL;
+    }
+
+    s = str_out_set(so, resp.summary, resp.summary_len, length);
+    fsql_ai_response_free(&resp);
+    fractal_session_release(sid);
+    if (s == NULL) { *error = 1; return NULL; }
+    *is_null = 0;
+    return s;
+}
+
+/* ==================================================================== */
+/* fractal_t2s_check_allowlist(sql) -> TEXT                             */
+/*   NULL = passes; else a human-readable rejection reason, suitable    */
+/*   to feed straight back into the next GENERATE attempt as feedback.  */
+/*   Pure text/lexical validation: no database access, no LLM call.     */
+/*   See this file's own header comment for the full MariaDB-dialect    */
+/*   design rationale (WITH-clause skip, INTO OUTFILE/DUMPFILE gate).   */
+/* ==================================================================== */
+
+typedef struct { const char *s; size_t len; size_t pos; } t2s_scan;
+
+static bool
+t2s_is_ident_char(unsigned char c) { return isalnum(c) || c == '_' || c == '$'; }
+
+/* Skips whitespace and every MariaDB comment form (--<ws>, #, block
+ * comments) at the current position, repeatedly, until none remain. */
+static void
+t2s_skip_ws_comments(t2s_scan *sc)
+{
+    bool moved = true;
+    while (moved && sc->pos < sc->len) {
+        moved = false;
+        while (sc->pos < sc->len && isspace((unsigned char) sc->s[sc->pos])) { sc->pos++; moved = true; }
+        /* `--<ws>` and `#` line comments both run to end-of-line. */
+        if ((sc->pos + 1 < sc->len && sc->s[sc->pos] == '-' && sc->s[sc->pos + 1] == '-' &&
+             (sc->pos + 2 >= sc->len || isspace((unsigned char) sc->s[sc->pos + 2]))) ||
+            (sc->pos < sc->len && sc->s[sc->pos] == '#')) {
+            while (sc->pos < sc->len && sc->s[sc->pos] != '\n') sc->pos++;
+            moved = true;
+        } else if (sc->pos + 1 < sc->len && sc->s[sc->pos] == '/' && sc->s[sc->pos + 1] == '*') {
+            sc->pos += 2;
+            while (sc->pos + 1 < sc->len && !(sc->s[sc->pos] == '*' && sc->s[sc->pos + 1] == '/'))
+                sc->pos++;
+            sc->pos = (sc->pos + 1 < sc->len) ? sc->pos + 2 : sc->len;
+            moved = true;
+        }
+    }
+}
+
+/* sc->s[sc->pos] must be a quote char ('\'', '"', or '`') on entry.
+ * Advances past the matching close, handling backslash-escapes
+ * (single/double-quoted only, see this file's NO_BACKSLASH_ESCAPES
+ * limitation note) and doubled-quote escapes (all three quote kinds). */
+static void
+t2s_skip_quoted(t2s_scan *sc)
+{
+    char q = sc->s[sc->pos];
+    sc->pos++;
+    while (sc->pos < sc->len) {
+        char c = sc->s[sc->pos];
+        if (c == '\\' && q != '`' && sc->pos + 1 < sc->len) { sc->pos += 2; continue; }
+        if (c == q) {
+            if (sc->pos + 1 < sc->len && sc->s[sc->pos + 1] == q) { sc->pos += 2; continue; }
+            sc->pos++;
+            return;
+        }
+        sc->pos++;
+    }
+}
+
+/* Case-insensitive keyword match at the current position, requiring a
+ * non-identifier char (or end of input) immediately after: a real
+ * word-boundary match, not a prefix match ("SELECTOR" must not match
+ * "SELECT"). Advances past the keyword on success; does not skip
+ * trailing whitespace (caller's job). */
+static bool
+t2s_match_kw(t2s_scan *sc, const char *kw)
+{
+    size_t klen = strlen(kw);
+    if (sc->pos + klen > sc->len) return false;
+    for (size_t i = 0; i < klen; i++)
+        if (tolower((unsigned char) sc->s[sc->pos + i]) != tolower((unsigned char) kw[i]))
+            return false;
+    if (sc->pos + klen < sc->len && t2s_is_ident_char((unsigned char) sc->s[sc->pos + klen]))
+        return false;
+    sc->pos += klen;
+    return true;
+}
+
+/* sc->s[sc->pos] must be '(' on entry. Advances past the matching
+ * close paren (quote-aware, so a ')' inside a string literal doesn't
+ * miscount). Returns false if the parens never balance before EOF. */
+static bool
+t2s_skip_paren_balanced(t2s_scan *sc)
+{
+    int depth = 0;
+    while (sc->pos < sc->len) {
+        char c = sc->s[sc->pos];
+        if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(sc); continue; }
+        if (c == '(') { depth++; sc->pos++; continue; }
+        if (c == ')') {
+            depth--;
+            sc->pos++;
+            if (depth == 0) return true;
+            continue;
+        }
+        sc->pos++;
+    }
+    return false;
+}
+
+/* Counts top-level (paren-depth-0, outside quotes/comments) SQL
+ * statements in `sql`, i.e. semicolon-separated chunks that contain
+ * at least one non-whitespace, non-comment token. A single statement
+ * with a harmless trailing semicolon (and/or trailing whitespace/
+ * comments) still counts as 1, matching how a normal SQL client would
+ * treat it. This must NOT reject the common case of a generated
+ * statement ending in ";". */
+static int
+t2s_count_statements(const char *sql, size_t len)
+{
+    t2s_scan sc = { sql, len, 0 };
+    int  n_stmts = 0;
+    bool any_content = false;
+
+    while (sc.pos < sc.len) {
+        char c = sc.s[sc.pos];
+        if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(&sc); any_content = true; continue; }
+        if (c == '(' || c == ')') { sc.pos++; any_content = true; continue; }
+        if (c == ';') {
+            sc.pos++;
+            if (any_content) n_stmts++;
+            any_content = false;
+            continue;
+        }
+        if (isspace((unsigned char) c)) { sc.pos++; continue; }
+        if ((c == '-' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '-') ||
+            c == '#' ||
+            (c == '/' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '*')) {
+            size_t before = sc.pos;
+            t2s_skip_ws_comments(&sc);
+            if (sc.pos == before) sc.pos++;   /* defensive: never spin */
+            continue;
+        }
+        any_content = true;
+        sc.pos++;
+    }
+    if (any_content) n_stmts++;
+    return n_stmts;
+}
+
+/* Classifies the TOP-LEVEL statement keyword, skipping past a leading
+ * WITH clause's CTE definitions first (see this file's header comment
+ * on why this matters for MariaDB specifically: a CTE can feed a
+ * top-level DML statement even though the CTE bodies themselves can
+ * only be SELECTs). Returns one of "SELECT"/"INSERT"/"UPDATE"/
+ * "DELETE"/"REPLACE"/"OTHER", or NULL if the WITH clause itself is
+ * malformed (unbalanced parens / missing AS); treated as a parse
+ * failure by the caller. */
+static const char *
+t2s_classify_leading_stmt(const char *sql, size_t len)
+{
+    t2s_scan sc = { sql, len, 0 };
+    t2s_skip_ws_comments(&sc);
+    if (sc.pos >= sc.len) return "OTHER";   /* empty; caller's statement-count check already rejects this */
+
+    if (t2s_match_kw(&sc, "WITH")) {
+        t2s_skip_ws_comments(&sc);
+        t2s_match_kw(&sc, "RECURSIVE");   /* optional, don't care either way */
+        t2s_skip_ws_comments(&sc);
+        for (;;) {
+            if (sc.pos < sc.len && sc.s[sc.pos] == '`') t2s_skip_quoted(&sc);
+            else { while (sc.pos < sc.len && t2s_is_ident_char((unsigned char) sc.s[sc.pos])) sc.pos++; }
+            t2s_skip_ws_comments(&sc);
+            if (sc.pos < sc.len && sc.s[sc.pos] == '(') {
+                /* optional column-name list before AS */
+                if (!t2s_skip_paren_balanced(&sc)) return NULL;
+                t2s_skip_ws_comments(&sc);
+            }
+            if (!t2s_match_kw(&sc, "AS")) return NULL;
+            t2s_skip_ws_comments(&sc);
+            if (sc.pos >= sc.len || sc.s[sc.pos] != '(') return NULL;
+            if (!t2s_skip_paren_balanced(&sc)) return NULL;
+            t2s_skip_ws_comments(&sc);
+            if (sc.pos < sc.len && sc.s[sc.pos] == ',') { sc.pos++; t2s_skip_ws_comments(&sc); continue; }
+            break;
+        }
+    }
+
+    /* A leading '(' at the top level (after any WITH-clause) is only
+     * valid MariaDB grammar for a parenthesized SELECT/set-operation.
+     * DML statements cannot be parenthesized at statement level. */
+    if (sc.pos < sc.len && sc.s[sc.pos] == '(') return "SELECT";
+
+    if (t2s_match_kw(&sc, "SELECT"))  return "SELECT";
+    if (t2s_match_kw(&sc, "INSERT"))  return "INSERT";
+    if (t2s_match_kw(&sc, "UPDATE"))  return "UPDATE";
+    if (t2s_match_kw(&sc, "DELETE"))  return "DELETE";
+    if (t2s_match_kw(&sc, "REPLACE")) return "REPLACE";
+    return "OTHER";
+}
+
+/* Whole-statement (all depths) scan for INTO OUTFILE / INTO DUMPFILE,
+ * outside quotes/comments. See this file's header comment: rejected
+ * unconditionally regardless of allowed_statements mode. */
+static bool
+t2s_has_into_outfile(const char *sql, size_t len)
+{
+    t2s_scan sc = { sql, len, 0 };
+    while (sc.pos < sc.len) {
+        char c = sc.s[sc.pos];
+        if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(&sc); continue; }
+        if ((c == '-' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '-') ||
+            c == '#' ||
+            (c == '/' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '*')) {
+            size_t before = sc.pos;
+            t2s_skip_ws_comments(&sc);
+            if (sc.pos == before) sc.pos++;
+            continue;
+        }
+        if (t2s_match_kw(&sc, "INTO")) {
+            t2s_scan save = sc;
+            t2s_skip_ws_comments(&sc);
+            if (t2s_match_kw(&sc, "OUTFILE") || t2s_match_kw(&sc, "DUMPFILE"))
+                return true;
+            sc = save;
+            continue;
+        }
+        sc.pos++;
+    }
+    return false;
+}
+
+/* MariaDB executes the contents of a versioned comment (slash-star-
+ * bang-star) and an optimizer-hint comment (slash-star-plus) as
+ * statement text, so neither is inert here the way a plain block
+ * comment is. Any such comment in candidate SQL is rejected outright
+ * (over-rejection is this gate's stated failure direction): splicing
+ * tokens into one would otherwise defeat both the statement counter
+ * and the INTO OUTFILE scan -- e.g.
+ *   SELECT 1 INTO <slash-star-bang> OUTFILE star-slash '/tmp/x'
+ * passes both scanners as written while the server executes the
+ * outfile write. The scan is quote- and plain-comment-aware, so a
+ * literal inside a string value does not false-positive. */
+static bool
+t2s_has_exec_comment(const char *sql, size_t len)
+{
+    t2s_scan sc = { sql, len, 0 };
+    while (sc.pos < sc.len) {
+        char c = sc.s[sc.pos];
+        if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(&sc); continue; }
+        if (c == '/' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '*') {
+            if (sc.pos + 2 < sc.len &&
+                (sc.s[sc.pos + 2] == '!' || sc.s[sc.pos + 2] == '+'))
+                return true;
+            /* plain comment: skip to its close, same loop shape as
+             * t2s_skip_ws_comments */
+            sc.pos += 2;
+            while (sc.pos + 1 < sc.len && !(sc.s[sc.pos] == '*' && sc.s[sc.pos + 1] == '/'))
+                sc.pos++;
+            sc.pos = (sc.pos + 1 < sc.len) ? sc.pos + 2 : sc.len;
+            continue;
+        }
+        sc.pos++;
+    }
+    return false;
+}
+
+FRACTAL_EXPORT bool
+fractal_t2s_check_allowlist_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 1) {
+        SFS_INIT_ERROR(message,
+            "fractal_t2s_check_allowlist(sql): expected 1 argument, got %u", args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    return str_out_generic_init(initid, message, 1024);
+}
+
+FRACTAL_EXPORT void
+fractal_t2s_check_allowlist_deinit(UDF_INIT *initid) { str_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_t2s_check_allowlist(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                            unsigned long *length, char *is_null, char *error)
+{
+    str_out_ctx *so = (str_out_ctx *) initid->ptr;
+    const char *sql;
+    unsigned long sqllen;
+    char buf[1024];
+    int  n;
+    int  n_stmts;
+    const char *kw;
+    bool select_only;
+    bool ok;
+    (void) result;
+
+    if (args->args[0] == NULL) { *is_null = 1; return NULL; }
+    sql    = args->args[0];
+    sqllen = args->lengths[0];
+    if (sqllen > FRACTAL_T2S_MAX_SQL_BYTES) { *error = 1; return NULL; }
+
+    ensure_env_config();
+    select_only = (strcmp(g_cfg.allowed_statements, "select_insert_update") != 0);
+
+    if (t2s_has_exec_comment(sql, sqllen)) {
+        n = snprintf(buf, sizeof buf,
+            "versioned (slash-star-bang) and optimizer-hint (slash-star-plus) "
+            "comments are not allowed: the server executes their contents");
+        goto reject;
+    }
+
+    n_stmts = t2s_count_statements(sql, sqllen);
+    if (n_stmts == 0) {
+        n = snprintf(buf, sizeof buf, "SQL is empty");
+        goto reject;
+    }
+    if (n_stmts != 1) {
+        n = snprintf(buf, sizeof buf,
+            "expected exactly one SQL statement, found %d. "
+            "fractal_text_to_sql only returns a single statement", n_stmts);
+        goto reject;
+    }
+
+    kw = t2s_classify_leading_stmt(sql, sqllen);
+    if (kw == NULL) {
+        n = snprintf(buf, sizeof buf, "SQL does not parse: malformed WITH clause");
+        goto reject;
+    }
+
+    ok = select_only ? (strcmp(kw, "SELECT") == 0)
+                      : (strcmp(kw, "SELECT") == 0 || strcmp(kw, "INSERT") == 0 || strcmp(kw, "UPDATE") == 0);
+    if (!ok) {
+        n = snprintf(buf, sizeof buf,
+            "statement type \"%s\" is not permitted. "
+            "FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS is set to \"%s\"",
+            kw, select_only ? "select" : "select_insert_update");
+        goto reject;
+    }
+
+    if (t2s_has_into_outfile(sql, sqllen)) {
+        n = snprintf(buf, sizeof buf,
+            "statement embeds INTO OUTFILE/DUMPFILE, which writes to the "
+            "filesystem and is never permitted regardless of "
+            "FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS");
+        goto reject;
+    }
+
+    *is_null = 1;
+    return NULL;
+
+reject:
+    if (n < 0) n = 0;
+    char *s = str_out_set(so, buf, (size_t) (n < (int) sizeof buf ? n : (int) sizeof buf - 1), length);
+    if (s == NULL) { *error = 1; return NULL; }
+    *is_null = 0;
+    return s;
+}

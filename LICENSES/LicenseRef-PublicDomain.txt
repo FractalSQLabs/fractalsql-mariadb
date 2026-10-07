@@ -1,0 +1,4 @@
+The file names below are dedicated to the public domain by their author.
+No copyright is claimed in them, and no license conditions apply.
+
+  service/common/fsq_sha256.h

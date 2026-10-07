@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+[Unit]
+Description=FractalSQL daemon (fractalsqld)
+Documentation=https://github.com/FractalSQLabs/fractalsql-mariadb
+After=network.target
+Before=mariadb.service mysql.service mariadbd.service
+
+[Service]
+Type=simple
+# Optional (leading '-': no failure if absent). Reasoning/embedding config
+# lives in fractalsqld.conf (the preferred source, reloadable with
+# `fsqlctl reload`); this file is the environment fallback for keys the
+# conf omits, e.g. FSQL_REASONING_HTTP_RESPONSE_MODE. scripts/easy_install.sh
+# manages it.
+EnvironmentFile=-/etc/fractalsql/fractalsqld.env
+ExecStart=/usr/libexec/fractalsql/fractalsqld -c /etc/fractalsql/fractalsqld.conf
+User=fractalsql
+Group=fractalsql
+RuntimeDirectory=fractalsql
+RuntimeDirectoryMode=0750
+# StateDirectory creates/owns /var/lib/fractalsql (writable even under
+# ProtectSystem=strict) and WorkingDirectory chdir()s there, so the
+# enterprise ledger's relative default path (FRACTALSQL_ENTERPRISE_LEDGER_
+# PATH, see docs/enterprise.md) lands somewhere persistent and writable
+# by default instead of wherever systemd would otherwise start the
+# process (normally /).
+StateDirectory=fractalsql
+WorkingDirectory=/var/lib/fractalsql
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

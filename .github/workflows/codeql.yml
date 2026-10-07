@@ -1,0 +1,65 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '23 3 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [c-cpp, actions]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@4187e74d05793876e9989daffde9c3e66b4acd07  # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.language == 'c-cpp' && 'manual' || 'none' }}
+
+      - name: Install build dependencies
+        if: matrix.language == 'c-cpp'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential \
+              libmariadb-dev \
+              libmariadb-dev-compat \
+              libssl-dev \
+              libluajit-5.1-dev \
+              pkg-config
+
+      # Manual build, not autobuild: the repo-root Makefile's only
+      # target is `bench`, which shells out to bench/data_gen.py --
+      # needing numpy, not installed here -- so CodeQL's autobuilder
+      # (which just runs a bare `make`) always failed. The C/C++ this
+      # scan actually cares about is service/ (the shim + fractalsqld);
+      # that's what `make -C service` builds, against the vendored
+      # core archive already checked into include/.
+      - name: Build service/ (shim + fractalsqld)
+        if: matrix.language == 'c-cpp'
+        run: make -C service all
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@4187e74d05793876e9989daffde9c3e66b4acd07  # v3
+        with:
+          category: "/language:${{ matrix.language }}"

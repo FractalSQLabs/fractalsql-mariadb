@@ -1,0 +1,264 @@
+<p align="center">
+  <img src="../FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
+# Vectorizer Setup Guide
+
+The Vectorizer is the Cognition tier's automation engine. It keeps raw text and semantic embeddings in sync automatically, so your data is always "search-ready" without external middleware or a separate ETL pipeline.
+
+By running the embedding sync as MariaDB stored procedures + triggers inside the server itself, FractalSQL eliminates the "data shuffle" and ensures that your semantic index is a real-time reflection of your data.
+
+---
+
+## Prerequisites
+
+To enable automated embeddings, the following configuration is required (Community edition, no separate tier or license needed). The preferred source for all of it is the daemon's conf file, `fractalsqld.conf`: `embed_url`, `embed_model`, `reasoning_plugin`, and `reasoning_allow_plaintext` are conf keys, and after editing one you run `fsqlctl reload` -- the changed value reaches the embed path on its next call, no restart. The **process environment variables** listed below (`FRACTALSQL_HTTP_EMBED_URL`, ...) remain the fallback for keys the conf leaves out, read once by `fractalsqld` (the daemon `fractal_embed` runs in, not `mariadbd`) at startup and cached for that process's lifetime; there is no sysvar or `SET GLOBAL` equivalent either way. `mariadbd` is untouched.
+
+1. **Reasoning Plugin**: `reasoning_plugin` in `fractalsqld.conf` (or the `FRACTALSQL_REASONING_PLUGIN` env fallback) must point at a compiled `fractalsql-reasoning-http.so` (see the reasoning-setup guide); a changed path is picked up by the next `fractal_embed` call after `fsqlctl reload`, with a bad path named in the daemon log.
+2. **Embeddings Endpoint**: `embed_url` in `fractalsqld.conf` (or the `FRACTALSQL_HTTP_EMBED_URL` env fallback) must be set to your provider's **embeddings** endpoint, a distinct path from the chat endpoint (e.g. `/v1/embeddings` vs `/v1/chat/completions`).
+3. **Embedding Model**: `embed_model` in `fractalsqld.conf` (or the `FRACTALSQL_HTTP_EMBED_MODEL` env fallback) specifies the purpose-trained model. **Important**: never reuse a chat model for embeddings; they are mathematically distinct tasks.
+4. `reasoning_allow_plaintext = 1` in `fractalsqld.conf` (or `FSQL_REASONING_HTTP_ALLOW_PLAINTEXT=1` in the environment) if your endpoint is plain `http://` rather than `https://` (e.g. a local Ollama instance).
+
+**Connectivity Check**:
+Confirm the embed path is active before creating a vectorizer:
+```sql
+SELECT fractal_embed(CONNECTION_ID(), 'hello world');
+--  [0.0023064255,-0.009327292,...]
+```
+(`fractal_embed` takes `session_id` as its first argument, pass `CONNECTION_ID()`. Every reasoning-tier function follows the same convention, backed by the connection-scoped context registry in `src/fractalsql_session.c`.)
+
+---
+
+## Quick Start: Automated Sync
+
+### 1. Define your table
+A plain `TEXT` column storing a JSON-array-string works on every supported MariaDB major (10.6-12.3). On MariaDB 11.7+, you can instead declare a native `VECTOR(n)` column, see **Native VECTOR(n) support** below.
+
+```sql
+CREATE TABLE docs (
+    id        BIGINT PRIMARY KEY AUTO_INCREMENT,
+    body      TEXT NOT NULL,
+    embedding TEXT
+);
+
+INSERT INTO docs (body) VALUES ('first doc'), ('second doc');
+```
+
+### 2. Create the Vectorizer
+This installs `AFTER INSERT` and `AFTER UPDATE` triggers on `docs` and immediately queues existing rows missing an embedding.
+
+```sql
+CALL fractal_vectorizer_create('docs', 'body', 'embedding', NULL, @vectorizer_id);
+SELECT @vectorizer_id;
+```
+
+Requires a single-column primary key on the source table.
+
+### 3. Process the Queue
+FractalSQL runs no background worker (`mariadbd` has no built-in equivalent of a background-scheduler extension, and this repo deliberately avoids adding one, keeping the extension portable). You trigger the embedding process on your own schedule: a `cron` entry, a systemd timer, an application-level scheduler.
+
+```sql
+CALL fractal_vectorizer_process_queue(100, 600);
+-- a plain SELECT result, not an OUT param:
+-- n_processed
+-- 2
+```
+`batch_size` (default 100 if `NULL`) caps rows attempted per call; `stale_after_secs` (default 600) reclaims rows stuck `processing` past that many seconds, e.g. from a crashed prior call.
+
+### 4. Monitor Progress
+```sql
+SELECT * FROM fractal_vectorizer_status WHERE vectorizer_id = @vectorizer_id;
+-- vectorizer_id | source_table | text_col | embedding_col | enabled | status | n | last_failure_at | last_error
+```
+`fractal_vectorizer_status` is a `VIEW` (not a function): one row per `(vectorizer_id, status)` pair, with the count of rows currently in that status and the most recent failure detail.
+
+---
+
+## Storage: TEXT/JSON vs. native `VECTOR(n)`
+
+FractalSQL stores and searches embeddings as a **JSON-array-string** (`'[0.1,0.2,0.3]'`), the same convention `fractal_search`/`fractal_vector_*` use everywhere. There is no native array type across the 10.6-12.3 compat floor this repo targets, so this is the portable baseline on every supported major.
+
+### Native `VECTOR(n)` support (MariaDB 11.7+, GA in 11.8 LTS)
+
+From MariaDB 11.7, `VECTOR(n)` is a real, built-in column type with its own `VEC_FROMTEXT()`/`VEC_TOTEXT()`/`VEC_DISTANCE_COSINE()`/`VEC_DISTANCE_EUCLIDEAN()` functions and index-accelerated ANN search (`VECTOR INDEX`). Verified (not assumed) to use the **same** bracket-comma text grammar this repo's `fractal_vector_*` functions emit/accept, so no conversion UDF is needed.
+
+```sql
+CREATE TABLE docs (
+    id        BIGINT PRIMARY KEY AUTO_INCREMENT,
+    body      TEXT NOT NULL,
+    embedding VECTOR(768) NOT NULL,
+    VECTOR INDEX (embedding)
+);
+INSERT INTO docs (body) VALUES ('first doc');
+
+CALL fractal_vectorizer_create('docs', 'body', 'embedding', NULL, @vectorizer_id);
+CALL fractal_vectorizer_process_queue(100, 600);
+```
+
+`fractal_vectorizer_create()` **auto-detects** whether `embedding_col` is a native `VECTOR(n)` column via `INFORMATION_SCHEMA` and records it on `fractal_vectorizers.embedding_is_vector_type`, with no separate flag to set. `fractal_vectorizer_process_queue()` then wraps the write-back in `VEC_FROMTEXT()` automatically. Live-verified against a real `mariadb:12.2` container: MariaDB itself rejects an insert whose dimension doesn't match the column's declared `VECTOR(n)` width, genuine dimension-drift protection with zero code in this repo needed to enforce it, unlike the portable TEXT path, which is unchecked.
+
+```sql
+-- Cross-path distance agreement (both read the same underlying float32 storage):
+SELECT VEC_DISTANCE_COSINE(embedding, VEC_FROMTEXT('[1,0,0]')) FROM docs;
+SELECT fractal_vector_cosine_distance(VEC_TOTEXT(embedding), '[1,0,0]') FROM docs;
+```
+
+Below 11.7, use the plain `TEXT`/`JSON` path. Every `fractal_vector_*` function and the vectorizer's queue/status mechanics work identically either way.
+
+### Operators & helpers (portable path)
+```sql
+SELECT fractal_vector_l2_distance(a, b);          -- L2 (Euclidean) distance
+SELECT fractal_vector_cosine_distance(a, b);       -- cosine distance
+SELECT fractal_vector_negative_inner_product(a, b);-- for max-inner-product ranking
+SELECT fractal_vector_l2_squared(a, b);            -- squared L2 (no sqrt, cheaper for ordering)
+SELECT fractal_vector_cosine_similarity(a, b);     -- cosine similarity (1 - cosine distance)
+SELECT fractal_vector_norm(a), fractal_vector_normalize(a);
+SELECT fractal_vector_add(a, b), fractal_vector_sub(a, b), fractal_vector_scale(a, s);
+SELECT fractal_vector_dims(a);
+```
+
+### Quantization & L_p helpers (portable path)
+| Function | What it does |
+| --- | --- |
+| `fractal_vector_lp_distance(a, b, p)` | Generalized $L_p$ distance, any $p > 0$ (for $0 < p < 1$ this is not a proper metric; use explicitly, never as a silent substitute for the search primitives' own cosine) |
+| `fractal_vector_quantize_int8(a)` | Symmetric int8 quantization, 4x compression, returns `{"scale":..,"values":[..]}` |
+| `fractal_vector_quantize_binary(a)` | 1-bit quantization, up to 32x compression, MSB-first sign bits as a JSON byte array |
+| `fractal_vector_hamming_distance(a, b)` | Hamming distance between two `fractal_vector_quantize_binary` outputs (cheap candidate filtering ahead of a full-precision re-rank) |
+
+```sql
+-- Cheap candidate filtering ahead of a full-precision cosine re-rank:
+SELECT fractal_vector_hamming_distance(
+    fractal_vector_quantize_binary(a.embedding),
+    fractal_vector_quantize_binary('[1,-2,3]'))
+FROM docs a WHERE a.embedding IS NOT NULL;
+```
+
+---
+
+## Endpoint Providers
+
+The Vectorizer shares the same auth-bridge as the Cognition tier's reasoning endpoint. Credentials and region settings are shared; only the URL and model change.
+
+### Ollama (Local or Private Network)
+Ideal for fully air-gapped deployments where data never leaves your network.
+
+```bash
+# chat / text-to-sql
+export FSQL_REASONING_HTTP_URL='http://127.0.0.1:11434/v1/chat/completions'
+export FSQL_REASONING_HTTP_MODEL='gpt-oss:20b'
+export FSQL_REASONING_HTTP_ALLOW_PLAINTEXT=1
+
+# embeddings
+export FRACTALSQL_HTTP_EMBED_URL='http://127.0.0.1:11434/v1/embeddings'
+export FRACTALSQL_HTTP_EMBED_MODEL='nomic-embed-text'
+```
+*Note: `ollama pull nomic-embed-text` (or your chosen embedding model) is a separate step. `FRACTALSQL_HTTP_EMBED_MODEL` is a distinct variable from `FSQL_REASONING_HTTP_MODEL`, with no fallback to the chat model between them: if it's unset, the reasoning plugin falls back to its own embedding-mode default (`text-embedding-3-small`, an OpenAI model), not to whatever `FSQL_REASONING_HTTP_MODEL` is set to. Against a local Ollama server that default won't resolve, so set `FRACTALSQL_HTTP_EMBED_MODEL` explicitly whenever your embedding model differs from your chat model (it almost always does).*
+
+### OpenAI-Compatible (OpenAI, Together AI, Fireworks, vLLM)
+```bash
+export FSQL_REASONING_HTTP_URL='https://api.openai.com/v1/chat/completions'
+export FSQL_REASONING_HTTP_TOKEN='sk-...'
+export FSQL_REASONING_HTTP_MODEL='gpt-4o-mini'
+export FRACTALSQL_HTTP_EMBED_URL='https://api.openai.com/v1/embeddings'
+export FRACTALSQL_HTTP_EMBED_MODEL='text-embedding-3-small'
+```
+
+### AWS Bedrock
+Same SigV4 auth as the reasoning endpoint (see [reasoning-setup.md](reasoning-setup.md#aws-bedrock)); only the URL and model change for the embed path.
+
+```bash
+export FSQL_REASONING_HTTP_URL='https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/chat/completions'
+export FSQL_REASONING_HTTP_MODEL='amazon.nova-lite-v1:0'
+export FRACTALSQL_HTTP_EMBED_URL='https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/embeddings'
+export FRACTALSQL_HTTP_EMBED_MODEL='amazon.titan-embed-text-v2:0'
+```
+
+### Azure OpenAI
+Requires a separate deployment resource for the embedding model.
+
+```bash
+export FSQL_REASONING_HTTP_URL='https://<resource>.openai.azure.com/openai/deployments/<chat-deploy>/chat/completions?api-version=2024-02-01'
+export FSQL_REASONING_HTTP_TOKEN='<azure-api-key>'
+export FSQL_REASONING_HTTP_MODEL='gpt-4o'
+export FRACTALSQL_HTTP_EMBED_URL='https://<resource>.openai.azure.com/openai/deployments/<embed-deploy>/embeddings?api-version=2024-02-01'
+```
+
+### Google Vertex AI
+Uses the same OAuth access token as the reasoning endpoint (see [reasoning-setup.md](reasoning-setup.md#google-vertex-ai)); only the URL and model change. Point the embed path at the `openapi/v1/embeddings` surface of your project's region endpoint.
+
+```bash
+export FSQL_REASONING_HTTP_TOKEN='<gcp-oauth-access-token>'
+export FRACTALSQL_HTTP_EMBED_URL='https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LOCATION}/endpoints/openapi/embeddings'
+export FRACTALSQL_HTTP_EMBED_MODEL='text-embedding-005'
+```
+
+Write these into `fractalsqld.conf` (preferred: `embed_url`,
+`embed_model`, `reasoning_url`, `reasoning_token`, `reasoning_model`,
+`reasoning_allow_plaintext`, `reasoning_plugin` -- same values, conf-key
+names, reloadable live with `fsqlctl reload`), or into `fractalsqld`'s
+environment as the fallback for keys the conf omits: via `docker run -e
+...` on the `fractalsqld` container (see `docker/Dockerfile` and
+`build_test.sh`'s `daemon_start` for this repo's own real wiring),
+`fractalsqld.service`'s systemd `EnvironmentFile`, or an equivalent
+process-manager mechanism -- not `mariadbd`'s environment either way.
+The conf file carries the token in plaintext, so it is
+permission-gated like the HMAC key file (`chmod 600` on Linux/macOS),
+whether or not it currently holds one; see
+[reasoning-setup.md](reasoning-setup.md).
+
+---
+
+## SQL API Reference
+
+### `fractal_vectorizer_create(source_table, text_col, embedding_col, options, out_id)`
+`options` is a JSON object or `NULL`. Sets up the automation triggers and backfills the queue with existing unembedded rows. Requires a single-column primary key on `source_table`.
+
+### `fractal_vectorizer_pause(id)` / `fractal_vectorizer_resume(id)`
+Toggles the `enabled` state. When paused, new writes are not queued (the trigger no-ops) and `process_queue` skips existing pending rows for that vectorizer. `SIGNAL`s a clean error on a nonexistent id. Idempotent: pausing an already-paused vectorizer is a no-op.
+
+### `fractal_vectorizer_drop(id)`
+Permanently deregisters the vectorizer: drops its `_fsql_vec_<id>_ins`/`_fsql_vec_<id>_upd` triggers (if the source table still exists) and deletes its row from `fractal_vectorizers` (the `queue`/`rate_window` rows cascade via the existing foreign key). Irreversible: for a temporary stop, use `fractal_vectorizer_pause()` instead. `SIGNAL`s a clean error on a nonexistent id. Needed before re-creating a vectorizer on the same `(source_table, text_col, embedding_col)`, since that triple is unique.
+
+### `fractal_vectorizer_enqueue(id, pk_value)`
+Queues one source row for embedding by hand. The triggers queue rows on every write, so you only need this for rows they could not see: a bulk load run with the triggers disabled, a row restored from a backup, or a row whose text changed outside the triggers. A row already `pending` or `processing` is left alone, and a row that is `done` gets a new pending entry. Unlike the trigger path, it signals an error for an unknown or paused vectorizer rather than dropping the row. MariaDB has no trigger functions, so unlike editions where the same name is a trigger function, this is a plain procedure taking the vectorizer id and the row's primary key.
+
+### `fractal_vectorizer_process_queue(batch_size, stale_after_secs)`
+The engine that drives synchronization. Ends in a plain `SELECT n_processed` result set: call it and fetch the result like any other query, there is no `OUT` parameter here. Concurrency-safe against another simultaneous call via an atomic claim-`UPDATE` (MariaDB has no `SKIP LOCKED` semantics that persist correctly across the statement boundaries this repo needs under autocommit; see `sql/install_udf.sql`'s own comment on the chosen concurrency mechanism).
+
+### Rate Capping
+To prevent provider throttling, set `options.max_embeds_per_window` (int) and `options.rate_window_secs` (default `3600`) during creation:
+```sql
+CALL fractal_vectorizer_create(
+    'documents', 'body', 'embedding',
+    '{"max_embeds_per_window": 500, "rate_window_secs": 3600}',
+    @vectorizer_id
+);
+```
+Tracked per-vectorizer in `fractal_vectorizer_rate_window`. Live-verified: the cap holds ATTEMPTS (not just successes) within a window, and correctly rolls over once `rate_window_secs` elapses.
+
+---
+
+## Design & Safety
+
+### The "No-Worker" Architecture
+FractalSQL uses a pull-based queue rather than a background worker thread. You control exactly when and how often the embedder runs, avoiding the extra process-management surface a worker thread would add inside `mariadbd`.
+
+### Crash Safety & Authorization
+- **Atomic recovery**: rows claimed by a `process_queue` call that never completes (a crashed connection, a killed session) are reclaimed automatically once `stale_after_secs` elapses on the next call; they don't stay stuck `processing` forever.
+- **`SQL SECURITY INVOKER`**: the vectorizer procedures run with the calling session's own privileges. If that session lacks `SELECT`/`UPDATE` on the source table, the affected row is marked `failed` with a clear reason, not silently skipped or leaking data.
+- **Identifier safety**: table/column names are handled via `_fractalsql_quote_ident()` (backtick-quoting, doubling embedded backticks) before being spliced into dynamically-built `PREPARE`d DDL/DML. Live-verified with a table name, text column, and embedding column all containing an embedded backtick, a `DROP TABLE`, and a SQL comment marker; the payload round-tripped safely with zero side effects on `fractal_vectorizers`.
+
+---
+
+## Known Constraints & Roadmap
+
+- **Text chunking**: the current version sends the full text of the column to the provider. For documents exceeding model context limits, pre-chunk into a separate table first.
+- **Spend caps**: rate capping is based on call count, not dollar cost.
+- **Automatic retries**: failed rows are not retried automatically; reset them to `pending` (e.g. `UPDATE fractal_vectorizer_queue SET status = 'pending' WHERE status = 'failed' AND vectorizer_id = ?`) to have the next `process_queue` call pick them up again.
+- **Backfill batching**: the initial backfill for very large tables happens as one `INSERT ... SELECT`. For millions of rows, consider seeding the source table in batches instead of one giant bulk load before calling `fractal_vectorizer_create`.
+
+---
+
+## When to use the Vectorizer
+
+Use the Vectorizer when you want embeddings kept in sync without running a separate Python/Node.js worker. If you already run your own ETL pipeline, skip it and call `fractal_embed()` directly to populate your embedding column on your own schedule.

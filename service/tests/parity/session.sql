@@ -1,0 +1,11 @@
+SELECT fractal_diversify_enable(101), fractal_diversify_set_params(101, '{"lambda":0.5}');
+SELECT fractal_detect_collapse(101);
+SELECT fractal_explain_result(101);
+SELECT fractal_feedback_report(101, 'r1', 'click');
+SELECT fractal_feedback_report(101, 'r1', 'dwell', 1500);
+SELECT fractal_isolate_background(101, 'r1');
+SELECT fractal_diversify_disable(101);
+SELECT fractal_session_close(101);
+SELECT fractal_detect_collapse(101);
+SELECT fractal_diversify_enable(NULL);
+SELECT fractal_session_close(999999);

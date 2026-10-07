@@ -1,0 +1,31 @@
+version = 1
+
+[[annotations]]
+path = ["**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Daniel Gardiner d/b/a FractalSQLabs"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["service/shim/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Daniel Gardiner d/b/a FractalSQLabs"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+[[annotations]]
+path = ["service/protocol/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Daniel Gardiner d/b/a FractalSQLabs"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["service/common/fsq_sha256.h"]
+precedence = "override"
+SPDX-FileCopyrightText = "Dedicated to the public domain"
+SPDX-License-Identifier = "LicenseRef-PublicDomain"
+
+[[annotations]]
+path = ["include/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Daniel Gardiner d/b/a FractalSQLabs"
+SPDX-License-Identifier = "Apache-2.0"

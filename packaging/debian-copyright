@@ -1,0 +1,46 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: fractalsql-mariadb
+Source: https://github.com/FractalSQLabs/fractalsql-mariadb
+
+Files: *
+Copyright: 2026 Daniel Gardiner d/b/a FractalSQLabs
+License: Apache-2.0
+
+Files: service/shim/*
+Copyright: 2026 Daniel Gardiner d/b/a FractalSQLabs
+License: GPL-2.0-only
+Comment: Shipped in this package as the plugin fractalsql.so, loaded by
+ mariadbd. Its complete corresponding source is at the Source URL above;
+ see LICENSE-GPL-SOURCE-OFFER in this package's doc directory for the
+ written offer required by GPL-2.0 section 3(b).
+
+Files: service/protocol/*
+Copyright: 2026 Daniel Gardiner d/b/a FractalSQLabs
+License: MIT
+
+Files: service/common/fsq_sha256.h
+Copyright: none, dedicated to the public domain
+License: public-domain
+
+Files: include/*
+Copyright: 2026 Daniel Gardiner d/b/a FractalSQLabs
+License: Apache-2.0
+Comment: Vendored, pre-built core archive, statically linked into the
+ daemon fractalsqld shipped in this package. See LICENSE-THIRD-PARTY in
+ this package's doc directory for the third-party components linked into
+ it (OpenSSL and others).
+
+License: Apache-2.0
+ The full text is in /usr/share/doc/fractalsql-mariadb/LICENSE-Apache-2.0,
+ and in /usr/share/common-licenses/Apache-2.0 on Debian systems.
+
+License: GPL-2.0-only
+ The full text is in /usr/share/doc/fractalsql-mariadb/LICENSE-GPL-2.0-only,
+ and in /usr/share/common-licenses/GPL-2 on Debian systems.
+
+License: MIT
+ The full text is in /usr/share/doc/fractalsql-mariadb/LICENSE-MIT.
+
+License: public-domain
+ This code is dedicated to the public domain by its author. No copyright
+ is claimed, and no license conditions apply.

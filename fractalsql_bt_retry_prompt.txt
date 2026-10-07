@@ -1,0 +1,7 @@
+Write a single MariaDB SELECT statement that answers this question. Return ONLY the SQL, wrapped in a ```sql fenced code block, with no other explanation.
+
+Question: q
+
+Your previous attempt was rejected for this reason: statement type "OTHER" is not permitted. FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS is set to "select"
+
+Write a corrected statement.

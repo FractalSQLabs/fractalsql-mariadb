@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fractalsqld as a per-user LaunchAgent. Installed by scripts/macos/install.sh
+  to ~/Library/LaunchAgents/, so it runs as the same user that user-level
+  `brew services start mariadb` runs mariadbd as -- the common Homebrew
+  case. A system-wide, multi-user install (mariadbd running as a dedicated
+  service account via a LaunchDaemon) is not set up by install.sh; adapt
+  this plist's UserName/GroupName and loading (`launchctl bootstrap
+  system/`) by hand for that case.
+
+  All paths here are the fixed locations install.sh installs to -- no
+  template substitution needed, the file ships and installs as-is.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fractalsqlabs.fractalsqld</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/fractalsql/fractalsqld</string>
+        <string>-c</string>
+        <string>/etc/fractalsql/fractalsqld.conf</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/fractalsql/fractalsqld.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/fractalsql/fractalsqld.log</string>
+</dict>
+</plist>

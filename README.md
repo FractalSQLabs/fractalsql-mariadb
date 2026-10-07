@@ -1,0 +1,170 @@
+<p align="center">
+  <img src="FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
+# FractalSQL: Sovereign Data Intelligence
+### Sovereign, Agentic MariaDB
+
+**Vector Search. In-Database Reasoning. Production-Safe Agency. All beside your data.**
+
+FractalSQL transforms MariaDB from a passive data store into an active agentic
+database. FractalSQL adds what traditional RAG (Retrieval-Augmented Generation)
+stops short of: reasoning over what it retrieves, and when you enable it
+acting on the result, whether that's running a generated query or executing a
+decision an agent computed, all inside the same database process.
+
+By bringing reasoning and agency directly into the MariaDB server, FractalSQL
+enables **Sovereign Data Intelligence**: the ability to reason, plan, and act upon
+your data with the deployment topology under your control. Run fully on-prem or in
+your own containers with Ollama/vLLM for zero data egress, or point at your
+organization's cloud AI accounts (Bedrock, Azure OpenAI, Vertex), where your compliance 
+posture requires it, for managed-model scale. You control the trade, not the product.
+
+| Traditional RAG Stack | The Sovereign Way (FractalSQL) |
+| --- | --- |
+| **Mode Collapse**: top-K search returns near-duplicates, starving the LLM of diverse context. | **Scout Discovery**: MMR-style diverse semantic search that discovers the data's real structure. |
+| **Fragmented Logic**: app pulls rows, calls LLM, handles retries, and glues answers in middleware. | **In-Database Reasoning**: reasoning and embedding happen inside the backend process itself. |
+| **Passive Retrieval**: you ask a question, the DB returns rows, and you hope the LLM is correct. | **Autonomous Agency**: self-correcting SQL, loop detection, and trajectory forecasting. |
+
+---
+
+## From zero to your first agent
+
+FractalSQL's docs follow a single linear path. Each step answers one question
+and hands off to the next. You don't need to read everything; follow the path.
+
+1. **What is this and why do I care?**: you are here. Sovereign Data Intelligence, in one page.
+2. **How do I get the UDFs running in 5 minutes?** → [Getting Started](docs/getting-started.md) (`docker compose up -d`, or the native `.deb`/`.rpm`/`.msi`, then your first Scout search).
+3. **How do I apply this to my industry?** → [Starter Kits](docs/starter-kits.md): a problem → agent map using the 16 shipped agents, plus all eleven industry-vertical demo *scripts*, verified end to end (see [demo/README.md](demo/README.md#industry-vertical-demos)).
+4. **How does a specific agent work and what are its inputs?** → [Agent Reference](docs/api-agency.md): the sixteen installable agents, each with a real `CALL` example.
+5. **How do I build a proprietary agent that isn't in the box?** → [Composition Guide](docs/composition-guide.md): the design patterns behind the shipped agents.
+
+> New here? Step 2 is a one-command demo. Step 4 is the reference you'll keep
+> coming back to.
+
+---
+
+## 🎯 Who are you?
+
+Depending on your role, you'll want to start in different places:
+
+- **AI Engineer**: You want to improve RAG quality and reasoning.
+  → Start with **[docs/features.md](docs/features.md)** and **[docs/reasoning-setup.md](docs/reasoning-setup.md)**.
+- **DBA / Security Architect**: You care about stability, safety, and grants.
+  → See **[docs/text-to-sql-setup.md](docs/text-to-sql-setup.md)**'s safety-pipeline section, and note MariaDB's **no Row-Level Security** gap called out there plainly: this repo doesn't paper over it.
+- **Product Developer**: You want to build agentic features quickly.
+  → Run the **[Docker Demo](docs/docker-demo.md)**, then pick a **[Starter Kit](docs/starter-kits.md)**.
+
+---
+
+## 🧩 What's in the box
+
+Four tiers of SQL-callable primitives, composable into agents with plain
+MariaDB stored procedures.
+
+- **Discovery**: diverse, mode-collapse-free retrieval: `fractal_search` (Sniper), `fractal_search_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`).
+- **Cognition**: in-database LLM integration: `fractal_reason` (Bedrock, Azure OpenAI, Vertex, Ollama), `fractal_embed`, `fractal_text_to_sql`, plus an automatic **Vectorizer** pipeline (trigger-driven, MariaDB 11.7+ native `VECTOR(n)` aware).
+- **Agency**: self-correcting stored procedures: **sixteen installable agents** spanning anomaly triage, portfolio allocation, hybrid recall, route planning, deterioration triage, regime detection, and more. See the [Agent Reference](docs/api-agency.md).
+- **Analytics**: fractal/dimension primitives: `fractal_dimension_dfa`, `fractal_dimension_boxcount`, `fractal_optimize_portfolio`, and more.
+
+Every primitive is an ordinary SQL function or stored procedure, no
+`CREATE EXTENSION`, no dependent-extension system, UDFs registered once via
+`sql/install_udf.sql` and `sql/install_agents.sql`. When you're ready to build
+your own agent, the [Composition Guide](docs/composition-guide.md) walks
+through the patterns the shipped agents use.
+
+A MariaDB C UDF can't run SQL against the calling session, and MariaDB has no
+table-returning UDFs. Every primitive that would otherwise be a
+table-scanning or set-returning C function is re-architected instead:
+inline-corpus arguments for Discovery, `CALL`-with-`OUT`-JSON-param
+stored procedures for anything that touches a table (schema
+introspection, text-to-sql, the vectorizer, every agent). See any
+`docs/api-*.md` page for the exact calling convention of a given
+primitive.
+
+---
+
+## 🚀 Get it running
+
+The fastest path is one command. See **[Getting Started](docs/getting-started.md)**
+for the 5-minute Docker run and the native installers:
+
+```bash
+docker compose up -d   # then connect and run your first Scout search
+```
+
+```bash
+# Or, on a real MariaDB install (Linux/macOS):
+git clone https://github.com/FractalSQLabs/fractalsql-mariadb.git && cd fractalsql-mariadb
+./scripts/easy_install.sh   # detects your MariaDB install, offers to install the package, walks you through reasoning setup
+```
+
+Native installers (MariaDB 10.6 / 10.11 / 11.4 LTS / 12.3 LTS): `.deb` /
+`.rpm` for Linux amd64/arm64, an unsigned `.zip` for macOS (arm64/x86_64),
+and a per-major `.msi` for Windows x64. See the compatibility table below.
+`easy_install.sh` (Linux/macOS) and `scripts/windows/easy_install.ps1`
+(Windows) wrap all of these behind one interactive wizard; no telemetry,
+everything stays local.
+
+---
+
+## 🏛️ Enterprise Tier
+
+Everything above is Community edition and fully functional on its own.
+Discovery, Cognition, and Agency don't depend on anything in this section. For regulated
+environments that need to **prove, not just
+claim**, what an autonomous agent decided and why, an optional drop-in
+library adds a tamper-evident, hash-chained decision ledger: no rebuild, no
+extension reload, activated by a single environment variable. See
+**[Enterprise Tier](docs/enterprise.md)** for the full mechanism, including
+what the hash chain can and can't prove.
+
+---
+
+## 📊 Compatibility & License
+
+| MariaDB | Linux | Windows x64  | macOS |
+| --- | :---: |:------------:|:-----:|
+| 10.6 | ✓ |      ✓       | ✓ |   ✓   |
+| 10.11 | ✓ |      ✓       | ✓ |   ✓   |
+| 11.4 LTS | ✓ |      ✓       | ✓ |   ✓   |
+| 12.3 LTS | ✓ |      ✓       | ✓ |   ✓   |
+
+**License**: mixed, by component --
+
+| Component | License |
+| --- | --- |
+| `fractalsql.so` / `.dll` (the shim, `service/shim/`) | GPL-2.0-only |
+| `fractalsqld` (the daemon, `service/daemon/`, `src/`) | Apache-2.0 |
+| Wire protocol (`service/protocol/`) | MIT |
+| HMAC primitive (`service/common/fsq_sha256.h`) | Public domain |
+| Install SQL, docs, demo, bench | Apache-2.0 |
+
+See `REUSE.toml` for the per-file source of truth, `LICENSES/` for full texts,
+and `THIRD-PARTY-NOTICES.md` for vendored third-party terms. The shim runs
+inside `mariadbd` and talks to the daemon over a local socket; it contains no
+Apache-licensed code, so the GPL-2.0 server plugin and the Apache-2.0 engine
+are never combined into one binary.
+
+For enterprise editions, licensing, and support, contact
+**enterprise@fractalsqlabs.com**.
+
+---
+
+## 📚 Documentation
+
+*Follow the path above; the links below are the same steps, expanded.*
+
+- **[Getting Started](docs/getting-started.md)**: 60-second Docker / native install.
+- **[Starter Kits](docs/starter-kits.md)**: industry-specific runnable SQL scripts.
+- **[Agent Recipes](docs/api-agency.md)**: the sixteen installable agents, each as a recipe.
+- **[Composition Guide](docs/composition-guide.md)**: build your own agent.
+- **[Features](docs/features.md)**: the full Capability Map and API reference.
+- **[Reasoning Setup](docs/reasoning-setup.md)**: LLM provider configuration (Ollama, OpenAI, Bedrock, Azure, Vertex).
+- **[Text-to-SQL Setup](docs/text-to-sql-setup.md)**: pipeline details and the security model.
+- **[Vectorizer Setup](docs/vectorizer-setup.md)**: automatic embedding pipelines.
+- **[FractalSQL Daemon](docs/fractalsql-daemon.md)**: running `fractalsqld` by hand, its config file, the `fsqlctl` CLI, and what a daemon crash does (and doesn't) do to your server.
+- **[Docker Demo](docs/docker-demo.md)**: a one-command end-to-end demo.
+- **[Agent Blueprint Gallery](demo/README.md)**: the vertical demos and reference agents.
+- **[Enterprise Tier](docs/enterprise.md)**: the tamper-evident decision ledger (CISO/audit).
+

@@ -1,0 +1,16 @@
+SELECT fractal_vector_dims('[1,2,3]'), fractal_vector_dims('1,2'), fractal_vector_dims(NULL), fractal_vector_dims('[]');
+SELECT fractal_vector_norm('[3,4]'), fractal_vector_norm('[0,0]'), fractal_vector_norm(NULL);
+SELECT fractal_vector_normalize('[3,4]'), fractal_vector_normalize('[0,0]'), fractal_vector_normalize(NULL);
+SELECT fractal_vector_add('[1,2]','[3,4]'), fractal_vector_sub('[5,6]','[1,2]'), fractal_vector_scale('[1,2]', 2.5);
+SELECT fractal_vector_l2_distance('[0,0]','[3,4]'), fractal_vector_l2_squared('[0,0]','[3,4]');
+SELECT fractal_vector_cosine_distance('[1,0]','[0,1]'), fractal_vector_cosine_similarity('[1,0]','[1,0]');
+SELECT fractal_vector_negative_inner_product('[1,2]','[3,4]'), fractal_vector_lp_distance('[0,0]','[3,4]',2), fractal_vector_lp_distance('[0,0]','[3,4]',1);
+SELECT fractal_vector_from_float8_array('[1.5,2.5]'), fractal_vector_to_float8_array('[1.5,2.5]');
+SELECT fractal_vector_quantize_int8('[0.1,-0.5,1]'), fractal_vector_quantize_binary('[1,-1,0.5]');
+SELECT fractal_vector_hamming_distance('[1,2,3]','[1,0,3]');
+SELECT fractal_vector_add(NULL,'[1]'), fractal_vector_l2_distance(NULL,'[1]'), fractal_vector_norm('not a vector');
+SELECT fractal_vector_add('[1,2]','[1]');
+SELECT fractal_vector_l2_distance('[1]','[1,2]');
+SELECT fractal_vector_add('[1]');
+SELECT fractal_vector_norm('[1,2');
+SELECT fractal_vector_lp_distance('[0,0]','[3,4]');

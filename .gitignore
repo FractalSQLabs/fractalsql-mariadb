@@ -1,0 +1,57 @@
+# Build artifacts
+*.so
+*.o
+*.obj
+*.a
+*.dylib
+*.pdb
+fractalsql.so
+fractal_mdb*.so
+build_test*.log
+demo-run.log
+
+/.gate*
+/obj/
+
+dist/
+deps/
+
+*.gcno
+*.gcda
+coverage_html/
+
+*.deb
+*.rpm
+packaging/debian/.debhelper/
+packaging/debian/fractalsql-mariadb-v*/
+packaging/debian/files
+packaging/debian/*.log
+packaging/debian/*.substvars
+packaging/rpm/BUILD/
+packaging/rpm/BUILDROOT/
+packaging/rpm/RPMS/
+packaging/rpm/SOURCES/
+packaging/rpm/SPECS/
+packaging/rpm/SRPMS/
+
+# Benchmark tester (Node.js 24)
+bench/tester/node_modules/
+bench/tester/results/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local-only Docker Compose override (LAN reasoning endpoint)
+docker-compose.override.yml
+demo-run-logs/
+run-all-demos.sh
+service/build/

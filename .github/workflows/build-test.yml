@@ -1,0 +1,493 @@
+name: build-test
+
+# Public CI wrapper around run_build_test.sh / build_test.sh: the same
+# scripts a dev runs locally, so local == CI. Builds the shim +
+# fractalsqld once (one pair covers every MariaDB major) and exercises
+# the behavioral gate suite (see build_test.sh's header) against a
+# throwaway cluster, for every supported MariaDB major on every push/PR.
+#
+# docker/Dockerfile.test runs build_test.sh --mdb <major> as a RUN
+# step, so a passing `docker build` cell IS the test result: no
+# separate `docker run` / cluster-cleanup dance in the workflow itself.
+#
+# Extra jobs alongside the Linux/Docker gate matrix:
+#   windows-gate-matrix: build_test.ps1 (a PowerShell port of
+#              build_test.sh) against archive.mariadb.org's per-major
+#              winx64 zip, MariaDB 10.6/10.11/11.4/12.3 on
+#              windows-latest. See build_test.ps1's own .DESCRIPTION.
+#   darwin-gate-matrix: build_test.sh (the same script, unmodified) on
+#              macos-14, matrixed across the same 4 majors as
+#              gate-matrix/windows-gate-matrix. Homebrew ships versioned
+#              formulae for 3 of the 4 (mariadb@10.6, mariadb@10.11,
+#              mariadb@11.4); the 12.3 cell installs the unversioned
+#              `mariadb` formula, which tracks 12.3.x -- matching this
+#              pin exactly today, though it is still not an exact-
+#              version pin and will drift once a newer major hits the
+#              formula -- see that matrix entry's own comment.
+#   linux-asan / linux-ubsan: build_test.sh --asan / --ubsan, MariaDB
+#              11.4 LTS only (the recommended ASan/UBSan
+#              representative), weekly/workflow_dispatch-only cadence.
+#              Instruments fractalsqld, never the shim. Installs 11.4
+#              directly via MariaDB's official apt repo on
+#              ubuntu-latest, not Docker, for a reason worth spelling
+#              out: LD_PRELOADing a sanitizer runtime into a
+#              full-featured official image can hang the dynamic linker
+#              on some glibc builds. It's untested whether the
+#              mariadb:11.4 Docker image has that problem, so this job
+#              sidesteps it rather than assuming it's fine.
+#   windows-asan/windows-ubsan, darwin-asan/darwin-ubsan: same 11.4-
+#              only, weekly-cadence pattern as linux-asan/ubsan above.
+#   linux-tsan/darwin-tsan: build_test.sh --tsan, same 11.4-only,
+#              weekly/workflow_dispatch-only cadence. No windows-tsan:
+#              MSVC/clang-cl implement no -fsanitize=thread at all.
+#              Unlike darwin-asan, darwin-tsan does NOT skip the cluster
+#              gates -- --tsan only instruments fractalsqld, a
+#              standalone process this script execs directly, never
+#              mariadbd itself, so the Darwin dyld/SIP/late-injection
+#              problems documented on darwin-asan below don't apply
+#              here at all.
+#   coverage: weekly/on-demand only. A gcov-instrumented build_test.sh
+#              --coverage run, with the lcov/genhtml report uploaded as
+#              a workflow artifact.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 5 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate-matrix:
+    name: build_test mdb${{ matrix.mdb }}
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mdb: ["10.6", "10.11", "11.4", "12.3"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: docker build (runs build_test.sh --mdb ${{ matrix.mdb }})
+        run: |
+          set -euo pipefail
+          chmod +x run_build_test.sh
+          ./run_build_test.sh --mdb ${{ matrix.mdb }}
+
+  windows-gate-matrix:
+    name: build_test.ps1 mdb${{ matrix.mdb }} (Windows)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mdb: "10.6"
+            mariadb_ver: "10.6.20"
+          - mdb: "10.11"
+            mariadb_ver: "10.11.10"
+          - mdb: "11.4"
+            mariadb_ver: "11.4.4"
+          - mdb: "12.3"
+            mariadb_ver: "12.3.3"
+    # Same version pins as release.yml's build-windows-msi matrix:
+    # single source of truth, don't let these drift independently.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+
+      - name: Download + unpack MariaDB ${{ matrix.mariadb_ver }} x64 binaries
+        shell: pwsh
+        env:
+          MARIADB_VER: ${{ matrix.mariadb_ver }}
+        run: |
+          $zipName = "mariadb-${env:MARIADB_VER}-winx64.zip"
+          $url     = "https://archive.mariadb.org/mariadb-${env:MARIADB_VER}/winx64-packages/$zipName"
+          Write-Host "Fetching $url"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+          $unpacked = "deps\mariadb\mariadb-${env:MARIADB_VER}-winx64"
+          if (Test-Path $unpacked) {
+            Rename-Item -Path $unpacked -NewName "root"
+          } else {
+            Write-Host "FATAL: expected $unpacked inside $zipName"
+            exit 1
+          }
+
+      # OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+      # check, not vendored in the core drop. Same vcpkg tool and
+      # install path fractalsql-reasoning-http's own Windows build
+      # already uses for libcurl (pre-installed on this runner image).
+      # build_test.ps1's own Gate-01-Build (scripts\windows\build.bat
+      # under the hood) does the actual compile -- this step only needs
+      # to make sure vcpkg has the package installed first.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+
+      - name: build_test.ps1 -MdbDir deps\mariadb\root -MdbMajor ${{ matrix.mdb }}
+        shell: pwsh
+        run: |
+          # -VcpkgRoot pins the vcpkg tree the step above populates:
+          # newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # pointing at it, and Resolve-VcpkgRoot's env fallback would
+          # resolve OpenSSL against that empty tree. Same drift fix as
+          # release.yml's build-windows-msi job.
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "${{ matrix.mdb }}" -VcpkgRoot "C:\vcpkg" -TimeoutMult 2
+          exit $LASTEXITCODE
+
+  darwin-gate-matrix:
+    name: build_test.sh mdb${{ matrix.mdb }} (macOS)
+    if: github.event_name != 'schedule'
+    runs-on: macos-14
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mdb: "10.6"
+            formula: "mariadb@10.6"
+          - mdb: "10.11"
+            formula: "mariadb@10.11"
+          - mdb: "11.4"
+            formula: "mariadb@11.4"
+          - mdb: "12.3"
+            # No mariadb@12.3 Homebrew formula -- the unversioned
+            # `mariadb` formula tracks 12.3.x, matching this pin today.
+            # Still not a Linux/Windows-style exact-version pin: it
+            # drifts to a newer major when Homebrew updates the
+            # formula; revisit then.
+            formula: "mariadb"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: "Install MariaDB ${{ matrix.mdb }} (Homebrew: ${{ matrix.formula }})"
+        run: |
+          set -euo pipefail
+          # openssl@3: gate 01's `make` needs <openssl/evp.h> for
+          # fractalsql_enterprise.c (the SDK ships no OpenSSL headers,
+          # and openssl@3 is keg-only -- the Makefile resolves the keg
+          # itself via `brew --prefix openssl@3`).
+          brew install jq openssl@3 "${{ matrix.formula }}"
+
+      - name: build_test.sh --mdb ${{ matrix.mdb }}
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix ${{ matrix.formula }})/bin" ./build_test.sh --mdb ${{ matrix.mdb }}
+
+  linux-asan:
+    name: build_test.sh --asan mdb11.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq
+          wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: fractalsqld's build links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+
+      - name: build_test.sh --asan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --asan
+
+  linux-ubsan:
+    name: build_test.sh --ubsan mdb11.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq
+          wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: fractalsqld's build links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+
+      - name: build_test.sh --ubsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --ubsan
+
+  linux-tsan:
+    name: build_test.sh --tsan mdb11.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq
+          wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: fractalsqld's build links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+
+      # ubuntu-latest runs this natively, not in a container -- important
+      # for --tsan specifically: the ASLR workaround build_test.sh applies
+      # (re-exec under `setarch -R`) needs the personality() syscall,
+      # which a container's default seccomp profile can block outright
+      # (confirmed against the mariadb:11.4 Docker image itself while
+      # developing this job -- setarch exists on PATH there but still
+      # fails with "Operation not permitted"). A bare GitHub-hosted VM
+      # has no such seccomp layer, so this job installs MariaDB directly
+      # rather than running build_test.sh inside Dockerfile.test.
+      - name: build_test.sh --tsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --tsan
+
+  windows-asan:
+    name: build_test.ps1 -Asan mdb11.4 (Windows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+      - name: Download + unpack MariaDB 11.4.4 x64 binaries
+        shell: pwsh
+        run: |
+          $url = "https://archive.mariadb.org/mariadb-11.4.4/winx64-packages/mariadb-11.4.4-winx64.zip"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+          Rename-Item -Path "deps\mariadb\mariadb-11.4.4-winx64" -NewName "root"
+      # build_test.ps1's Gate-01-Build calls Build-AsanExtension itself
+      # (a real MSVC /fsanitize=address compile+link into its own
+      # dist\windows-asan\ tree, see that function's own comment) --
+      # this step only needs vcpkg to already have OpenSSL installed.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+      - name: build_test.ps1 -Asan mdb11.4
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Asan -VcpkgRoot "C:\vcpkg" -TimeoutMult 4
+          exit $LASTEXITCODE
+
+  windows-ubsan:
+    name: build_test.ps1 -Ubsan mdb11.4 (Windows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+      - name: Download + unpack MariaDB 11.4.4 x64 binaries
+        shell: pwsh
+        run: |
+          $url = "https://archive.mariadb.org/mariadb-11.4.4/winx64-packages/mariadb-11.4.4-winx64.zip"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+          Rename-Item -Path "deps\mariadb\mariadb-11.4.4-winx64" -NewName "root"
+      # build_test.ps1's Gate-01-Build calls Build-UbsanExtension itself
+      # (clang-cl + -fsanitize=undefined into its own dist\windows-ubsan\
+      # tree, see that function's own comment) -- clang-cl comes from
+      # windows-latest's bundled VS "C++ Clang tools for Windows"
+      # component, resolved via Find-ClangCl's vswhere lookup. This step
+      # only needs vcpkg to already have OpenSSL installed.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+      - name: build_test.ps1 -Ubsan mdb11.4
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MdbDir "deps\mariadb\root" -MdbMajor "11.4" -Ubsan -VcpkgRoot "C:\vcpkg" -TimeoutMult 4
+          exit $LASTEXITCODE
+
+  darwin-asan:
+    # The cluster gates SKIP on stock Homebrew mariadbd, by design: ASan
+    # must install its malloc/free interceptors before the host process
+    # makes its first allocation, and on modern macOS (dyld chained
+    # fixups) no late injection can achieve that against a mariadbd that
+    # wasn't itself compiled with -fsanitize=address -- LD_PRELOAD is
+    # ignored by dyld outright, and DYLD_INSERT_LIBRARIES loads the
+    # runtime too late, after which the runtime aborts the whole
+    # (single, threaded) mariadbd process mid-query (surfacing as ERROR
+    # 2013 Lost connection at the first CREATE FUNCTION; caught live on
+    # this cell). build_test.sh detects the non-instrumented host via
+    # otool -L and skips cleanly rather than hard-failing cluster setup.
+    # The Linux/Windows ASan cells cover the same portable C source;
+    # full-cluster ASan on macOS would need a source-built ASan mariadbd.
+    name: build_test.sh --asan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MariaDB (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install mariadb jq openssl@3
+      - name: build_test.sh --asan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --asan
+
+  darwin-ubsan:
+    name: build_test.sh --ubsan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MariaDB (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install mariadb jq openssl@3
+      - name: build_test.sh --ubsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --ubsan
+
+  darwin-tsan:
+    # Does NOT skip the cluster gates the way darwin-asan above does --
+    # --tsan only instruments fractalsqld (a standalone process this
+    # script execs directly), never mariadbd, so the dyld/SIP/late-
+    # injection problems darwin-asan works around don't apply here.
+    # Unverified on real Darwin hardware in this session, same caveat as
+    # the rest of this file's Darwin content -- the first place to check
+    # if this cell fails is whether `setarch` even exists on macOS (it
+    # doesn't; this script's --tsan ASLR workaround is Linux-only and a
+    # no-op on Darwin by design, see build_test.sh's own comment).
+    name: build_test.sh --tsan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MariaDB (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install mariadb jq openssl@3
+      - name: build_test.sh --tsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --tsan
+
+  coverage:
+    name: coverage (lcov)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB 11.4 + lcov
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg lcov jq
+          wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: fractalsqld's build links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mariadb-server to pull it in transitively.
+          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+
+      - name: build_test.sh --coverage
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mariadb stop || true
+          ./build_test.sh --mdb 11.4 --coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-html
+          path: coverage_html/
+          retention-days: 30
+          if-no-files-found: warn

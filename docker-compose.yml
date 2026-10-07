@@ -1,0 +1,72 @@
+# Demo stack: shim + daemon. The fractalsqld container holds the core
+# and the reasoning plugin and talks to mariadb over a unix socket in the
+# shared volume. The mariadb container loads only the GPL shim.
+#
+# Required: FSQL_HMAC_KEY (hex, shared by both services), e.g.
+#   export FSQL_HMAC_KEY=$(openssl rand -hex 32)
+# LLM host: OLLAMA_HOST (default 192.168.17.8), any Ollama-compatible
+# server with gpt-oss:20b and nomic-embed-text.
+services:
+  fractalsqld:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: fractalsqld
+    environment:
+      FSQL_HMAC_KEY: ${FSQL_HMAC_KEY:?set FSQL_HMAC_KEY (openssl rand -hex 32)}
+      FRACTALSQL_REASONING_PLUGIN: /usr/lib/fractalsql/fractalsql-reasoning-http.so
+      FSQL_REASONING_HTTP_URL: http://${OLLAMA_HOST:-192.168.17.8}:11434/v1/chat/completions
+      FSQL_REASONING_HTTP_ALLOW_PLAINTEXT: "1"
+      FSQL_REASONING_HTTP_MODEL: gpt-oss:20b
+      FRACTALSQL_HTTP_EMBED_URL: http://${OLLAMA_HOST:-192.168.17.8}:11434/v1/embeddings
+      FRACTALSQL_HTTP_EMBED_MODEL: nomic-embed-text
+      FSQL_REASONING_HTTP_TIMEOUT_MS: "330000"
+      FSQL_REASONING_HTTP_LOW_SPEED_SECS: "300"
+    user: "999:999"            # mysql, the uid the daemon admits (allowed_uids)
+    restart: unless-stopped
+    stop_grace_period: 20s     # SIGTERM stops accepting; in-flight calls finish
+    read_only: true            # root filesystem is read-only; state is in the volume
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    volumes:
+      - fsqld_run:/run/fractalsql
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/fractalsql/fractalsqld.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mariadb:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: demo
+    depends_on:
+      fractalsqld:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      MARIADB_ROOT_PASSWORD: fractalsql
+      MARIADB_DATABASE: fractalsql_demo
+      FSQL_HMAC_KEY: ${FSQL_HMAC_KEY:?set FSQL_HMAC_KEY (openssl rand -hex 32)}
+      FRACTALSQL_CONFIG: /etc/fractalsql/fractalsql.conf
+    volumes:
+      - fsqld_run:/run/fractalsql
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  fsqld_run:

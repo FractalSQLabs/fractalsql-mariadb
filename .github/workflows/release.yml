@@ -1,0 +1,972 @@
+name: Release fractalsql-mariadb Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Read-only by default; publish jobs grant contents: write below.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # Linux: build fractalsql.so per arch. The UDF ABI is stable across
+  # MariaDB 10.6 / 10.11 / 11.4 LTS and 12.3 LTS, so one .so per
+  # arch covers the whole supported range, no per-major fan-in.
+  #
+  # Both arches get a native smoke test inside real mariadb:11.4 AND
+  # mariadb:12.3 containers (edition + version + fractal_search
+  # cosine-similarity convergence), the same .so in, both containers
+  # out, which is the actual cross-major-ABI proof. The arm64 cell
+  # runs on GitHub's native ubuntu-24.04-arm runner, so its Docker
+  # images and mariadbd are arm64 at full speed -- the historical
+  # reason for skipping it (QEMU translation of the whole server was
+  # too slow and flaky) went away when the runner became native.
+  # ------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.arch }}
+    # Native arm64 via GitHub's ubuntu-24.04-arm runner. Earlier
+    # iterations used ubuntu-latest + QEMU, which paid the cost of
+    # x86->aarch64 instruction translation for the entire pure-C
+    # fractalsql.so build. Native arm64 runners (GA mid-2025) run the
+    # same Docker + buildx stack at native speed; no QEMU shim needed.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Build fractalsql.so and fractalsqld for ${{ matrix.arch }}
+        run: |
+          chmod +x build.sh
+          ./build.sh ${{ matrix.arch }}
+          ls -l dist/${{ matrix.arch }}/fractalsql.so dist/${{ matrix.arch }}/fractalsqld
+
+      - name: Smoke test (edition/version + fractal_search convergence)
+        run: |
+          set -euo pipefail
+          SO="dist/${{ matrix.arch }}/fractalsql.so"
+          DAEMON="dist/${{ matrix.arch }}/fractalsqld"
+          CONF_DIR=/etc/fractalsql
+          SOCK=/run/fractalsql/fractalsqld.sock
+
+          # fractalsql.so is only the shim: every UDF call needs
+          # fractalsqld running inside the same container and reachable
+          # at FRACTALSQL_CONFIG, or every call below fails with "lost
+          # connection to fractalsqld" instead of a real result. The key
+          # and conf files are built once on the runner and docker cp'd
+          # into each container below.
+          KEY_FILE=$(mktemp)
+          openssl rand -hex 32 > "${KEY_FILE}"
+
+          # Validate the same pair against both current LTS majors
+          # (11.4 and 12.3). Same binaries in, both containers out,
+          # proving the UDF ABI stability claim instead of just
+          # asserting it in commentary.
+          for TAG in 11.4 12.3; do
+              M="mdb-${TAG}"
+              echo "=============================================="
+              echo "  Smoke test against mariadb:${TAG}"
+              echo "=============================================="
+
+              docker run -d --name "${M}" \
+                  -e MARIADB_ROOT_PASSWORD=test \
+                  -e FRACTALSQL_CONFIG="${CONF_DIR}/fractalsql.conf" \
+                  "mariadb:${TAG}"
+
+              # The mariadb image runs a two-phase bootstrap: a
+              # temporary mariadbd on the unix socket populates the
+              # data dir and applies MARIADB_ROOT_PASSWORD, then the
+              # server restarts for production use. Polling
+              # `mariadb-admin ping` can succeed during phase 1 BEFORE
+              # the password is applied, and subsequent -ptest calls
+              # then fail with "Access denied for user 'root'@'localhost'
+              # (using password: YES)" once phase 2 kicks in.
+              #
+              # healthcheck.sh (shipped inside the image specifically
+              # for this) waits for both connectability AND innodb
+              # initialization, i.e. the full production state.
+              for i in $(seq 1 90); do
+                  if docker exec "${M}" healthcheck.sh \
+                        --connect --innodb_initialized >/dev/null 2>&1; then
+                      break
+                  fi
+                  sleep 1
+              done
+              docker exec "${M}" healthcheck.sh --connect --innodb_initialized
+
+              # All subsequent client calls force --protocol=socket so
+              # we stay on the unix-socket code path, avoiding the
+              # TLS handshake that mariadb 11.4+ defaults to on TCP,
+              # which was producing "TLS/SSL error: Broken pipe (32)"
+              # in CI.
+              MC="mariadb --protocol=socket -uroot -ptest"
+
+              # Stand up fractalsqld inside the container before the
+              # shim ever gets a call: allowed_uids must be mysql's
+              # uid in THIS image (mariadbd, and so the shim, runs as
+              # mysql), queried live rather than assumed.
+              MYSQL_UID=$(docker exec "${M}" id -u mysql)
+              docker exec "${M}" mkdir -p "${CONF_DIR}" "$(dirname "${SOCK}")"
+              docker exec "${M}" chown mysql "$(dirname "${SOCK}")"
+              docker cp "${KEY_FILE}" "${M}:${CONF_DIR}/hmac.key"
+              docker exec "${M}" sh -c "printf 'socket_path = %s\nhmac_key_file = %s\nallowed_uids = %s\n' '${SOCK}' '${CONF_DIR}/hmac.key' '${MYSQL_UID}' > ${CONF_DIR}/fractalsqld.conf"
+              docker exec "${M}" sh -c "printf 'socket_path = %s\nhmac_key_file = %s\n' '${SOCK}' '${CONF_DIR}/hmac.key' > ${CONF_DIR}/fractalsql.conf"
+              # fractalsqld refuses to start if hmac_key_file OR its
+              # conf file has ANY world permission bits set
+              # (fractalsqld.c: "grants access to other users" -- the
+              # conf is gated like the key file because it may now
+              # carry plaintext provider secrets), so world-readable
+              # is not an option, throwaway container or not -- caught
+              # live here (a prior chmod 644 made the daemon exit
+              # before it ever created its socket, on every arch).
+              # mariadbd (and so the shim) and fractalsqld both run as
+              # mysql in this image, so chown to mysql + owner-only is
+              # both sufficient and the only mode the daemon will
+              # accept.
+              docker exec "${M}" chown mysql "${CONF_DIR}/hmac.key"
+              docker exec "${M}" chmod 600 "${CONF_DIR}/hmac.key"
+              docker exec "${M}" chown mysql "${CONF_DIR}/fractalsqld.conf"
+              docker exec "${M}" chmod 600 "${CONF_DIR}/fractalsqld.conf"
+              # fractalsql.conf is the SHIM's config (FSQL_CONFIG); the
+              # shim does not gate its mode, but it lives beside the
+              # gated pair and carries nothing public either, so 600.
+              docker cp "${DAEMON}" "${M}:/usr/local/bin/fractalsqld"
+              docker exec "${M}" chmod +x /usr/local/bin/fractalsqld
+              # `docker exec -d` discards the detached process's own
+              # stdout/stderr -- a failure here otherwise has zero
+              # visibility, since `docker logs` only ever captures
+              # PID 1 (mariadbd), not this exec'd process. Redirect to
+              # a file inside the container so a failure below can cat
+              # it and show the daemon's own startup error.
+              docker exec -u mysql -d "${M}" sh -c \
+                  "fractalsqld -c '${CONF_DIR}/fractalsqld.conf' >/tmp/fractalsqld.log 2>&1"
+              for i in $(seq 1 50); do
+                  docker exec "${M}" test -S "${SOCK}" && break
+                  sleep 0.2
+              done
+              docker exec "${M}" test -S "${SOCK}" \
+                  || { echo "fractalsqld never created ${SOCK}"; \
+                       echo "--- fractalsqld.log ---"; docker exec "${M}" cat /tmp/fractalsqld.log 2>&1; \
+                       echo "--- container log ---"; docker logs "${M}"; exit 1; }
+
+              docker cp "${SO}" "${M}:/usr/lib/mysql/plugin/fractalsql.so"
+              # install_udf.sql's UDF half is server-global (mysql.func,
+              # no default database needed), but its procedural half
+              # (fractal_schema_context, _fractalsql_scan_corpus, ...)
+              # are ordinary stored procedures: DROP/CREATE PROCEDURE
+              # fails with ERROR 1046 "No database selected" unless the
+              # client has a default database. Create a scratch one and
+              # select it; CREATE FUNCTION is unaffected by the choice.
+              docker exec "${M}" ${MC} \
+                  -e "CREATE DATABASE IF NOT EXISTS fractalsql_ci;"
+              docker exec -i "${M}" ${MC} -D fractalsql_ci < sql/install_udf.sql
+
+              EDITION=$(docker exec "${M}" ${MC} -N -B -e \
+                  "SELECT fractal_edition();")
+              echo "[${TAG}] edition: ${EDITION}"
+              test "${EDITION}" = "Community"
+
+              VERSION=$(docker exec "${M}" ${MC} -N -B -e \
+                  "SELECT fractal_version();")
+              echo "[${TAG}] version: ${VERSION}"
+              test "${VERSION}" = "2.0.9"
+
+              # Convergence sanity check. query = (0.6, 0.8), objective
+              # is cosine distance. Cosine distance is magnitude-
+              # invariant, so every point on the ray through the origin
+              # and (0.6, 0.8) is a global optimum: the coordinates
+              # SFS returns can land anywhere along that ray inside
+              # [-1, 1]^2. We assert the invariant the optimizer is
+              # actually minimizing: cosine similarity to the query
+              # should be essentially 1. ||query||^2 = 0.6^2+0.8^2 = 1,
+              # so cos_sim simplifies to (v . query) / ||v||.
+              RESULT=$(docker exec "${M}" ${MC} -N -B -e "
+                  SET @r = fractal_search('', '0.6,0.8', 1,
+                                          '{\"iterations\":100,\"population_size\":50}');
+                  SELECT CASE
+                      WHEN SQRT(v1*v1 + v2*v2) > 1e-9
+                       AND (v1*0.6 + v2*0.8) / SQRT(v1*v1 + v2*v2) > 0.99
+                      THEN 'ok'
+                      ELSE CONCAT('FAIL v=', v1, ',', v2)
+                  END
+                  FROM (
+                      SELECT
+                        CAST(JSON_EXTRACT(@r, '\$.best_point[0]') AS DOUBLE) AS v1,
+                        CAST(JSON_EXTRACT(@r, '\$.best_point[1]') AS DOUBLE) AS v2
+                  ) t;")
+              echo "[${TAG}] convergence: ${RESULT}"
+              test "${RESULT}" = "ok"
+
+              docker rm -f "${M}"
+          done
+          rm -f "${KEY_FILE}"
+
+      - name: Upload shim + daemon artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: fractalsql-mariadb-${{ matrix.arch }}-bin
+          path: |
+            dist/${{ matrix.arch }}/fractalsql.so
+            dist/${{ matrix.arch }}/fractalsqld
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # One packaging cell per arch. Pulls the per-arch shim+daemon pair
+  # from the build jobs, runs scripts/package.sh to produce .deb +
+  # .rpm, and verifies no luajit runtime dep leaked into the package
+  # metadata.
+  # ------------------------------------------------------------------
+  package:
+    name: package ${{ matrix.arch }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # action-gh-release upload
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Download fractalsql.so + fractalsqld
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: fractalsql-mariadb-${{ matrix.arch }}-bin
+          path: dist/${{ matrix.arch }}
+
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Build .deb and .rpm for ${{ matrix.arch }}
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh ${{ matrix.arch }}
+          ls -l dist/packages
+
+      - name: Verify packages declare no luajit dependency
+        run: |
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              DEPS=$(dpkg-deb -f "${deb}" Depends)
+              echo "Depends: ${DEPS}"
+              if echo "${DEPS}" | grep -iE 'luajit'; then
+                  echo "FAIL: ${deb} declares a luajit dependency" >&2
+                  exit 1
+              fi
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              REQS=$(rpm -qpR "${rpm}" || true)
+              echo "Requires:"
+              echo "${REQS}"
+              if echo "${REQS}" | grep -iE '^luajit'; then
+                  echo "FAIL: ${rpm} declares a luajit requirement" >&2
+                  exit 1
+              fi
+          done
+
+      - name: Verify packages ship LICENSE files
+        run: |
+          set -euo pipefail
+          # package.sh's stage_common() ships one file per component
+          # (shim=GPL-2.0-only, daemon=Apache-2.0, protocol=MIT, plus
+          # the GPL source offer and third-party notices) -- there is
+          # no plain "LICENSE" file any more. This check still looked
+          # for that retired name and so failed on every package,
+          # the first time this step ever actually ran (earlier runs
+          # never got past the build job).
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              CONTENTS=$(dpkg-deb -c "${deb}")
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mariadb/LICENSE-Apache-2.0$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mariadb/LICENSE-GPL-2.0-only$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mariadb/LICENSE-THIRD-PARTY$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mariadb/copyright$'
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              CONTENTS=$(rpm -qlp "${rpm}")
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/LICENSE-Apache-2.0$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/LICENSE-GPL-2.0-only$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/LICENSE-THIRD-PARTY$'
+          done
+
+      - name: Verify plugin .so lands at the right per-distro path
+        run: |
+          # mariadbd reads from different plugin_dir paths depending on
+          # distro. The .so must land where the running server actually
+          # looks or CREATE FUNCTION ... SONAME 'fractalsql.so' silently
+          # fails to load.
+          #   Debian/Ubuntu:  /usr/lib/mysql/plugin/
+          #   RHEL/EL9:       /usr/lib64/mysql/plugin/  (the MariaDB
+          #                    Foundation packages install-test.yml
+          #                    installs report this as @@plugin_dir --
+          #                    confirmed live across 10.6/10.11/11.4/
+          #                    12.3; a distro-stock mariadb-server
+          #                    package may use /usr/lib64/mariadb/plugin/
+          #                    instead, which package.sh does not target)
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              dpkg-deb -c "${deb}" \
+                  | grep -E 'usr/lib/mysql/plugin/fractalsql\.so$'
+              dpkg-deb -c "${deb}" \
+                  | grep -E 'usr/lib/mysql/plugin/fractalsql-reasoning-http\.so$'
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              rpm -qlp "${rpm}" \
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql\.so$'
+              rpm -qlp "${rpm}" \
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql-reasoning-http\.so$'
+          done
+
+      # easy_install.sh is arch-independent (pure bash), so stamp it once
+      # from the amd64 leg only, not once per matrix arch. Uploading the
+      # identical file from both the amd64 and arm64 package jobs would
+      # race two concurrent release-asset uploads of the same name.
+      - name: Stamp version into easy_install.sh
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              FSQL_VERSION="${{ github.ref_name }}"
+              FSQL_VERSION="${FSQL_VERSION#v}"
+          else
+              FSQL_VERSION="$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' src/fractalsql.c)"
+          fi
+          sed "s/@@FSQL_VERSION@@/${FSQL_VERSION}/" scripts/easy_install.sh > dist/packages/easy_install.sh
+          chmod +x dist/packages/easy_install.sh
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: fractalsql-mariadb-${{ matrix.arch }}
+          path: dist/packages/*
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: dist/packages/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
+  # macOS: fractalsql.so (the GPL-2.0-only shim) + fractalsqld (the
+  # Apache-2.0 daemon), built via service/Makefile -- the same build
+  # darwin-gate-matrix in build-test.yml already exercises natively on
+  # every push/PR. Static-links include/darwin-<arch>/libfractalsql-
+  # community-sovereign-c.a into the daemon, the same vendored core
+  # archive the Linux build links.
+  #
+  # Both cells run on macos-14, since GitHub retired the free macos-13
+  # (Intel) runner in Dec 2025, so amd64 is a cross-compile
+  # (`-arch x86_64`, via FSQ_ARCH_FLAGS) on the arm64 runner rather
+  # than a native build. The vendored core archive is a real per-arch
+  # static lib (not a host binary), so cross-linking it from either
+  # runner arch just works.
+  #
+  # `brew install mariadb-connector-c` supplies mysql.h (UDF headers)
+  # only, no client library is linked. plugin_dir varies across
+  # Homebrew arch + install path, so install.sh (bundled in the zip)
+  # discovers it live rather than hardcoding one.
+  #
+  # Unsigned release: users run `xattr -d com.apple.quarantine` once.
+  # ------------------------------------------------------------------
+  build-macos:
+    name: macos ${{ matrix.platform_tag }}
+    permissions:
+      contents: write  # action-gh-release upload
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform_tag: osx_amd64
+          - arch: arm64
+            platform_tag: osx_arm64
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MariaDB client headers
+        run: |
+          set -euo pipefail
+          # openssl@3 for fractalsql_enterprise.c's Ed25519 signature
+          # check (the macOS SDK ships no OpenSSL headers; linked
+          # statically into the daemon in the build step below).
+          brew install mariadb-connector-c pkg-config openssl@3
+          # mariadb-connector-c is keg-only (homebrew-core #196747):
+          # nothing is linked into the default prefix, so its
+          # libmariadb.pc is not on pkg-config's default search path
+          # and "pkg-config --cflags libmariadb" fails with "Package
+          # 'libmariadb' not found". Point pkg-config at the keg.
+          echo "PKG_CONFIG_PATH=$(brew --prefix mariadb-connector-c)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      # The macos-14 runner is arm64, so arm-Homebrew's openssl@3 keg
+      # contains only arm64 objects; linking them into an -arch x86_64
+      # build makes ld discard every member ("found architecture
+      # 'arm64', required architecture 'x86_64'") and all EVP symbols
+      # go undefined. Homebrew also no longer ships x86_64 bottles
+      # (Intel support discontinued -- a Rosetta brew install compiles
+      # from source under emulation, ~20 minutes, on a platform Apple,
+      # GitHub and Homebrew are all sunsetting). Cross-compile an
+      # x86_64 libcrypto natively instead: clang -arch x86_64 emits
+      # x86_64 objects at full speed on the arm64 host, no Rosetta
+      # needed, since only the archive is linked and its binaries are
+      # never run.
+      - name: Cross-build x86_64 libcrypto from source
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          curl -fsSLO --proto '=https' https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
+          echo "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2  openssl-3.5.8.tar.gz" | shasum -a 256 -c -
+          tar xf openssl-3.5.8.tar.gz
+          cd openssl-3.5.8
+          ./Configure darwin64-x86_64 no-shared no-tests \
+              --prefix=/tmp/openssl-x64 \
+              -mmacosx-version-min=11.0 -fPIC
+          # opensslv.h and friends are generated at build time, not
+          # shipped in the tarball. Serially force the header-generation
+          # step first: kicking straight into a parallel libcrypto.a
+          # build races it, and the first .o compiles fail with
+          # "fatal error: 'openssl/opensslv.h' file not found".
+          make -j1 -s build_generated
+          make -j"$(sysctl -n hw.ncpu)" -s libcrypto.a
+          make -s install_sw
+
+      - name: Verify vendored core archive is present
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-${{ matrix.arch }}/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" \
+              || (echo "ERROR: vendored core archive missing: ${CORE_A}" >&2 \
+                  && echo "  Refresh the vendored core artifact per the vendoring process" >&2 \
+                  && echo "  (deploy the foundry build into include/darwin-*)." >&2 \
+                  && exit 1)
+
+      - name: Build fractalsql.so (shim) and fractalsqld (daemon)
+        run: |
+          set -euo pipefail
+          # The tree must match the -arch being built: x86_64 uses the
+          # cross-compiled tree (see the step above), arm64 uses the
+          # runner's own arm-Homebrew keg.
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+              OPENSSL_DIR="/tmp/openssl-x64"
+          else
+              OPENSSL_DIR="$(brew --prefix openssl@3)"
+          fi
+          MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
+          echo "MDB_CFLAGS: ${MDB_CFLAGS}"
+          echo "OPENSSL_DIR: ${OPENSSL_DIR}"
+          make -C service clean
+          make -C service \
+              FSQ_PLATFORM="darwin-${{ matrix.arch }}" \
+              FSQ_ARCH_FLAGS="-arch ${{ matrix.arch }}" \
+              FSQ_OPENSSL_DIR="${OPENSSL_DIR}" \
+              MDB_CFLAGS="${MDB_CFLAGS}" \
+              all scan
+          OUT_DIR="dist/${{ matrix.platform_tag }}"
+          mkdir -p "${OUT_DIR}"
+          cp service/build/fractalsql.so "${OUT_DIR}/fractalsql.so"
+          cp service/build/fractalsqld "${OUT_DIR}/fractalsqld"
+          ls -l "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld"
+
+      - name: Posture checks (otool, size, exports)
+        run: |
+          set -euo pipefail
+          DYLIB="dist/${{ matrix.platform_tag }}/fractalsql.so"
+
+          echo "--- otool -L ---"
+          otool -L "${DYLIB}"
+          # tail drops the "path:" header; the self-name filter drops
+          # the dylib's own LC_ID_DYLIB entry, which otool -L also
+          # prints (install name = the -o output path) and which is
+          # not a real dependency. The shim links no OpenSSL at all
+          # (make -C service scan's symbol_scan.sh already proved
+          # that above), so the allow-list here is just the system
+          # libraries a plain MariaDB UDF plugin needs.
+          BAD=$(otool -L "${DYLIB}" \
+                  | tail -n +2 \
+                  | awk '{print $1}' \
+                  | grep -v 'fractalsql\.so$' \
+                  | grep -vE '^(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|/usr/lib/libresolv\.[0-9]+\.dylib|/System/Library/Frameworks/)' \
+                  | grep -v '^$' || true)
+          if [ -n "${BAD}" ]; then
+              echo "FAIL: disallowed dynamic deps:" >&2
+              echo "${BAD}" >&2
+              exit 1
+          fi
+
+          echo "--- size ---"
+          SZ=$(stat -f '%z' "${DYLIB}")
+          echo "size: ${SZ} bytes"
+          # The shim is a thin socket forwarder with no core and no
+          # OpenSSL (that's all in fractalsqld now) -- it should stay
+          # near the service/README.md target (a few hundred KB at
+          # most). 2 MiB catches a mistaken core/OpenSSL re-link
+          # without being so tight it flakes on toolchain noise.
+          if [ "${SZ}" -gt 2097152 ]; then
+              echo "FAIL: shim exceeds 2 MiB ceiling (expected thin; see service/README.md)" >&2
+              exit 1
+          fi
+
+          echo "--- required exports ---"
+          # Covers every UDF currently in sql/install_udf.sql. Extend
+          # this list whenever sql/install_udf.sql adds a new
+          # CREATE FUNCTION entry.
+          for sym in _fractal_search _fractal_search_init _fractal_search_deinit \
+                     _fractal_search_explore _fractal_search_explore_init _fractal_search_explore_deinit \
+                     _fractal_edition _fractal_edition_init _fractal_edition_deinit \
+                     _fractal_version _fractal_version_init _fractal_version_deinit \
+                     _fractal_dimension_dfa _fractal_dimension_dfa_init _fractal_dimension_dfa_deinit \
+                     _fractal_dimension_boxcount _fractal_dimension_boxcount_init _fractal_dimension_boxcount_deinit \
+                     _fractal_dimension_drift _fractal_dimension_drift_init _fractal_dimension_drift_deinit \
+                     _fractal_optimize_portfolio _fractal_optimize_portfolio_init _fractal_optimize_portfolio_deinit \
+                     _fractal_vascular_network _fractal_vascular_network_init _fractal_vascular_network_deinit \
+                     _fractal_cortical_folding _fractal_cortical_folding_init _fractal_cortical_folding_deinit \
+                     _fractal_nerve_plexus_metric _fractal_nerve_plexus_metric_init _fractal_nerve_plexus_metric_deinit \
+                     _fractal_morphological_complexity _fractal_morphological_complexity_init _fractal_morphological_complexity_deinit \
+                     _fractal_diversify_enable _fractal_diversify_enable_init _fractal_diversify_enable_deinit \
+                     _fractal_diversify_disable _fractal_diversify_disable_init _fractal_diversify_disable_deinit \
+                     _fractal_diversify_set_params _fractal_diversify_set_params_init _fractal_diversify_set_params_deinit \
+                     _fractal_detect_collapse _fractal_detect_collapse_init _fractal_detect_collapse_deinit \
+                     _fractal_explain_result _fractal_explain_result_init _fractal_explain_result_deinit \
+                     _fractal_session_close _fractal_session_close_init _fractal_session_close_deinit \
+                     _fractal_vector_dims _fractal_vector_dims_init _fractal_vector_dims_deinit \
+                     _fractal_vector_norm _fractal_vector_norm_init _fractal_vector_norm_deinit \
+                     _fractal_vector_normalize _fractal_vector_normalize_init _fractal_vector_normalize_deinit \
+                     _fractal_vector_add _fractal_vector_add_init _fractal_vector_add_deinit \
+                     _fractal_vector_sub _fractal_vector_sub_init _fractal_vector_sub_deinit \
+                     _fractal_vector_scale _fractal_vector_scale_init _fractal_vector_scale_deinit \
+                     _fractal_vector_l2_distance _fractal_vector_l2_distance_init _fractal_vector_l2_distance_deinit \
+                     _fractal_vector_l2_squared _fractal_vector_l2_squared_init _fractal_vector_l2_squared_deinit \
+                     _fractal_vector_cosine_distance _fractal_vector_cosine_distance_init _fractal_vector_cosine_distance_deinit \
+                     _fractal_vector_cosine_similarity _fractal_vector_cosine_similarity_init _fractal_vector_cosine_similarity_deinit \
+                     _fractal_vector_negative_inner_product _fractal_vector_negative_inner_product_init _fractal_vector_negative_inner_product_deinit \
+                     _fractal_vector_from_float8_array _fractal_vector_from_float8_array_init _fractal_vector_from_float8_array_deinit \
+                     _fractal_vector_to_float8_array _fractal_vector_to_float8_array_init _fractal_vector_to_float8_array_deinit \
+                     _fractal_reason _fractal_reason_init _fractal_reason_deinit \
+                     _fractal_embed _fractal_embed_init _fractal_embed_deinit \
+                     _fractal_t2s_config _fractal_t2s_config_init _fractal_t2s_config_deinit \
+                     _fractal_t2s_generate _fractal_t2s_generate_init _fractal_t2s_generate_deinit \
+                     _fractal_t2s_review _fractal_t2s_review_init _fractal_t2s_review_deinit \
+                     _fractal_t2s_check_allowlist _fractal_t2s_check_allowlist_init _fractal_t2s_check_allowlist_deinit \
+                     _fractal_feedback_report _fractal_feedback_report_init _fractal_feedback_report_deinit \
+                     _fractal_isolate_background _fractal_isolate_background_init _fractal_isolate_background_deinit \
+                     _fractal_ledger_flush _fractal_ledger_flush_init _fractal_ledger_flush_deinit \
+                     _fractal_ledger_load _fractal_ledger_load_init _fractal_ledger_load_deinit \
+                     _fractal_ledger_compact _fractal_ledger_compact_init _fractal_ledger_compact_deinit \
+                     _fractal_ledger_reset_soft _fractal_ledger_reset_soft_init _fractal_ledger_reset_soft_deinit \
+                     _fractal_ledger_reset_hard _fractal_ledger_reset_hard_init _fractal_ledger_reset_hard_deinit \
+                     _fractal_ledger_truth_count _fractal_ledger_truth_count_init _fractal_ledger_truth_count_deinit \
+                     _fractal_ledger_shadow_count _fractal_ledger_shadow_count_init _fractal_ledger_shadow_count_deinit \
+                     _fractal_audit_unpack _fractal_audit_unpack_init _fractal_audit_unpack_deinit; do
+              nm -gU "${DYLIB}" | grep -E "${sym}$" \
+                  || { echo "FAIL: ${sym} missing"; exit 1; }
+          done
+          echo "ok: ${DYLIB}"
+
+      - name: Package .zip
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist/packages"
+          mkdir -p "${DIST_DIR}"
+          ZIP_NAME="fractalsql-mariadb-${{ matrix.platform_tag }}.zip"
+          STAGE="$(mktemp -d)"
+          # Shipped as fractalsql.dylib (the macOS-idiomatic name for a
+          # shared library); install.sh stages it as plugin_dir's
+          # fractalsql.so, since every install_udf.sql CREATE FUNCTION
+          # ... SONAME reference expects that exact on-disk name.
+          cp "dist/${{ matrix.platform_tag }}/fractalsql.so" "${STAGE}/fractalsql.dylib"
+          # install -m 0755, not cp: ships both binaries with the exec
+          # bit set in the zip itself so a manual install can't stage a
+          # non-executable one (macOS dyld refuses to mmap(PROT_EXEC) a
+          # non-executable dylib; install.sh re-stages 0755 regardless,
+          # this keeps the raw zip right).
+          install -m 0755 "dist/${{ matrix.platform_tag }}/fractalsqld" "${STAGE}/fractalsqld"
+          install -m 0755 "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so" "${STAGE}/"
+          install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist "${STAGE}/"
+          cp LICENSE "${STAGE}/"
+          cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
+          cp sql/install_udf.sql "${STAGE}/install_udf.sql"
+          cp sql/install_agents.sql "${STAGE}/install_agents.sql"
+          install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
+          cat > "${STAGE}/README.txt" <<EOF
+          fractalsql-mariadb 2.0.9 Community (${{ matrix.platform_tag }})
+
+          Unsigned, for macOS. Compatible with MariaDB 10.6 / 10.11 /
+          11.4 LTS / 12.3 LTS via Homebrew.
+
+          mariadbd loads only fractalsql.so (the shim); every UDF body
+          runs in fractalsqld, a separate daemon this package also
+          installs and loads as a per-user LaunchAgent.
+
+          Automated: run ./install.sh (uses mariadb on PATH, or
+          MARIADB_BIN=/path/to/mariadb ./install.sh for a specific
+          server). It does steps 1-6 below for you; scripts/
+          easy_install.sh's own darwin path calls it the same way.
+
+          Manual steps, if you'd rather not run install.sh:
+
+          1. Find your mariadbd's plugin_dir:
+                 mariadb -uroot -p -e "SELECT @@plugin_dir;"
+             Typical on macOS (Homebrew):
+                 /opt/homebrew/opt/mariadb/lib/plugin/   (Apple Silicon)
+                 /usr/local/opt/mariadb/lib/plugin/      (Intel)
+
+          2. Copy the dylib there as 'fractalsql.so' (CREATE FUNCTION
+             ... SONAME references the .so name; macOS loader still
+             picks up the dylib under that name), and the reasoning
+             plugin alongside it (needed for fractal_reason()/
+             fractal_embed()/text-to-sql, see docs/reasoning-setup.md):
+                 sudo cp fractalsql.dylib \\
+                     /opt/homebrew/opt/mariadb/lib/plugin/fractalsql.so
+                 sudo cp fractalsql-reasoning-http.so \\
+                     /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so
+
+          3. Clear Gatekeeper quarantine:
+                 sudo xattr -d com.apple.quarantine \\
+                     /opt/homebrew/opt/mariadb/lib/plugin/fractalsql.so \\
+                     /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so \\
+                     fractalsqld
+
+          4. Install the daemon and give it a config (socket_path,
+             hmac_key_file, allowed_uids -- see service/README.md):
+                 sudo install -d /usr/local/libexec/fractalsql /etc/fractalsql
+                 sudo install -m 0755 fractalsqld /usr/local/libexec/fractalsql/fractalsqld
+                 openssl rand -hex 32 | sudo tee /etc/fractalsql/hmac.key >/dev/null
+                 # then write /etc/fractalsql/fractalsqld.conf and
+                 # fractalsql.conf -- install.sh does this for you.
+
+          5. Install and load the LaunchAgent:
+                 install -m 0644 com.fractalsqlabs.fractalsqld.plist \\
+                     ~/Library/LaunchAgents/
+                 launchctl load -w ~/Library/LaunchAgents/com.fractalsqlabs.fractalsqld.plist
+
+          6. Register the UDFs and agent procedures (the database is
+             needed because the scripts also CREATE PROCEDURE), then
+             verify:
+                 mariadb -uroot -p mydb < install_udf.sql
+                 mariadb -uroot -p mydb < install_agents.sql
+                 mariadb -uroot -p -e "SELECT fractal_edition(), fractal_version();"
+          EOF
+          ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
+          rm -rf "${STAGE}"
+          ls -l "${DIST_DIR}/${ZIP_NAME}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: fractalsql-mariadb-${{ matrix.platform_tag }}
+          path: dist/packages/fractalsql-mariadb-${{ matrix.platform_tag }}.zip
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: dist/packages/fractalsql-mariadb-${{ matrix.platform_tag }}.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
+  # Windows: fractalsql.dll + FractalSQL-MariaDB-<MAJOR>-<VER>-x64.msi
+  #
+  # Matrix: x64 only.
+  #   x86   : MariaDB Foundation stopped publishing 32-bit Windows
+  #           server binaries after 10.4, so there's no host server
+  #           for a 32-bit UDF DLL on the current LTS majors.
+  #   arm64 : MariaDB does not yet ship Windows ARM64 server binaries
+  #           in an extractable .zip form. The current distribution
+  #           is MSI-only for any ARM64 coverage, which would require
+  #           7-Zip silent extraction to harvest include\mysql\*.h.
+  #           This cell is deliberately deferred rather than shipped
+  #           half-implemented.
+  #   x64   : full coverage for 10.6 / 10.11 / 11.4 LTS and 12.3
+  #           LTS via the official archive.mariadb.org
+  #           mariadb-<VER>-winx64.zip publishes.
+  #
+  # The minor versions pinned below (10.6.20 etc.) are current as of
+  # the first tagged release; bump MARIADB_VER when rolling forward.
+  # If a pin goes stale (archive.mariadb.org 404s), CI fails at the
+  # download step.
+  # ------------------------------------------------------------------
+  build-windows-msi:
+    permissions:
+      contents: write  # action-gh-release upload
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mariadb_major: "10.6"
+            mariadb_ver:   "10.6.20"
+            arch: x64
+            runner: windows-latest
+          - mariadb_major: "10.11"
+            mariadb_ver:   "10.11.10"
+            arch: x64
+            runner: windows-latest
+          - mariadb_major: "11.4"
+            mariadb_ver:   "11.4.4"
+            arch: x64
+            runner: windows-latest
+          - mariadb_major: "12.3"
+            mariadb_ver:   "12.3.3"
+            arch: x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    name: windows mdb${{ matrix.mariadb_major }} / ${{ matrix.arch }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Install WiX Toolset (provides candle.exe + light.exe)
+        shell: pwsh
+        run: |
+          choco install -y --no-progress wixtoolset
+
+          # On the x64 runner, choco shims candle/light into
+          # C:\ProgramData\chocolatey\bin automatically. Still, locate
+          # the real bin and append it to $GITHUB_PATH to cover
+          # chocolatey shim drift and future ARM64 runners.
+          $wixBin = $null
+          $candidates = @(
+            "C:\Program Files (x86)\WiX Toolset v3.14\bin",
+            "C:\Program Files\WiX Toolset v3.14\bin",
+            "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "candle.exe")) { $wixBin = $c; break }
+          }
+          if (-not $wixBin) {
+            Write-Host "Searching under Program Files for candle.exe..."
+            $hit = Get-ChildItem -Path "C:\Program Files (x86)", "C:\Program Files" `
+                     -Recurse -Filter "candle.exe" -ErrorAction SilentlyContinue `
+                   | Select-Object -First 1
+            if ($hit) { $wixBin = $hit.DirectoryName }
+          }
+          if (-not $wixBin) {
+            Write-Host "FATAL: candle.exe not found after choco install wixtoolset"
+            exit 1
+          }
+          Write-Host "WiX bin dir: $wixBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+
+      - name: Download + unpack MariaDB ${{ matrix.mariadb_ver }} ${{ matrix.arch }} binaries
+        shell: pwsh
+        env:
+          MARIADB_VER: ${{ matrix.mariadb_ver }}
+          MARIADB_ARCH: ${{ matrix.arch }}
+        run: |
+          # archive.mariadb.org hosts per-version winx64 zips that
+          # contain a full mariadb-<VER>-winx64\ tree including
+          # include\mysql\ with the UDF headers. UDFs do not need a
+          # server import lib: the server loads the DLL and calls the
+          # exported entry points by name.
+          $zipName = "mariadb-${env:MARIADB_VER}-win${env:MARIADB_ARCH}.zip"
+          $url     = "https://archive.mariadb.org/mariadb-${env:MARIADB_VER}/winx64-packages/$zipName"
+          Write-Host "Fetching $url"
+          New-Item -ItemType Directory -Force -Path deps\mariadb | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "deps\mariadb\mariadb.zip" -UseBasicParsing
+          Expand-Archive -Path "deps\mariadb\mariadb.zip" -DestinationPath "deps\mariadb" -Force
+
+          $unpacked = "deps\mariadb\mariadb-${env:MARIADB_VER}-win${env:MARIADB_ARCH}"
+          if (Test-Path $unpacked) {
+            Rename-Item -Path $unpacked -NewName "root"
+          } else {
+            Write-Host "FATAL: expected $unpacked inside $zipName"
+            Get-ChildItem deps\mariadb -Recurse -Depth 2 | Format-Table
+            exit 1
+          }
+          if (-not (Test-Path "deps\mariadb\root\include\mysql\mysql.h")) {
+            Write-Host "FATAL: include\mysql\mysql.h missing from unpacked tree"
+            exit 1
+          }
+
+      - name: Build fractalsql.dll (/MT static CRT, /GL WPO, MariaDB ${{ matrix.mariadb_major }})
+        shell: cmd
+        env:
+          MARIADB_MAJOR: ${{ matrix.mariadb_major }}
+          # Newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # (and VCPKG_INSTALLATION_ROOT) pointing at it -- an install
+          # tree that has no OpenSSL and that build.bat would then
+          # resolve OPENSSL_DIR against. Pin VCPKG_ROOT to the
+          # pre-installed C:\vcpkg the install below actually populates.
+          VCPKG_ROOT: 'C:\vcpkg'
+        run: |
+          set MARIADB_DIR=%CD%\deps\mariadb\root
+          set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%
+          if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          REM OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+          REM check, not vendored in the core drop. Same vcpkg tool and
+          REM install path fractalsql-reasoning-http's own Windows build
+          REM already uses for libcurl (pre-installed on this runner image).
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+          call scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          dir "%OUT_DIR%\fractalsql.dll"
+
+      - name: Smoke-check fractalsql.dll dependencies (dumpbin)
+        shell: pwsh
+        env:
+          MARIADB_MAJOR: ${{ matrix.mariadb_major }}
+        run: |
+          $dll = "dist\windows\mdb${env:MARIADB_MAJOR}\fractalsql.dll"
+          $deps = dumpbin /dependents $dll
+          Write-Host ($deps -join "`n")
+          if ($deps -match 'vcruntime|msvcp140|msvcr\d') {
+              Write-Host '==> FAIL: .dll depends on MSVC redistributable DLLs'
+              exit 1
+          }
+          if ($deps -match 'lua51\.dll|libluajit') {
+              Write-Host '==> FAIL: .dll depends on LuaJIT (pure-C vendored core migration regressed)'
+              exit 1
+          }
+          Write-Host '==> OK: static CRT, no LuaJIT dependency'
+
+      - name: Verify UDF entry points exported (dumpbin /exports)
+        shell: pwsh
+        env:
+          MARIADB_MAJOR: ${{ matrix.mariadb_major }}
+        run: |
+          $dll = "dist\windows\mdb${env:MARIADB_MAJOR}\fractalsql.dll"
+          $exports = dumpbin /exports $dll
+          Write-Host ($exports -join "`n")
+          # Covers every UDF currently in sql/install_udf.sql. Extend
+          # this list whenever sql/install_udf.sql adds a new
+          # CREATE FUNCTION entry; matches the macOS posture check's
+          # list above.
+          foreach ($sym in @(
+                'fractal_search','fractal_search_init','fractal_search_deinit',
+                'fractal_search_explore','fractal_search_explore_init','fractal_search_explore_deinit',
+                'fractal_edition','fractal_edition_init','fractal_edition_deinit',
+                'fractal_version','fractal_version_init','fractal_version_deinit',
+                'fractal_dimension_dfa','fractal_dimension_dfa_init','fractal_dimension_dfa_deinit',
+                'fractal_dimension_boxcount','fractal_dimension_boxcount_init','fractal_dimension_boxcount_deinit',
+                'fractal_dimension_drift','fractal_dimension_drift_init','fractal_dimension_drift_deinit',
+                'fractal_optimize_portfolio','fractal_optimize_portfolio_init','fractal_optimize_portfolio_deinit',
+                'fractal_vascular_network','fractal_vascular_network_init','fractal_vascular_network_deinit',
+                'fractal_cortical_folding','fractal_cortical_folding_init','fractal_cortical_folding_deinit',
+                'fractal_nerve_plexus_metric','fractal_nerve_plexus_metric_init','fractal_nerve_plexus_metric_deinit',
+                'fractal_morphological_complexity','fractal_morphological_complexity_init','fractal_morphological_complexity_deinit',
+                'fractal_diversify_enable','fractal_diversify_enable_init','fractal_diversify_enable_deinit',
+                'fractal_diversify_disable','fractal_diversify_disable_init','fractal_diversify_disable_deinit',
+                'fractal_diversify_set_params','fractal_diversify_set_params_init','fractal_diversify_set_params_deinit',
+                'fractal_detect_collapse','fractal_detect_collapse_init','fractal_detect_collapse_deinit',
+                'fractal_explain_result','fractal_explain_result_init','fractal_explain_result_deinit',
+                'fractal_session_close','fractal_session_close_init','fractal_session_close_deinit',
+                'fractal_vector_dims','fractal_vector_dims_init','fractal_vector_dims_deinit',
+                'fractal_vector_norm','fractal_vector_norm_init','fractal_vector_norm_deinit',
+                'fractal_vector_normalize','fractal_vector_normalize_init','fractal_vector_normalize_deinit',
+                'fractal_vector_add','fractal_vector_add_init','fractal_vector_add_deinit',
+                'fractal_vector_sub','fractal_vector_sub_init','fractal_vector_sub_deinit',
+                'fractal_vector_scale','fractal_vector_scale_init','fractal_vector_scale_deinit',
+                'fractal_vector_l2_distance','fractal_vector_l2_distance_init','fractal_vector_l2_distance_deinit',
+                'fractal_vector_l2_squared','fractal_vector_l2_squared_init','fractal_vector_l2_squared_deinit',
+                'fractal_vector_cosine_distance','fractal_vector_cosine_distance_init','fractal_vector_cosine_distance_deinit',
+                'fractal_vector_cosine_similarity','fractal_vector_cosine_similarity_init','fractal_vector_cosine_similarity_deinit',
+                'fractal_vector_negative_inner_product','fractal_vector_negative_inner_product_init','fractal_vector_negative_inner_product_deinit',
+                'fractal_vector_from_float8_array','fractal_vector_from_float8_array_init','fractal_vector_from_float8_array_deinit',
+                'fractal_vector_to_float8_array','fractal_vector_to_float8_array_init','fractal_vector_to_float8_array_deinit',
+                'fractal_reason','fractal_reason_init','fractal_reason_deinit',
+                'fractal_embed','fractal_embed_init','fractal_embed_deinit')) {
+              if (-not ($exports -match "\b$sym\b")) {
+                  Write-Host "==> FAIL: $sym missing from export table"
+                  exit 1
+              }
+          }
+          Write-Host '==> OK: all UDF entry points exported'
+
+      - name: Build MSI (candle + light, MariaDB ${{ matrix.mariadb_major }} / ${{ matrix.arch }})
+        shell: cmd
+        env:
+          MARIADB_MAJOR: ${{ matrix.mariadb_major }}
+          MSI_ARCH:      ${{ matrix.arch }}
+        run: |
+          call scripts\windows\build-msi.bat
+          if errorlevel 1 exit /b 1
+          dir dist\windows\*.msi
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: fractalsql-mariadb-windows-mdb${{ matrix.mariadb_major }}-${{ matrix.arch }}
+          path: dist/windows/FractalSQL-MariaDB-${{ matrix.mariadb_major }}-*-${{ matrix.arch }}.msi
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: dist/windows/FractalSQL-MariaDB-${{ matrix.mariadb_major }}-*-${{ matrix.arch }}.msi
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # easy_install.ps1 is MariaDB-major-independent (it detects installs at
+      # runtime), so stamp and upload it from one matrix cell only, not once
+      # per (major, arch) cell, to avoid racing uploads of the same asset.
+      - name: Stamp version into easy_install.ps1
+        if: matrix.mariadb_major == '10.6'
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $ver = "${{ github.ref_name }}".Substring(1)
+          } else {
+            $m = Select-String -Path src\fractalsql.c -Pattern '^#define FSQL_VERSION "(.*)"$' | Select-Object -First 1
+            $ver = $m.Matches[0].Groups[1].Value
+          }
+          New-Item -ItemType Directory -Force -Path dist\windows | Out-Null
+          (Get-Content scripts\windows\easy_install.ps1 -Raw) -replace '@@FSQL_VERSION@@', $ver | Set-Content -Path dist\windows\easy_install.ps1 -Encoding utf8
+
+      - name: Upload easy_install.ps1 to Release
+        if: matrix.mariadb_major == '10.6' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: dist/windows/easy_install.ps1
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,12 @@
+FractalSQL for MariaDB
+Copyright 2026 Daniel Gardiner d/b/a FractalSQLabs
+
+This product includes software developed by the OpenSSL Project for
+use in the OpenSSL Toolkit (https://www.openssl.org/), linked into
+fractalsqld (the daemon) for enterprise-library signature verification.
+The shim (fractalsql.so / .dll) contains no OpenSSL code.
+
+Copyright (c) The OpenSSL Project Authors. All rights reserved.
+
+Licensed under the Apache License, Version 2.0. A copy of the License
+is included in this distribution as LICENSES/Apache-2.0.txt.

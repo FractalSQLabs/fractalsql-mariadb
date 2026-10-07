@@ -1,0 +1,50 @@
+Source: fractalsql-mariadb
+Section: database
+Priority: optional
+Maintainer: FractalSQLabs
+Build-Depends:
+ debhelper-compat (= 13),
+ libmariadb-dev,
+ pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/FractalSQLabs/fractalsql-mariadb
+
+# Reference-only control file: scripts/package.sh (fpm-based) is the
+# actual build/package path used by CI (release.yml, install-test.yml)
+# and documented in scripts/package.sh's own header -- it emits a
+# single generic fractalsql-mariadb_<version>_<arch>.deb, not a
+# per-major package, since the UDF ABI is stable across MariaDB
+# 10.6/10.11/11.4 LTS/12.3 LTS. There is no debian/rules or
+# debian/*.install here, so this file alone does not build a package;
+# it exists so the dependency/description metadata for a future native
+# dpkg-buildpackage flow doesn't drift from what fpm actually ships
+# (both fractalsql.so, the GPL-2.0-only shim, and fractalsqld, the
+# Apache-2.0 daemon -- never just the shim, since nothing would run the
+# UDF bodies the shim forwards calls to). See debian-copyright
+# (one level up) for the per-file license breakdown.
+Package: fractalsql-mariadb
+Architecture: amd64 arm64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libc6 (>= 2.34),
+ libcurl4,
+ libssl3,
+ mariadb-server
+Description: Stochastic Fractal Search UDF for MariaDB, plus its daemon
+ fractalsql-mariadb registers the fractal_search() UDF, a Stochastic
+ Fractal Search optimizer that returns JSON top-k matches for a query
+ vector against an inline corpus, plus the full Discovery/Vector/
+ Cognition/Text-to-SQL/Agency/Enterprise-activation tier surface (see
+ docs/features.md). Pure-C vendored core, no LuaJIT runtime
+ dependency. Compatible with MariaDB 10.6 / 10.11 / 11.4 LTS / 12.3
+ LTS -- the UDF ABI has been stable across these majors.
+ .
+ mariadbd loads only a thin shim (fractalsql.so); every UDF body runs
+ in the separate fractalsqld daemon this package also installs and
+ runs via systemd (fractalsqld.service). The bundled
+ fractalsql-reasoning-http.so plugin (Cognition/Text-to-SQL/
+ Vectorizer/Agency tiers), loaded by the daemon, dynamically links
+ libcurl at runtime, hence the libcurl4 dependency above. libssl3 is
+ for the daemon's enterprise-library signature check; the shim links
+ no OpenSSL.

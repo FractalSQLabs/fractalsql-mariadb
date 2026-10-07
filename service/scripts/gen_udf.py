@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+#
+# Generates the per-function tables for the service build from
+# protocol/functions.def, cross-checked against sql/install_udf.sql and the
+# adapter sources in src/. Functions are identified on the wire by name (FSQ
+# protocol v2), not by opcode, so this registry carries no opcode numbers.
+# Output goes to the build directory.
+#
+#   shim_udfs.h    FSQ_UDF_<KIND>(sql, cls) lines for the shim (GPL), where
+#                  cls is functions.def's retry class (r/s/e -- see that file).
+#   daemon_udfs.h  prototypes and the dispatch table for the daemon (Apache-2.0).
+#   fsqlctl_functions.h  the CLI's callable-name table (Apache-2.0; one plain
+#                  string per function, so no kind/cls columns and no source-
+#                  form pairing beyond the same cross-check). Also emitted here
+#                  so the Windows build (build.bat) can produce fsqlctl.exe
+#                  without a POSIX shell.
+#
+# Calling forms (verified against src/ at generation time):
+#   STR   char *f(UDF_INIT*, UDF_ARGS*, char *result, unsigned long *length,
+#                 char *is_null, char *error)
+#   INT   long long f(UDF_INIT*, UDF_ARGS*, char *is_null, char *error)
+#   REAL  double f(UDF_INIT*, UDF_ARGS*, char *is_null, char *error)
+import glob
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SERVICE = os.path.dirname(HERE)
+REPO = os.path.dirname(SERVICE)
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SERVICE, "build", "gen")
+
+SQL_RET = {"STR": {"STRING", "VARCHAR"}, "INT": {"INTEGER"}, "REAL": {"REAL"}}
+FORM_PARAMS = {"STR": 4, "INT": 2, "REAL": 2}
+RET_CTYPE = {"STR": "char *", "INT": "long long", "REAL": "double"}
+
+
+def read_registry():
+    rows = []
+    seen = set()
+    text = open(os.path.join(SERVICE, "protocol", "functions.def")).read()
+    for m in re.finditer(r"^X\((\w+),\s*(\w+),\s*([rse])\)$", text, re.M):
+        sql, kind, cls = m.groups()
+        if sql in seen:
+            sys.exit(f"gen_udf: duplicate sql name {sql} in functions.def")
+        seen.add(sql)
+        rows.append((sql, kind, cls))
+    return rows
+
+
+def read_sql_returns():
+    text = open(os.path.join(REPO, "sql", "install_udf.sql")).read()
+    text = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("--"))
+    ret = {}
+    for stmt in text.split(";"):
+        m = re.search(r"CREATE\s+FUNCTION\s+(\w+)", stmt)
+        r = re.search(r"RETURNS\s+([A-Z]+)", stmt)
+        if m and r:
+            ret[m.group(1)] = r.group(1)
+    return ret
+
+
+def source_forms():
+    """Parameter count after (UDF_INIT, UDF_ARGS) for each main function.
+
+    Direct definitions are read from the text. Macro-generated definitions are
+    read from the invocation list, using the form each macro expands to.
+    """
+    srcs = {f: open(f).read() for f in glob.glob(os.path.join(REPO, "src", "*.c"))}
+    forms = {}
+    for text in srcs.values():
+        for m in re.finditer(r"\b(\w+)\s*\(\s*UDF_INIT\s*\*\s*initid\s*,\s*UDF_ARGS\s*\*\s*args\s*,([^)]*)\)", text):
+            name = m.group(1)
+            if name.endswith("_init") or name.endswith("_deinit"):
+                continue
+            forms.setdefault(name, set()).add(m.group(2).count(",") + 1)
+    macro_forms = {
+        "FRACTAL_VECTOR_BINOP": 4,
+        "FRACTAL_VECTOR_CANONICALIZE": 4,
+        "FRACTAL_VECTOR_DISTANCE": 2,
+        "ENT_LEDGER_VOID_UDF": 2,
+        "ENT_LEDGER_COUNT_UDF": 2,
+    }
+    for text in srcs.values():
+        for mac, params in macro_forms.items():
+            for m in re.finditer(r"^" + mac + r"\(\s*(\w+)", text, re.M):
+                forms.setdefault(m.group(1), set()).add(params)
+    return forms
+
+
+def main():
+    fn_rows = read_registry()
+    rets = read_sql_returns()
+    forms = source_forms()
+    errors = []
+
+    for sql, kind, cls in fn_rows:
+        if sql not in rets:
+            errors.append(f"{sql}: not a CREATE FUNCTION in install_udf.sql")
+            continue
+        if rets[sql] not in SQL_RET[kind]:
+            errors.append(f"{sql}: registry kind {kind} but SQL RETURNS {rets[sql]}")
+        got = forms.get(sql)
+        if not got or len(got) != 1:
+            errors.append(f"{sql}: source form not found or ambiguous ({got})")
+        elif next(iter(got)) != FORM_PARAMS[kind]:
+            errors.append(f"{sql}: kind {kind} needs {FORM_PARAMS[kind]} params, source has {next(iter(got))}")
+    sqls = [r[0] for r in fn_rows]
+    if errors:
+        for e in errors:
+            print("gen_udf: " + e, file=sys.stderr)
+        return 1
+
+    os.makedirs(OUT, exist_ok=True)
+    # The shim table carries the retry class (functions.def's cls column);
+    # the daemon's table doesn't need it (retries are resolved shim-side).
+    with open(os.path.join(OUT, "shim_udfs.h"), "w") as f:
+        f.write("/* Generated by scripts/gen_udf.py from protocol/functions.def. Do not edit. */\n")
+        for sql, kind, cls in fn_rows:
+            f.write(f"FSQ_UDF_{kind}({sql}, '{cls}')\n")
+
+    with open(os.path.join(OUT, "daemon_udfs.h"), "w") as f:
+        f.write("/* Generated by scripts/gen_udf.py from protocol/functions.def. Do not edit. */\n")
+        for sql, kind, cls in fn_rows:
+            ctype = RET_CTYPE[kind]
+            if kind == "STR":
+                main_sig = "UDF_ARGS *, char *, unsigned long *, char *, char *"
+            else:
+                main_sig = f"UDF_ARGS *, char *, char *"
+            f.write(f"extern {ctype} {sql}(UDF_INIT *, {main_sig});\n")
+            f.write(f"extern bool {sql}_init(UDF_INIT *, UDF_ARGS *, char *);\n")
+            f.write(f"extern void {sql}_deinit(UDF_INIT *);\n")
+        f.write("\nstatic const struct fsq_fn g_fn_table[] = {\n")
+        for sql, kind, cls in fn_rows:
+            f.write(f"    {{ \"{sql}\", FSQ_KIND_{kind}, (void *) {sql}_init, "
+                    f"(void *) {sql}_deinit, (void *) {sql} }},\n")
+        f.write("};\n")
+
+    with open(os.path.join(OUT, "fsqlctl_functions.h"), "w") as f:
+        f.write("/* Generated by scripts/gen_udf.py from protocol/functions.def. Do not edit. */\n")
+        f.write("static const char *const fsqlctl_fns[] = {")
+        for sql, _kind, _cls in fn_rows:
+            f.write(f' "{sql}",')
+        f.write(" };\n")
+    print(f"gen_udf: {len(fn_rows)} functions -> {OUT}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

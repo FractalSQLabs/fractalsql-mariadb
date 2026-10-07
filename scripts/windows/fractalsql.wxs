@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  scripts/windows/fractalsql.wxs: WiX Toolset source for the
+  FractalSQL MariaDB UDF Windows MSI.
+
+  Driven by four preprocessor vars supplied by build-msi.bat:
+    -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.3 (dotted, for display)
+    -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_3 (sanitized, for WiX IDs)
+    -dSTAGE_DIR=dist\windows\staging-mdb...
+    -dMSI_VERSION=2.0.9
+  plus the standard candle -arch x64|arm64, which populates
+  $(sys.BUILDARCH) and selects the Package Platform attribute.
+
+  UX flow
+    1. Welcome / EULA. WixUI_InstallDir's LicenseAgreementDlg is
+       populated exclusively by the WixUILicenseRtf WixVariable below;
+       without it the WixUIExtension silently falls back to its own
+       bundled placeholder (lorem ipsum), so this must point at the
+       plain Apache 2.0 text (converted to RTF) shown in the dialog.
+    2. WixUI_InstallDir lets the user pick the MariaDB install root
+       (default: C:\Program Files\MariaDB X.Y). This must be the
+       folder that MariaDB's own MSI server installer created, i.e.
+       the folder containing lib\plugin\.
+    3. Install copies fractalsql.dll into lib\plugin\, and the
+       install SQL plus LICENSE files into share\doc\fractalsql-mariadb\.
+    4. Uninstall removes every file cleanly.
+
+  Per-MariaDB-major UpgradeCode
+    Each MariaDB major gets its own UpgradeCode so installing the
+    10.6 and 11.4 MSIs side-by-side does not trigger MajorUpgrade on
+    either. ProductId=* forces a fresh ProductCode per build, so
+    re-installing the same MSI overwrites cleanly.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <?if $(var.MARIADB_MAJOR_HEX) = "0A06" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB001" ?>
+  <?elseif $(var.MARIADB_MAJOR_HEX) = "0A11" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB002" ?>
+  <?elseif $(var.MARIADB_MAJOR_HEX) = "0B04" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB003" ?>
+  <?elseif $(var.MARIADB_MAJOR_HEX) = "0C03" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB005" ?>
+  <?else ?>
+      <?error Unsupported MARIADB_MAJOR_HEX: $(var.MARIADB_MAJOR_HEX) ?>
+  <?endif ?>
+
+  <Product Id="*"
+           Name="FractalSQL for MariaDB $(var.MARIADB_MAJOR)"
+           Language="1033"
+           Version="$(var.MSI_VERSION)"
+           Manufacturer="FractalSQLabs"
+           UpgradeCode="$(var.UpgradeCode)">
+
+    <Package InstallerVersion="300"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="$(sys.BUILDARCH)"
+             Description="FractalSQL MariaDB $(var.MARIADB_MAJOR) UDF installer"
+             Manufacturer="FractalSQLabs" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of FractalSQL for MariaDB $(var.MARIADB_MAJOR) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- EULA dialog text. Resolved relative to the directory light
+         runs from (repo root, per build-msi.bat's pushd), and kept in
+         sync with the LICENSE file also shipped into share\doc\. -->
+    <WixVariable Id="WixUILicenseRtf" Value="scripts\windows\License.rtf" />
+
+    <!-- WixUI_InstallDir targets the MariaDB-install-root folder. The
+         power-user override for a non-default MariaDB root (e.g.
+         D:\MariaDB\11.4) retargets the whole tree: fractalsql.dll
+         still lands under lib\plugin\ of that chosen root. PLUGINDIR
+         is exposed separately for scripted installs that want to
+         point the DLL at an even more unusual location. -->
+    <Property Id="WIXUI_INSTALLDIR" Value="MARIADBROOT" />
+
+    <!-- MariaDB does not publish a 32-bit Windows build on the
+         current LTS majors (10.6+), so there's no host server for a
+         win32 x86 MSI. arm64 is likewise deferred until MariaDB
+         Foundation publishes an extractable Windows ARM64 build. -->
+    <?if $(sys.BUILDARCH) = "x86" ?>
+        <?error MariaDB UDFs are not shipped for win32 x86 (no MariaDB host binary). ?>
+    <?endif ?>
+
+    <!--
+         Directory layout mirrors the MariaDB Windows default install:
+           C:\Program Files\MariaDB X.Y\
+             lib\
+               plugin\              fractalsql.dll
+             share\
+               doc\
+                 fractalsql-mariadb\ LICENSE
+                                     LICENSE-THIRD-PARTY
+                                     install_udf.sql
+                                     README.txt
+    -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="MARIADBROOT" Name="MariaDB $(var.MARIADB_MAJOR)">
+          <Directory Id="LibDir" Name="lib">
+            <Directory Id="PLUGINDIR" Name="plugin" />
+          </Directory>
+          <Directory Id="FractalSqldDir" Name="fractalsqld" />
+          <Directory Id="ShareDir" Name="share">
+            <Directory Id="DocDir" Name="doc">
+              <Directory Id="FractalSqlDocDir" Name="fractalsql-mariadb" />
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- Each file is its own Component so uninstall removes exactly
+         the set we installed: no orphan files, no touching existing
+         MariaDB files. GUIDs embed MARIADB_MAJOR_TAG so each
+         (major, file) pair is deterministic across rebuilds without
+         colliding across majors. -->
+
+    <ComponentGroup Id="CoreFiles">
+
+      <Component Id="c_FractalSqlDll"
+                 Directory="PLUGINDIR"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)001-0000-4000-B000-00000000DA01">
+        <File Id="fractalsql.dll"
+              Source="$(var.STAGE_DIR)\fractalsql.dll"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_FractalSqldExe"
+                 Directory="FractalSqldDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)006-0000-4000-B000-00000000DA02">
+        <File Id="fractalsqld.exe"
+              Source="$(var.STAGE_DIR)\fractalsqld.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_FractalSqldLicense"
+                 Directory="FractalSqldDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)007-0000-4000-B000-00000000DA03">
+        <File Id="fractalsqld_LICENSE"
+              Name="LICENSE"
+              Source="$(var.STAGE_DIR)\fractalsqld-LICENSE"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_FractalSqldServicePs1"
+                 Directory="FractalSqldDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)009-0000-4000-B000-00000000DA05">
+        <File Id="fractalsqld_service.ps1"
+              Name="fractalsqld-service.ps1"
+              Source="$(var.STAGE_DIR)\fractalsqld-service.ps1"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_ProvisionFractalsqldPs1"
+                 Directory="FractalSqldDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)00A-0000-4000-B000-00000000DA06">
+        <File Id="provision_fractalsqld.ps1"
+              Name="provision-fractalsqld.ps1"
+              Source="$(var.STAGE_DIR)\provision-fractalsqld.ps1"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_InstallUdfSql"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)002-0000-4000-B000-000000005510">
+        <File Id="install_udf.sql"
+              Source="$(var.STAGE_DIR)\install_udf.sql"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_License"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)003-0000-4000-B000-0000000011CE">
+        <File Id="LICENSE.txt"
+              Name="LICENSE"
+              Source="$(var.STAGE_DIR)\LICENSE"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_SourceOffer"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)008-0000-4000-B000-00000000DA04">
+        <File Id="GPL_SOURCE_OFFER.txt"
+              Name="GPL-SOURCE-OFFER.txt"
+              Source="$(var.STAGE_DIR)\GPL-SOURCE-OFFER.txt"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_LicenseThirdParty"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)004-0000-4000-B000-00000003DA7A">
+        <File Id="LICENSE_THIRD_PARTY.txt"
+              Name="LICENSE-THIRD-PARTY"
+              Source="$(var.STAGE_DIR)\LICENSE-THIRD-PARTY"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_Readme"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)005-0000-4000-B000-00000000AD11">
+        <File Id="README.txt"
+              Source="$(var.STAGE_DIR)\README.txt"
+              KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+
+    <Feature Id="MainFeature"
+             Title="FractalSQL for MariaDB $(var.MARIADB_MAJOR)"
+             Level="1"
+             Display="expand"
+             AllowAdvertise="no">
+      <ComponentGroupRef Id="CoreFiles" />
+    </Feature>
+
+    <!-- Daemon provisioning: generates the shared HMAC key, writes
+         fractalsqld.conf/fractalsql.conf, and registers and starts
+         the fractalsqld service: the Windows equivalent of what
+         packaging/scripts/postinst.sh does for the .deb/.rpm packages.
+         Without this, the MSI only ever drops files; see
+         provision-fractalsqld.ps1's own header comment for the full
+         rationale, and build-msi.bat's generated README.txt for the
+         manual fallback if this can't finish the job (most commonly:
+         MariaDB's own service wasn't running yet during this install).
+
+         powershell.exe, not pwsh: this runs on an arbitrary customer
+         machine, where only Windows PowerShell 5.1 is guaranteed to
+         exist. Impersonate="no" runs it as the installer's own
+         LocalSystem context (required: it registers a Windows
+         service and writes files under C:\ProgramData), and
+         Return="ignore" means a failure here (most commonly: MariaDB
+         isn't installed/running yet) never fails the whole product
+         install: every file is already placed correctly either way,
+         and the script's own best-effort design (see its header
+         comment) already turns a failure into printed guidance
+         rather than a fatal error.
+
+         Uninstall mirrors postrm.sh: stop and remove the service
+         registration (not the config/key under C:\ProgramData, so a
+         reinstall doesn't need to regenerate the shared secret), run
+         while fractalsqld-service.ps1 still exists on disk, i.e.
+         scheduled before RemoveFiles. -->
+    <CustomAction Id="ProvisionFractalsqld"
+                  ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[FractalSqldDir]provision-fractalsqld.ps1&quot; -FractalsqldExe &quot;[FractalSqldDir]fractalsqld.exe&quot; -MariaDbMajor &quot;$(var.MARIADB_MAJOR)&quot;"
+                  Directory="FractalSqldDir"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <CustomAction Id="UnprovisionFractalsqld"
+                  ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[FractalSqldDir]fractalsqld-service.ps1&quot; -Action uninstall"
+                  Directory="FractalSqldDir"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="ProvisionFractalsqld" After="InstallFiles">NOT (REMOVE="ALL")</Custom>
+      <Custom Action="UnprovisionFractalsqld" Before="RemoveFiles">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+
+    <!-- Standard WixUI_InstallDir flow (Welcome -> EULA -> FolderDlg ->
+         Ready -> Progress). Folder picker lets power-users retarget a
+         non-default MariaDB install root. -->
+    <UIRef Id="WixUI_InstallDir" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
+  </Product>
+</Wix>

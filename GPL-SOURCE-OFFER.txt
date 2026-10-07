@@ -1,0 +1,27 @@
+Source offer for fractalsql.dll (GPL-2.0-only)
+
+The file fractalsql.dll (and fractalsql.so on Linux) is the FractalSQL shim.
+It is licensed under the GNU General Public License, version 2 only. The
+license text is the LICENSE file beside it.
+
+Corresponding source for the shim, for version 2.0.9:
+
+  Repository: https://github.com/FractalSQLabs/fractalsql-mariadb
+  Tag:        v2.0.9
+
+The shim's source is in service/shim/. Building it also needs the files in
+service/common/fsq_sha256.h, service/protocol/, and service/scripts/gen_udf.py
+(the generator writes the shim's function table). Those files are in the same
+repository, and the offer covers all of them.
+
+Written offer (GPL-2.0 section 3(b)):
+
+For at least three years from the date you received this package, FractalSQLabs
+will give any third party, for a charge no more than the cost of physically
+performing source distribution, a complete machine-readable copy of the
+corresponding source code described above. To request it, write to:
+
+  info@fractalsqlabs.com
+
+This offer is not a substitute for the repository. If the repository is
+available to you, you can use it directly.

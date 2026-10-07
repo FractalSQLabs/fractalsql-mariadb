@@ -1,0 +1,35 @@
+/* SPDX-License-Identifier: MIT */
+/* SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+ *
+ * Control opcode registry for FSQ protocol v2. X(name, code) per row.
+ * Functions are called by name, not by opcode -- see UDF_INIT and UDF_CALL
+ * in SPEC.md, and the function registry in functions.def. Opcodes are never
+ * reused.
+ */
+
+X(PING, 0x0001)
+X(VERSION, 0x0002)
+/* Lifecycle. The target function's name travels in the payload. */
+X(UDF_INIT, 0x0010)
+X(UDF_CALL, 0x0011)
+X(UDF_DEINIT, 0x0012)
+/* Admin-triggered cancel: payload is the handle_id (u64) to cancel. Unlike
+ * UDF_CALL/UDF_DEINIT, this is not restricted to the handle's owning
+ * connection -- it's meant to be sent from a separate connection (fsqlctl),
+ * since the owning connection's thread is the one blocked inside the call
+ * being cancelled. Two effects, both cooperative:
+ *   - between calls: marks the handle so its *next* UDF_CALL fails with
+ *     ERR_BUSY instead of running (never cached; one-shot per CANCEL);
+ *   - mid-call: the daemon's in-repo computation loops (parsers, per-element
+ *     UDF bodies) poll the same flag at row/element boundaries and abort
+ *     with ERR_BUSY too. It does NOT abort work inside the vendored core
+ *     archive, and a CANCEL arriving after that call finished does nothing
+ *     (one-shot). See SPEC.md's cancel section. */
+X(CANCEL, 0x0013)
+/* Admin-triggered config reload (fsqlctl reload): payload is empty. The
+ * daemon re-parses its config file and swaps it atomically under live
+ * connections (allowed lists, timeouts, connection limits, log path).
+ * Changes to socket_path or hmac_key_file are refused -- those require a
+ * restart. Not the same as a key/config rotation for client-side settings
+ * the shim reads once at first call. See SPEC.md's reload section. */
+X(RELOAD, 0x0014)
