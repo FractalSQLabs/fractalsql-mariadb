@@ -92,7 +92,7 @@ queries > "$work/out.log"
 # expected row has no regex metacharacters, so a literal match is both
 # portable and simpler.
 dims_row=$(printf '3\t2\tNULL\tNULL')
-if grep -qx "2.0.9" "$work/out.log" && grep -qxF "$dims_row" "$work/out.log" && grep -q "expected 1 argument, got 0" "$work/out.log"; then ok "SQL values correct (version, dims, NULL handling, arity error)"; else bad "SQL values (see $work/out.log)"; fi
+if grep -qx "2.0.10" "$work/out.log" && grep -qxF "$dims_row" "$work/out.log" && grep -q "expected 1 argument, got 0" "$work/out.log"; then ok "SQL values correct (version, dims, NULL handling, arity error)"; else bad "SQL values (see $work/out.log)"; fi
 
 echo "== A5: kill fractalsqld, server must survive"
 kill "$daemon_pid" 2>/dev/null; wait "$daemon_pid" 2>/dev/null
@@ -103,7 +103,7 @@ mdb -e "SELECT 1;" >/dev/null 2>&1 && ok "server still answers after daemon deat
 echo "== lazy reconnect"
 start_daemon
 out=$(mdb -e "SELECT fractal_version();" 2>&1)
-case "$out" in *2.0.9*) ok "shim reconnects to a restarted daemon";; *) bad "no reconnect: $out";; esac
+case "$out" in *2.0.10*) ok "shim reconnects to a restarted daemon";; *) bad "no reconnect: $out";; esac
 
 echo "== frame-level auth"
 if "$here/build/frame_test" "$work/fsqld.sock" "$(cat "$work/hmac.key")"; then ok "frame_test: valid PING, bad tag, oversize length"; else bad "frame_test"; fi

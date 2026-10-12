@@ -144,8 +144,16 @@ jobs:
       # build_test.ps1's own Gate-01-Build (scripts\windows\build.bat
       # under the hood) does the actual compile -- this step only needs
       # to make sure vcpkg has the package installed first.
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: C:\vcpkg_cache
+          key: windows-vcpkg-openssl-static-v1
+
       - name: vcpkg install openssl:x64-windows-static
         shell: cmd
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,C:\vcpkg_cache,readwrite
         run: |
           C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
           if errorlevel 1 exit /b 1
@@ -328,8 +336,15 @@ jobs:
       # (a real MSVC /fsanitize=address compile+link into its own
       # dist\windows-asan\ tree, see that function's own comment) --
       # this step only needs vcpkg to already have OpenSSL installed.
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: C:\vcpkg_cache
+          key: windows-vcpkg-openssl-static-v1
       - name: vcpkg install openssl:x64-windows-static
         shell: cmd
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,C:\vcpkg_cache,readwrite
         run: |
           C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
           if errorlevel 1 exit /b 1
@@ -365,8 +380,15 @@ jobs:
       # windows-latest's bundled VS "C++ Clang tools for Windows"
       # component, resolved via Find-ClangCl's vswhere lookup. This step
       # only needs vcpkg to already have OpenSSL installed.
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: C:\vcpkg_cache
+          key: windows-vcpkg-openssl-static-v1
       - name: vcpkg install openssl:x64-windows-static
         shell: cmd
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,C:\vcpkg_cache,readwrite
         run: |
           C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
           if errorlevel 1 exit /b 1
@@ -400,12 +422,16 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb jq openssl@3
+          # Pinned to 11.4, not the unversioned `mariadb` formula -- that
+          # one tracks whatever Homebrew currently calls latest (now
+          # 12.3.x), which silently drifted past this job's --mdb-less
+          # default of 11.4 and broke mdb_setup's version check.
+          brew install mariadb@11.4 jq openssl@3
       - name: build_test.sh --asan
         run: |
           set -euo pipefail
           chmod +x build_test.sh
-          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --asan
+          MDB_BINDIR="$(brew --prefix mariadb@11.4)/bin" ./build_test.sh --asan
 
   darwin-ubsan:
     name: build_test.sh --ubsan (macOS)
@@ -418,12 +444,12 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb jq openssl@3
+          brew install mariadb@11.4 jq openssl@3
       - name: build_test.sh --ubsan
         run: |
           set -euo pipefail
           chmod +x build_test.sh
-          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --ubsan
+          MDB_BINDIR="$(brew --prefix mariadb@11.4)/bin" ./build_test.sh --ubsan
 
   darwin-tsan:
     # Does NOT skip the cluster gates the way darwin-asan above does --
@@ -445,12 +471,12 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb jq openssl@3
+          brew install mariadb@11.4 jq openssl@3
       - name: build_test.sh --tsan
         run: |
           set -euo pipefail
           chmod +x build_test.sh
-          MDB_BINDIR="$(brew --prefix mariadb)/bin" ./build_test.sh --tsan
+          MDB_BINDIR="$(brew --prefix mariadb@11.4)/bin" ./build_test.sh --tsan
 
   coverage:
     name: coverage (lcov)

@@ -16,7 +16,7 @@
 # run the UDF bodies the shim forwards calls to.
 
 Name:           fractalsql-mariadb
-Version:        2.0.9
+Version:        2.0.10
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 
@@ -128,6 +128,9 @@ systemctl enable --now fractalsqld.service >/dev/null 2>&1 || true
 %dir %attr(0750,fractalsql,fractalsql) %{confdir}
 
 %changelog
+* Mon Oct 12 2026 FractalSQLabs - 2.0.10-1
+- Pin darwin-asan/ubsan/tsan CI jobs to mariadb lts.
+- Add vcpkg binary caching to Windows CI jobs.
 * Tue Sep 23 2026 FractalSQLabs - 2.0.7-1
 - v2.0.7: 10 new v2.0.25-core analytics/vector primitives as UDFs
   (change-point detection, periodogram, SimHash state fingerprint,

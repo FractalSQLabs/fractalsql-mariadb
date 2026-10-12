@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
  *
- * fractalsql-mariadb v2.0.9: Stochastic Fractal Search for MariaDB (UDF).
+ * fractalsql-mariadb v2.0.10: Stochastic Fractal Search for MariaDB (UDF).
  *
  * Compatible with MariaDB 10.6, 10.11, 11.4 LTS, and 12.3 LTS.
  * The UDF ABI has been stable across these majors.
@@ -76,7 +76,7 @@
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
  * metadata's version silently drifting apart. */
-#define FSQL_VERSION "2.0.9"
+#define FSQL_VERSION "2.0.10"
 
 /* strncasecmp is POSIX (<strings.h>), not standard C. MSVC has no
  * <strings.h> at all, only the underscore-prefixed _strnicmp. Used by

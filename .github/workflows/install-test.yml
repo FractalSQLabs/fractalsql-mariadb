@@ -186,7 +186,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.9"
+          test "\$VERSION" = "2.0.10"
 
           # End-to-end fractal_search smoke. Trivial 4-row corpus, query
           # equals row 0; expect a JSON document with dim/n_corpus/top_k.
@@ -477,7 +477,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.9"
+          test "\$VERSION" = "2.0.10"
 
           RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
           echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
@@ -584,7 +584,7 @@ jobs:
           VERSION=$(mariadb -N -B -e "SELECT fractal_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
-          test "${VERSION}" = "2.0.9"
+          test "${VERSION}" = "2.0.10"
 
           RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
           echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
@@ -808,6 +808,12 @@ jobs:
           Expand-Archive -Path "deps\mariadb\mdb.zip" -DestinationPath "deps\mariadb" -Force
           Rename-Item -Path "deps\mariadb\mariadb-$env:MARIADB_VER-winx64" -NewName "root"
 
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: C:\vcpkg_cache
+          key: windows-vcpkg-openssl-static-v1
+
       - name: Build fractalsql.dll and fractalsqld.exe (scripts\windows\build.bat)
         shell: cmd
         env:
@@ -818,6 +824,7 @@ jobs:
           # OPENSSL_DIR against that empty install tree. Same pin as
           # release.yml's build-windows-msi job.
           VCPKG_ROOT: 'C:\vcpkg'
+          VCPKG_BINARY_SOURCES: clear;files,C:\vcpkg_cache,readwrite
         run: |
           set MARIADB_DIR=%CD%\deps\mariadb\root
           set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%

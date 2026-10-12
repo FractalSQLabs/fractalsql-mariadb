@@ -191,7 +191,7 @@ jobs:
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "2.0.9"
+              test "${VERSION}" = "2.0.10"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -628,7 +628,7 @@ jobs:
           cp sql/install_agents.sql "${STAGE}/install_agents.sql"
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
-          fractalsql-mariadb 2.0.9 Community (${{ matrix.platform_tag }})
+          fractalsql-mariadb 2.0.10 Community (${{ matrix.platform_tag }})
 
           Unsigned, for macOS. Compatible with MariaDB 10.6 / 10.11 /
           11.4 LTS / 12.3 LTS via Homebrew.
@@ -825,6 +825,12 @@ jobs:
             exit 1
           }
 
+      - name: Cache vcpkg binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: C:\vcpkg_cache
+          key: windows-vcpkg-openssl-static-v1
+
       - name: Build fractalsql.dll (/MT static CRT, /GL WPO, MariaDB ${{ matrix.mariadb_major }})
         shell: cmd
         env:
@@ -835,6 +841,7 @@ jobs:
           # resolve OPENSSL_DIR against. Pin VCPKG_ROOT to the
           # pre-installed C:\vcpkg the install below actually populates.
           VCPKG_ROOT: 'C:\vcpkg'
+          VCPKG_BINARY_SOURCES: clear;files,C:\vcpkg_cache,readwrite
         run: |
           set MARIADB_DIR=%CD%\deps\mariadb\root
           set OUT_DIR=%CD%\dist\windows\mdb%MARIADB_MAJOR%
