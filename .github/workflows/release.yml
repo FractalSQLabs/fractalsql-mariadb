@@ -224,7 +224,7 @@ jobs:
           rm -f "${KEY_FILE}"
 
       - name: Upload shim + daemon artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}-bin
           path: |
@@ -368,7 +368,7 @@ jobs:
           chmod +x dist/packages/easy_install.sh
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}
           path: dist/packages/*
@@ -691,7 +691,7 @@ jobs:
           ls -l "${DIST_DIR}/${ZIP_NAME}"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: fractalsql-mariadb-${{ matrix.platform_tag }}
           path: dist/packages/fractalsql-mariadb-${{ matrix.platform_tag }}.zip
@@ -938,7 +938,7 @@ jobs:
           dir dist\windows\*.msi
 
       - name: Upload MSI artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: fractalsql-mariadb-windows-mdb${{ matrix.mariadb_major }}-${{ matrix.arch }}
           path: dist/windows/FractalSQL-MariaDB-${{ matrix.mariadb_major }}-*-${{ matrix.arch }}.msi
