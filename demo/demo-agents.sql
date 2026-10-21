@@ -181,17 +181,21 @@ SELECT item_id, score
            score   DOUBLE      PATH '$.score')) AS jt;
 
 -- 9. fractal_agent_data_analyst (horizontal NL->SQL->reason). Composes
--- fractal_sql_agent (auto_execute=true) then fractal_reason. Trailing
+-- fractal_sql_agent then fractal_reason. Trailing
 -- p_context is optional extra guidance for the reasoning step, NULL
 -- is fine (same reason fractal_agent_allocate's own p_context exists,
 -- see sql/install_agents.sql Engine I).
+-- p_auto_execute is the caller's EXPLICIT opt-in to run the generated
+-- statement: TRUE for the full NL->SQL->run->reason path, FALSE to have
+-- the statement generated and validated but NOT run (the SQL still comes
+-- back in generated_sql; result_json and analysis stay null).
 DROP TABLE IF EXISTS agents_demo_data;
 CREATE TABLE agents_demo_data (id INT PRIMARY KEY, category VARCHAR(32), amount DOUBLE);
 INSERT INTO agents_demo_data VALUES (1, 'hardware', 1200.00), (2, 'software', 800.50), (3, 'hardware', 450.25);
 
 CALL fractal_agent_data_analyst(
     'total amount spent per category in agents_demo_data',
-    '["agents_demo_data"]', 2, NULL, @r);
+    '["agents_demo_data"]', 2, NULL, TRUE, @r);
 -- 'result_json' is a nested object ({"status":...,"rows":...}), not a
 -- scalar, JSON_EXTRACT, not JSON_VALUE (same reasoning as 'allocation'
 -- above).

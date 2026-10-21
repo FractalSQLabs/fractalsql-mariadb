@@ -99,8 +99,10 @@
 
 #include "fractalsql.h"          /* FSQL_OK, fsql_last_error */
 #include "fractalsql_sql.h"      /* fsql_ctx, fsql_dispatch_ai, fsql_load_reasoning */
+#include "fractalsql_enterprise.h" /* fractal_plugin_verify */
 #include "fractalsql_session.h"  /* fractal_session_acquire_reason/_t2s, ... */
 #include "fractalsql_provider.h"     /* fractalsql_textsql_{check,apply}_provider */
+#include "fractalsql_config.h"       /* the per-session configuration overlay */
 #include "fractalsql_msvc_compat.h"  /* setenv/unsetenv on MSVC */
 
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -120,6 +122,38 @@
         snprintf((msg), MYSQL_ERRMSG_SIZE, __VA_ARGS__);                      \
         fprintf(stderr, "fractalsql: %s\n", (msg));                           \
     } while (0)
+
+/* The reasoning plugin's own diagnostic string is UNBOUNDED: a failed
+ * HTTP round trip can echo a whole response body back into it. The
+ * error buffer is MYSQL_ERRMSG_SIZE (512) bytes, so a plain snprintf
+ * cuts the message at an arbitrary byte with nothing to say so, and the
+ * cut can land mid-UTF-8 or mid-URL -- a half line in the log reads
+ * as a whole one. The unbounded operand is therefore shortened HERE,
+ * with an explicit marker, before the fixed text is formatted around
+ * it. Same rule as fractalsql_cognition.c's sfs_detail_bounded, which
+ * this file's copy follows (duplicated per translation unit by this
+ * repo's established precedent). */
+#define T2S_DETAIL_MAX 256
+#define T2S_DETAIL_MARK "...[truncated]"
+
+/* Copies `detail` into `out` (capacity `cap`), cut at a UTF-8 scalar
+ * boundary and marked when it does not fit. */
+static void
+t2s_detail_bounded(const char *detail, char *out, size_t cap)
+{
+    size_t len = strlen(detail);
+    if (len + 1 <= cap) { memcpy(out, detail, len + 1); return; }
+    {
+        size_t mark = sizeof T2S_DETAIL_MARK - 1;
+        size_t keep = cap - 1 - mark;      /* room for the marker + NUL */
+        if (keep > len) keep = len;
+        /* Never cut inside a UTF-8 sequence. */
+        while (keep > 0 && ((unsigned char) detail[keep] & 0xC0) == 0x80)
+            keep--;
+        memcpy(out, detail, keep);
+        memcpy(out + keep, T2S_DETAIL_MARK, mark + 1);
+    }
+}
 
 /* Same DoS-guard reasoning as fractalsql_cognition.c's
  * FRACTAL_COGNITION_MAX_INPUT_BYTES: caller-controlled text drives
@@ -258,16 +292,63 @@ typedef struct {
 } t2s_config;
 
 static t2s_config g_cfg;     /* effective values */
+
+/* Verify the reasoning plugin (signature or pinned digest) before every load. */
+static char g_plugin_verr[512];
+static int
+checked_load_reasoning(fsql_ctx *ctx)
+{
+    g_plugin_verr[0] = '\0';
+    if (!fractal_plugin_verify(g_cfg.reasoning_plugin, g_plugin_verr, sizeof g_plugin_verr))
+        return -9001;
+    return fsql_load_reasoning(ctx, g_cfg.reasoning_plugin);
+}
 static t2s_config g_env_fb;  /* boot-env fallback snapshot */
 static bool g_env_captured;  /* g_env_fb filled (under load lock) */
 static bool g_cfg_initialized; /* g_cfg filled from the snapshot (until apply) */
 static bool g_provider_applied; /* g_cfg last written by apply_provider */
 
-static char *
-dup_env(const char *name)
+/* The fingerprint of the bridge environment each tier's plugin instance
+ * was last loaded with (see generate_env_and_reload). A changed
+ * provider invalidates it: the fingerprint describes the ENVIRONMENT,
+ * and a provider reload can change the plugin PATH -- the thing the
+ * instance was loaded from -- without changing the environment. */
+static uint64_t g_t2s_fp = 0;
+static bool     g_t2s_fp_valid = false;
+static uint64_t g_review_fp = 0;
+static bool     g_review_fp_valid = false;
+
+/* Owned copy of an environment variable: 0 with *out set to the
+ * value (NULL when the variable is unset or empty), or -1 when the
+ * copy failed. The distinction is the point. A NULL that means "the
+ * operator set nothing" and a NULL that means "the copy ran out of
+ * memory" are different facts, and conflating them turns an
+ * allocation failure into "not configured" -- which, in the boot
+ * snapshot below, would be latched for the life of the process. */
+static int
+dup_env_into(const char *name, char **out)
 {
     const char *v = getenv(name);
-    return (v && *v) ? strdup(v) : NULL;
+    *out = NULL;
+    if (v == NULL || *v == '\0') return 0;
+    *out = strdup(v);
+    return *out ? 0 : -1;
+}
+
+/* Preferred name first, then the legacy FRACTALSQL_HTTP_* name. The
+ * preferred names match the reasoning plugin's own FSQL_REASONING_HTTP_*
+ * variable spellings, so the same configured names reach the plugin as
+ * is. Legacy names keep existing installs working. */
+static int
+dup_env_pref_into(const char *preferred, const char *legacy, char **out)
+{
+    const char *v = getenv(preferred);
+    *out = NULL;
+    if (v && *v) {
+        *out = strdup(v);
+        return *out ? 0 : -1;
+    }
+    return dup_env_into(legacy, out);
 }
 
 /* strdup `s` (NULL stays NULL) into *out; 0, or -1 on allocation
@@ -321,23 +402,28 @@ dup_t2s_cfg(const t2s_config *from, t2s_config *to)
 }
 
 /* Called with the load lock held. Fills the boot-env fallback snapshot
- * from the process environment exactly once. */
-static void
+ * from the process environment exactly once. A copy that FAILS leaves
+ * the snapshot incomplete and g_env_captured false, so the next call
+ * retries the capture instead of latching an allocation failure as a
+ * permanent "the operator never set this". */
+static bool
 capture_t2s_env_fb(void)
 {
     const char *plain, *max_att, *allowed, *review;
-    if (g_env_captured) return;
+    int rc = 0;
+    if (g_env_captured) return true;
 
-    g_env_fb.reasoning_plugin = dup_env("FRACTALSQL_REASONING_PLUGIN");
-    g_env_fb.http_url         = dup_env("FRACTALSQL_HTTP_URL");
-    g_env_fb.http_token       = dup_env("FRACTALSQL_HTTP_TOKEN");
-    g_env_fb.http_model       = dup_env("FRACTALSQL_HTTP_MODEL");
-    plain = getenv("FRACTALSQL_HTTP_ALLOW_PLAINTEXT");
+    rc |= dup_env_into("FRACTALSQL_REASONING_PLUGIN", &g_env_fb.reasoning_plugin);
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_URL", "FRACTALSQL_HTTP_URL", &g_env_fb.http_url);
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_TOKEN", "FRACTALSQL_HTTP_TOKEN", &g_env_fb.http_token);
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_MODEL", "FRACTALSQL_HTTP_MODEL", &g_env_fb.http_model);
+    plain = getenv("FSQL_REASONING_HTTP_ALLOW_PLAINTEXT");
+    if (!plain || !*plain) plain = getenv("FRACTALSQL_HTTP_ALLOW_PLAINTEXT");
     g_env_fb.http_allow_plaintext = (plain && *plain && strcmp(plain, "0") != 0);
-    g_env_fb.http_think          = dup_env("FRACTALSQL_HTTP_THINK");
-    g_env_fb.http_think_provider = dup_env("FRACTALSQL_HTTP_THINK_PROVIDER");
-    g_env_fb.http_native_url     = dup_env("FRACTALSQL_HTTP_NATIVE_URL");
-    g_env_fb.http_num_ctx        = dup_env("FRACTALSQL_HTTP_NUM_CTX");
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_THINK", "FRACTALSQL_HTTP_THINK", &g_env_fb.http_think);
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_THINK_PROVIDER", "FRACTALSQL_HTTP_THINK_PROVIDER", &g_env_fb.http_think_provider);
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_NATIVE_URL", "FRACTALSQL_HTTP_NATIVE_URL", &g_env_fb.http_native_url);
+    rc |= dup_env_pref_into("FSQL_REASONING_HTTP_NUM_CTX", "FRACTALSQL_HTTP_NUM_CTX", &g_env_fb.http_num_ctx);
 
     max_att = getenv("FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS");
     g_env_fb.max_attempts = 2;
@@ -354,17 +440,29 @@ capture_t2s_env_fb(void)
 
     review = getenv("FRACTALSQL_TEXT_TO_SQL_USE_REVIEW");
     g_env_fb.use_review = (review && *review && strcmp(review, "0") != 0);
+    if (rc != 0) {
+        /* Drop the partial snapshot: the next capture starts from
+         * scratch, and nothing half-filled is ever published. */
+        free_t2s_cfg(&g_env_fb);
+        return false;
+    }
     g_env_captured = true;
+    return true;
 }
 
-static void
-ensure_env_config(void)
+/* Fills g_cfg from the boot-env snapshot the first time it is needed.
+ * Returns false only when the environment could not be read at all
+ * (an allocation failure): the caller reports that as the out-of-
+ * memory it is, rather than as missing configuration. */
+static bool
+ensure_env_config(char *errbuf)
 {
+    bool ok;
     /* Under the load lock: the snapshot capture would race a concurrent
      * apply_provider, and the copies below assume both are settled. */
     load_lock();
-    capture_t2s_env_fb();
-    if (!g_provider_applied && !g_cfg_initialized) {
+    ok = capture_t2s_env_fb();
+    if (ok && !g_provider_applied && !g_cfg_initialized) {
         /* Byte-identical to the old env-only first read. On OOM g_cfg
          * stays zeroed and the dispatch path reports missing config;
          * the next call retries this copy. */
@@ -372,6 +470,57 @@ ensure_env_config(void)
             g_cfg_initialized = true;
     }
     load_unlock();
+    if (!ok) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_textsql: out of memory reading the process environment");
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Read side for the configuration surface (fractalsql_config.h).      */
+/* ------------------------------------------------------------------ */
+
+/* The effective value of one configuration key this tier owns. Returns
+ * 0 and fills `out` when the key is one this tier owns and currently
+ * holds a value for, -1 otherwise. */
+int
+fractalsql_textsql_config_value(const char *name, char *out, size_t outcap)
+{
+    const char *v = NULL;
+    char        numbuf[32];
+    char        strbuf[24];   /* holds a COPY of g_cfg.allowed_statements */
+
+    if (name == NULL || out == NULL || outcap == 0) return -1;
+    out[0] = '\0';
+
+    load_lock();
+    if (strcmp(name, "t2s_max_attempts") == 0) {
+        snprintf(numbuf, sizeof numbuf, "%d", g_cfg.max_attempts);
+        v = numbuf;
+    } else if (strcmp(name, "t2s_allowed_statements") == 0) {
+        /* The value has to be COPIED under the lock, not pointed at:
+         * g_cfg.allowed_statements lives inside the shared config
+         * struct, and the copy below runs after the lock is dropped.
+         * A concurrent apply_provider rewrites that field in place,
+         * so a pointer taken here could be torn or point at a value
+         * that changed mid-copy. */
+        snprintf(strbuf, sizeof strbuf, "%s", g_cfg.allowed_statements);
+        v = strbuf;
+    } else if (strcmp(name, "t2s_use_review") == 0) {
+        v = g_cfg.use_review ? "1" : "0";
+    }
+    load_unlock();
+
+    if (v == NULL || v[0] == '\0') return -1;
+    {
+        size_t n = strlen(v);
+        if (n > outcap - 1) n = outcap - 1;
+        memcpy(out, v, n);
+        out[n] = '\0';
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -399,13 +548,19 @@ fractalsql_textsql_apply_provider(const struct fsq_provider_cfg *c)
     char *np_plugin = NULL, *nurl = NULL, *ntok = NULL, *nmodel = NULL;
     char *nthink = NULL, *nthink_provider = NULL, *nnative = NULL, *nnum_ctx = NULL;
     const char *src;
-    int rc = -1;
 
     /* We take the lock ourselves: the daemon calls this on startup and
      * on FSQ_OP_RELOAD, and the swap must be ordered against every
      * dispatch's read of g_cfg (apply_generate_env_locked et al). */
     load_lock();
-    capture_t2s_env_fb();
+    if (!capture_t2s_env_fb()) {
+        /* The boot-environment fallback could not be captured, so the
+         * provider's own values would be applied over a snapshot that
+         * silently dropped whatever the operator set. The apply
+         * refuses as a whole instead. */
+        load_unlock();
+        return -1;
+    }
 
     src = (c->present & FSQL_PROV_REASONING_PLUGIN) ? c->reasoning_plugin
                                                     : g_env_fb.reasoning_plugin;
@@ -457,9 +612,14 @@ fractalsql_textsql_apply_provider(const struct fsq_provider_cfg *c)
 
     /* Plugin loads are never attempted here (fractalsql_provider.h): a
      * changed or failing path surfaces on the tier's next dispatch, when
-     * these cleared flags force a fresh fsql_load_reasoning. */
+     * these cleared flags force a fresh fsql_load_reasoning. The
+     * fingerprints are cleared with them: a provider reload can change
+     * the plugin PATH, and the fingerprint only describes the
+     * environment -- a path change leaves it untouched. */
     fractal_session_forget_t2s_loaded();
     fractal_session_forget_review_loaded();
+    g_t2s_fp_valid    = false;
+    g_review_fp_valid = false;
     load_unlock();
     return 0;
 
@@ -471,21 +631,29 @@ oom:
 }
 
 /* ==================================================================== */
-/* fractal_t2s_config() -> JSON STRING                                  */
+/* fractal_t2s_config([session_id]) -> JSON STRING                      */
 /* {"max_attempts":2,"allowed_statements":"select","use_review":false}  */
 /* Lets the orchestrating stored procedure (sql/install_udf.sql) read   */
 /* this file's effective config once per CALL, since SQL/PSM, running    */
 /* inside MariaDB, has no built-in mechanism to read the daemon's        */
 /* process environment directly.                                        */
+/*                                                                    */
+/* With a session_id, the values the session has overridden            */
+/* (fractalsql_config.h) are reported instead of the daemon-wide ones, */
+/* so the procedure acts on the same attempt count and review switch    */
+/* the caller's own configuration asks for. The session may only        */
+/* override the two keys this function reports: t2s_max_attempts and   */
+/* t2s_use_review. t2s_allowed_statements is daemon-wide only.          */
 /* ==================================================================== */
 
 FRACTAL_EXPORT bool
 fractal_t2s_config_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-    if (args->arg_count != 0) {
-        SFS_INIT_ERROR(message, "fractal_t2s_config(): expected 0 arguments, got %u", args->arg_count);
+    if (args->arg_count != 0 && args->arg_count != 1) {
+        SFS_INIT_ERROR(message, "fractal_t2s_config([session_id]): expected 0 or 1 arguments, got %u", args->arg_count);
         return true;
     }
+    if (args->arg_count == 1) args->arg_type[0] = INT_RESULT;
     return str_out_generic_init(initid, message, 256);
 }
 
@@ -498,15 +666,42 @@ fractal_t2s_config(UDF_INIT *initid, UDF_ARGS *args, char *result,
 {
     str_out_ctx *so = (str_out_ctx *) initid->ptr;
     char buf[256];
+    char errbuf[MYSQL_ERRMSG_SIZE];
     int  n;
-    (void) args; (void) result;
+    int  max_attempts;
+    bool use_review;
+    char allowed[64];
+    (void) result;
 
-    ensure_env_config();
+    if (!ensure_env_config(errbuf)) { *error = 1; return NULL; }
+
+    load_lock();
+    max_attempts = g_cfg.max_attempts;
+    use_review   = g_cfg.use_review;
+    snprintf(allowed, sizeof allowed, "%s", g_cfg.allowed_statements);
+    load_unlock();
+
+    /* The session's own overrides win over the daemon-wide values for
+     * the two keys a session is allowed to change here. */
+    if (args->arg_count == 1 && args->args[0] != NULL) {
+        unsigned long long sid =
+            (unsigned long long) *(long long *) args->args[0];
+        long v = 0;
+        if (fractal_config_lookup_long(sid, "t2s_max_attempts", &v) && v >= 1)
+            max_attempts = (int) v;
+        if (fractal_config_lookup_str(sid, "t2s_use_review", buf, sizeof buf)) {
+            if (strcmp(buf, "1") == 0 || strcmp(buf, "true") == 0 ||
+                strcmp(buf, "on") == 0 || strcmp(buf, "yes") == 0)
+                use_review = true;
+            else
+                use_review = false;
+        }
+    }
 
     n = snprintf(buf, sizeof buf,
                  "{\"max_attempts\":%d,\"allowed_statements\":\"%s\",\"use_review\":%s}",
-                 g_cfg.max_attempts, g_cfg.allowed_statements,
-                 g_cfg.use_review ? "true" : "false");
+                 max_attempts, allowed,
+                 use_review ? "true" : "false");
     if (n < 0 || (size_t) n >= sizeof buf) { *error = 1; return NULL; }
 
     char *s = str_out_set(so, buf, (size_t) n, length);
@@ -629,30 +824,139 @@ apply_review_env_locked(void)
     unsetenv("FSQL_REASONING_HTTP_SYSTEM_TAG");
 }
 
+/* ------------------------------------------------------------------- */
+/* Publish the bridge environment, and reload the tier's instance when */
+/* the published configuration is not the one the instance was loaded  */
+/* with.                                                             */
+/* ------------------------------------------------------------------- */
+
+/* Publishes the text-to-SQL tier's settings plus this session's own
+ * overrides, and (re)loads the tier's plugin instance when the
+ * effective configuration no longer matches the loaded one.
+ *
+ * WHY THE RELOAD: the reasoning plugin reads its configuration ONCE,
+ * when it is loaded, and bakes it into the loaded instance -- the
+ * plugin's ABI has no per-dispatch configuration read, and the
+ * vendored core never reads the environment at all. A session's
+ * model/THINK override is published into the environment, so it only
+ * reaches the plugin if the instance is loaded again with that
+ * environment in place. That is what the fingerprint decides.
+ *
+ * THE COST: the tier holds ONE instance, shared by every session, so
+ * two sessions asking for different models make the tier reload
+ * between their calls. A session that overrides nothing never
+ * triggers a reload.
+ *
+ * Caller MUST hold the tier's dispatch lock (g_load_lock): the ctx is
+ * single-thread affine, and the load replaces the plugin attached to
+ * it. Returns false with a one-line reason on a load failure. */
+static bool
+generate_env_and_reload(fsql_ctx *ctx, unsigned long long session_id,
+                         const char *system_tag, char *errbuf)
+{
+    uint64_t fp;
+    int rc;
+
+    /* The environment lock is taken around the publish+load window and
+     * released again before the dispatch: the plugin does not read the
+     * environment during a dispatch, so holding it across the network
+     * round trip would only serialise the tiers against each other. */
+    fractal_config_env_lock();
+    apply_generate_env_locked(system_tag);
+    fractal_config_apply_env_overrides(session_id, FSQL_CFG_TIER_T2S);
+    fp = fractal_config_env_fingerprint();
+    if (!g_t2s_fp_valid || fp != g_t2s_fp) {
+        rc = checked_load_reasoning(ctx);
+        if (rc != FSQL_OK) {
+            fractal_config_env_unlock();
+            {
+                const char *err = g_plugin_verr[0] ? g_plugin_verr : fsql_last_error(ctx);
+                char detail[T2S_DETAIL_MAX + sizeof T2S_DETAIL_MARK];
+                t2s_detail_bounded(err && *err ? err : "(no detail)",
+                                   detail, sizeof detail);
+                SFS_INIT_ERROR(errbuf,
+                    "fractal_t2s_generate: failed to load reasoning plugin (rc=%d): %s",
+                    rc, detail);
+            }
+            return false;
+        }
+        /* Fingerprinted AFTER the load, so it describes the
+         * environment the loaded instance actually saw. */
+        g_t2s_fp = fractal_config_env_fingerprint();
+        g_t2s_fp_valid = true;
+    }
+    fractal_config_env_unlock();
+    return true;
+}
+
+/* The review tier's twin of generate_env_and_reload. The review tier
+ * unsets the response mode and the system tag, so its environment
+ * differs from the generate tier's -- but both publish on the same
+ * variables, which is why the environment lock is shared. */
+static bool
+review_env_and_reload(fsql_ctx *ctx, unsigned long long session_id,
+                       char *errbuf)
+{
+    uint64_t fp;
+    int rc;
+
+    fractal_config_env_lock();
+    apply_review_env_locked();
+    fractal_config_apply_env_overrides(session_id, FSQL_CFG_TIER_T2S);
+    fp = fractal_config_env_fingerprint();
+    if (!g_review_fp_valid || fp != g_review_fp) {
+        rc = checked_load_reasoning(ctx);
+        if (rc != FSQL_OK) {
+            fractal_config_env_unlock();
+            {
+                const char *err = g_plugin_verr[0] ? g_plugin_verr : fsql_last_error(ctx);
+                char detail[T2S_DETAIL_MAX + sizeof T2S_DETAIL_MARK];
+                t2s_detail_bounded(err && *err ? err : "(no detail)",
+                                   detail, sizeof detail);
+                SFS_INIT_ERROR(errbuf,
+                    "fractal_t2s_review: failed to load reasoning plugin (rc=%d): %s",
+                    rc, detail);
+            }
+            return false;
+        }
+        g_review_fp = fractal_config_env_fingerprint();
+        g_review_fp_valid = true;
+    }
+    fractal_config_env_unlock();
+    return true;
+}
+
 static bool
 ensure_generate_loaded(unsigned long long session_id, fsql_ctx *ctx,
                        bool already_loaded, const char *system_tag, char *errbuf)
 {
-    int rc;
     if (already_loaded) return true;
-    ensure_env_config();
-    if (!g_cfg.reasoning_plugin) {
-        SFS_INIT_ERROR(errbuf,
-            "fractal_t2s_generate: no reasoning plugin configured. Set reasoning_plugin "
-            "in fractalsqld.conf and run `fsqlctl reload`, or set "
-            "FRACTALSQL_REASONING_PLUGIN in fractalsqld's environment at startup");
-        return false;
+    if (!ensure_env_config(errbuf)) return false;
+    /* The plugin path is read UNDER the load lock: apply_provider frees
+     * the old copy before installing the new one, so an unlocked read of
+     * the pointer races that free (a stale non-NULL value would send the
+     * dispatch down the "plugin configured" path when the config says
+     * otherwise). The value is only tested here -- the dispatch that
+     * actually uses it re-reads the config under the lock. */
+    {
+        bool no_plugin;
+        load_lock();
+        no_plugin = (g_cfg.reasoning_plugin == NULL);
+        load_unlock();
+        if (no_plugin) {
+            SFS_INIT_ERROR(errbuf,
+                "fractal_t2s_generate: no reasoning plugin configured. Set reasoning_plugin "
+                "in fractalsqld.conf and run `fsqlctl reload`, or set "
+                "FRACTALSQL_REASONING_PLUGIN in fractalsqld's environment at startup");
+            return false;
+        }
     }
     load_lock();
-    apply_generate_env_locked(system_tag);
-    rc = fsql_load_reasoning(ctx, g_cfg.reasoning_plugin);
-    load_unlock();
-    if (rc != FSQL_OK) {
-        const char *err = fsql_last_error(ctx);
-        SFS_INIT_ERROR(errbuf, "fractal_t2s_generate: failed to load reasoning plugin (rc=%d): %s",
-                       rc, err && *err ? err : "(no detail)");
+    if (!generate_env_and_reload(ctx, session_id, system_tag, errbuf)) {
+        load_unlock();
         return false;
     }
+    load_unlock();
     fractal_session_mark_t2s_loaded(session_id);
     return true;
 }
@@ -661,26 +965,28 @@ static bool
 ensure_review_loaded(unsigned long long session_id, fsql_ctx *ctx,
                      bool already_loaded, char *errbuf)
 {
-    int rc;
     if (already_loaded) return true;
-    ensure_env_config();
-    if (!g_cfg.reasoning_plugin) {
-        SFS_INIT_ERROR(errbuf,
-            "fractal_t2s_review: no reasoning plugin configured. Set reasoning_plugin "
-            "in fractalsqld.conf and run `fsqlctl reload`, or set "
-            "FRACTALSQL_REASONING_PLUGIN in fractalsqld's environment at startup");
-        return false;
+    if (!ensure_env_config(errbuf)) return false;
+    /* Under the load lock -- see ensure_generate_loaded's note. */
+    {
+        bool no_plugin;
+        load_lock();
+        no_plugin = (g_cfg.reasoning_plugin == NULL);
+        load_unlock();
+        if (no_plugin) {
+            SFS_INIT_ERROR(errbuf,
+                "fractal_t2s_review: no reasoning plugin configured. Set reasoning_plugin "
+                "in fractalsqld.conf and run `fsqlctl reload`, or set "
+                "FRACTALSQL_REASONING_PLUGIN in fractalsqld's environment at startup");
+            return false;
+        }
     }
     load_lock();
-    apply_review_env_locked();
-    rc = fsql_load_reasoning(ctx, g_cfg.reasoning_plugin);
-    load_unlock();
-    if (rc != FSQL_OK) {
-        const char *err = fsql_last_error(ctx);
-        SFS_INIT_ERROR(errbuf, "fractal_t2s_review: failed to load reasoning plugin (rc=%d): %s",
-                       rc, err && *err ? err : "(no detail)");
+    if (!review_env_and_reload(ctx, session_id, errbuf)) {
+        load_unlock();
         return false;
     }
+    load_unlock();
     fractal_session_mark_review_loaded(session_id);
     return true;
 }
@@ -762,30 +1068,38 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
 
     if (!ensure_generate_loaded(sid, ctx, loaded, system_tag, errbuf)) {
-        fractal_session_release(sid);
+        fractal_session_release_tier();
         *error = 1; return NULL;
     }
 
     memset(&resp, 0, sizeof(resp));
-    /* The plugin library is shared by all four tiers, so the endpoint and
-     * mode it dispatches with are whatever the last load or dispatch left.
-     * Re-apply this tier's settings under the load lock, right before it. */
+    /* The plugin's configuration is baked in when the instance is
+     * loaded, so every dispatch republishes the tier's settings (plus
+     * this session's own overrides) and reloads the instance if that
+     * configuration is not the one the instance was loaded with. */
     load_lock();
-    apply_generate_env_locked(system_tag);
+    if (!generate_env_and_reload(ctx, sid, system_tag, errbuf)) {
+        load_unlock();
+        fractal_session_release_tier();
+        *error = 1; return NULL;
+    }
     rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1],
                           context_json, context_len, &resp);
     load_unlock();
     if (rc != FSQL_OK || resp.rc != 0) {
         const char *err = fsql_last_error(ctx);
+        char detail[T2S_DETAIL_MAX + sizeof T2S_DETAIL_MARK];
+        t2s_detail_bounded(err && *err ? err : "(no detail)",
+                           detail, sizeof detail);
         /* Mirrored to stderr via SFS_INIT_ERROR: a plain *error=1 here
          * surfaces only as the orchestrating procedure's generic
          * "generate dispatch failed" NULL, hiding the plugin's actual
          * reason (e.g. code-mode fence extraction failure). */
         SFS_INIT_ERROR(errbuf,
             "fractal_t2s_generate: dispatch failed (rc=%d, resp.rc=%d): %s",
-            rc, resp.rc, err && *err ? err : "(no detail)");
+            rc, resp.rc, detail);
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
         *error = 1; return NULL;
     }
     if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
@@ -793,7 +1107,7 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
             "fractal_t2s_generate: response %zu bytes exceeds "
             "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
         *error = 1; return NULL;
     }
     /* The rc==0 dispatch contract says summary is non-NULL, but the
@@ -804,13 +1118,13 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
             "fractal_t2s_generate: reasoning plugin returned a NULL summary "
             "on a success status -- likely a plugin bug");
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
         *error = 1; return NULL;
     }
 
     s = str_out_set(so, resp.summary, resp.summary_len, length);
     fsql_ai_response_free(&resp);
-    fractal_session_release(sid);
+    fractal_session_release_tier();
     if (s == NULL) { *error = 1; return NULL; }
     *is_null = 0;
     return s;
@@ -839,6 +1153,45 @@ fractal_t2s_review_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
     return str_out_generic_init(initid, message, FRACTAL_MAX_AI_RESPONSE_BYTES);
 }
 
+/* Builds the review prompt into a heap buffer sized to fit the question
+ * and the candidate SQL EXACTLY.
+ *
+ * The prompt is sized from its inputs, so it is never truncated. That
+ * matters here: this function's PASS/FAIL verdict is its return value
+ * and feeds straight back into the next GENERATE attempt as retry
+ * feedback, so the model must grade exactly the request the caller sent.
+ *
+ * The inputs are copied by length rather than by %.*s, so a NUL inside
+ * the question is carried through instead of silently ending the copy
+ * early (the UDF ABI does not NUL-terminate string arguments). */
+static char *
+t2s_review_build_prompt(const char *question, size_t qlen,
+                         const char *sql, size_t slen,
+                         size_t *out_len)
+{
+    static const char lead[] = "Original request: ";
+    static const char mid[]  = "\n\nCandidate SQL:\n";
+    static const char tail[] =
+        "\n\nDoes this candidate correctly and completely answer the request? "
+        "Answer PASS or FAIL on the first line, then explain briefly.";
+
+    size_t lead_len = sizeof lead - 1;
+    size_t mid_len  = sizeof mid - 1;
+    size_t tail_len = sizeof tail - 1;
+    size_t total    = lead_len + qlen + mid_len + slen + tail_len + 1;
+    char  *buf      = (char *) malloc(total);
+    if (buf == NULL) return NULL;
+
+    memcpy(buf, lead, lead_len);
+    memcpy(buf + lead_len, question, qlen);
+    memcpy(buf + lead_len + qlen, mid, mid_len);
+    memcpy(buf + lead_len + qlen + mid_len, sql, slen);
+    memcpy(buf + lead_len + qlen + mid_len + slen, tail, tail_len);
+    buf[total - 1] = '\0';
+    *out_len = total - 1;
+    return buf;
+}
+
 FRACTAL_EXPORT void
 fractal_t2s_review_deinit(UDF_INIT *initid) { str_out_generic_deinit(initid); }
 
@@ -853,8 +1206,7 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
     fsql_ctx *ctx;
     fsql_ai_response_t resp;
     int     rc;
-    char    prompt[8192];
-    int     n;
+    char   *prompt;
     const char *p;
     size_t  plen;
     bool    passed;
@@ -875,39 +1227,46 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
 
     if (!ensure_review_loaded(sid, ctx, loaded, errbuf)) {
-        fractal_session_release(sid);
+        fractal_session_release_tier();
         *error = 1; return NULL;
     }
 
-    /* args->args[1]/[2] are not guaranteed NUL-terminated by the UDF
-     * ABI; %.*s bounds both by their explicit lengths. Truncating a
-     * pathologically long question/candidate into this fixed prompt
-     * buffer is acceptable here: review is an optional quality pass
-     * (default off), not a security boundary. */
-    n = snprintf(prompt, sizeof prompt,
-        "Original request: %.*s\n\n"
-        "Candidate SQL:\n%.*s\n\n"
-        "Does this candidate correctly and completely answer the request? "
-        "Answer PASS or FAIL on the first line, then explain briefly.",
-        (int) args->lengths[1], args->args[1],
-        (int) args->lengths[2], args->args[2]);
-    if (n < 0) { fractal_session_release(sid); *error = 1; return NULL; }
-    plen = (size_t) n < sizeof prompt ? (size_t) n : sizeof prompt - 1;
+    /* The prompt is sized from its inputs, so it is never truncated:
+     * see t2s_review_build_prompt for why a cut-off question is not
+     * an acceptable outcome here. */
+    prompt = t2s_review_build_prompt(args->args[1], args->lengths[1],
+                                     args->args[2], args->lengths[2], &plen);
+    if (prompt == NULL)
+    {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: out of memory building the review prompt");
+        fractal_session_release_tier();
+        *error = 1; return NULL;
+    }
 
     memset(&resp, 0, sizeof(resp));
     load_lock();
-    apply_review_env_locked();
+    if (!review_env_and_reload(ctx, sid, errbuf)) {
+        load_unlock();
+        fractal_session_release_tier();
+        free(prompt);
+        *error = 1; return NULL;
+    }
     rc = fsql_dispatch_ai(ctx, prompt, plen, "{}", 2, &resp);
     load_unlock();
     if (rc != FSQL_OK || resp.rc != 0) {
         const char *err = fsql_last_error(ctx);
+        char detail[T2S_DETAIL_MAX + sizeof T2S_DETAIL_MARK];
+        t2s_detail_bounded(err && *err ? err : "(no detail)",
+                           detail, sizeof detail);
         /* Same stderr mirror as fractal_t2s_generate's dispatch branch:
          * a bare *error=1 would only ever show as a NULL review verdict. */
         SFS_INIT_ERROR(errbuf,
             "fractal_t2s_review: dispatch failed (rc=%d, resp.rc=%d): %s",
-            rc, resp.rc, err && *err ? err : "(no detail)");
+            rc, resp.rc, detail);
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
+        free(prompt);
         *error = 1; return NULL;
     }
     if (resp.summary_len > FRACTAL_MAX_AI_RESPONSE_BYTES) {
@@ -915,7 +1274,8 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
             "fractal_t2s_review: response %zu bytes exceeds "
             "FRACTAL_MAX_AI_RESPONSE_BYTES", resp.summary_len);
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
+        free(prompt);
         *error = 1; return NULL;
     }
     /* The rc==0 dispatch contract says summary is non-NULL, but the
@@ -926,7 +1286,8 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
             "fractal_t2s_review: reasoning plugin returned a NULL summary "
             "on a success status -- likely a plugin bug");
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
+        free(prompt);
         *error = 1; return NULL;
     }
 
@@ -939,14 +1300,16 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     if (passed) {
         fsql_ai_response_free(&resp);
-        fractal_session_release(sid);
+        fractal_session_release_tier();
+        free(prompt);
         *is_null = 1;
         return NULL;
     }
 
     s = str_out_set(so, resp.summary, resp.summary_len, length);
     fsql_ai_response_free(&resp);
-    fractal_session_release(sid);
+    fractal_session_release_tier();
+    free(prompt);
     if (s == NULL) { *error = 1; return NULL; }
     *is_null = 0;
     return s;
@@ -1225,6 +1588,74 @@ fractal_t2s_check_allowlist_init(UDF_INIT *initid, UDF_ARGS *args, char *message
 FRACTAL_EXPORT void
 fractal_t2s_check_allowlist_deinit(UDF_INIT *initid) { str_out_generic_deinit(initid); }
 
+/* Functions a generated SELECT/INSERT/UPDATE must not call. The leading-keyword
+ * check alone cannot tell SELECT 1 from SELECT fractal_audit_log(...): a
+ * function is legal in any expression list. Scans identifiers followed by '('
+ * outside quotes and comments and rejects those whose lower-cased name starts
+ * with a denied prefix. Returns the denied name through *which (static). */
+static const char *const t2s_denied_call_prefixes[] = {
+    "fractal_audit_log", "fractal_ledger_", "fractal_lock_destructive",
+    "fractal_store_", "fractal_diversify_", "fractal_feedback_report",
+    "fractal_isolate_background", "fractal_sql_agent", "fractal_agent_",
+    "fractal_vectorizer_", "fractalsql_set_config",
+    "load_file", "sleep", "benchmark", "get_lock", "release_lock",
+    "sys_exec", "sys_eval", "master_pos_wait", "master_gtid_wait",
+    NULL
+};
+
+static bool
+t2s_has_denied_call(const char *sql, unsigned long len, const char **which)
+{
+    unsigned long i = 0;
+    while (i < len) {
+        char c = sql[i];
+        if (c == '\'' || c == '"' || c == '`') {
+            char q = c; i++;
+            while (i < len) {
+                if (sql[i] == '\\' && q != '`') { i += 2; continue; }
+                if (sql[i] == q) { if (i + 1 < len && sql[i + 1] == q) { i += 2; continue; } break; }
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '#' || (c == '-' && i + 1 < len && sql[i + 1] == '-')) {
+            while (i < len && sql[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < len && sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < len && !(sql[i] == '*' && sql[i + 1] == '/')) i++;
+            i += 2;
+            continue;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            char name[64];
+            unsigned long n = 0;
+            while (i < len && ((sql[i] >= 'a' && sql[i] <= 'z') || (sql[i] >= 'A' && sql[i] <= 'Z') ||
+                               (sql[i] >= '0' && sql[i] <= '9') || sql[i] == '_' || sql[i] == '$')) {
+                if (n + 1 < sizeof name) name[n++] = (char) ((sql[i] >= 'A' && sql[i] <= 'Z') ? sql[i] + 32 : sql[i]);
+                i++;
+            }
+            name[n] = '\0';
+            unsigned long j = i;
+            while (j < len && (sql[j] == ' ' || sql[j] == '\t' || sql[j] == '\n' || sql[j] == '\r')) j++;
+            if (j < len && sql[j] == '(') {
+                for (int k = 0; t2s_denied_call_prefixes[k] != NULL; k++) {
+                    size_t pl = strlen(t2s_denied_call_prefixes[k]);
+                    if (strncmp(name, t2s_denied_call_prefixes[k], pl) == 0) {
+                        *which = t2s_denied_call_prefixes[k];
+                        return true;
+                    }
+                }
+            }
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
 FRACTAL_EXPORT char *
 fractal_t2s_check_allowlist(UDF_INIT *initid, UDF_ARGS *args, char *result,
                             unsigned long *length, char *is_null, char *error)
@@ -1233,6 +1664,7 @@ fractal_t2s_check_allowlist(UDF_INIT *initid, UDF_ARGS *args, char *result,
     const char *sql;
     unsigned long sqllen;
     char buf[1024];
+    char errbuf[MYSQL_ERRMSG_SIZE];
     int  n;
     int  n_stmts;
     const char *kw;
@@ -1245,8 +1677,20 @@ fractal_t2s_check_allowlist(UDF_INIT *initid, UDF_ARGS *args, char *result,
     sqllen = args->lengths[0];
     if (sqllen > FRACTAL_T2S_MAX_SQL_BYTES) { *error = 1; return NULL; }
 
-    ensure_env_config();
-    select_only = (strcmp(g_cfg.allowed_statements, "select_insert_update") != 0);
+    if (!ensure_env_config(errbuf)) { *error = 1; return NULL; }
+
+    /* Read the allowlist mode under the load lock and keep a COPY.
+     * g_cfg.allowed_statements is rewritten in place by a concurrent
+     * apply_provider, so reading it unlocked could see a half-written
+     * value (and the mode decides whether an UPDATE is accepted at
+     * all). */
+    {
+        char mode[24];
+        load_lock();
+        snprintf(mode, sizeof mode, "%s", g_cfg.allowed_statements);
+        load_unlock();
+        select_only = (strcmp(mode, "select_insert_update") != 0);
+    }
 
     if (t2s_has_exec_comment(sql, sqllen)) {
         n = snprintf(buf, sizeof buf,
@@ -1281,6 +1725,16 @@ fractal_t2s_check_allowlist(UDF_INIT *initid, UDF_ARGS *args, char *result,
             "FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS is set to \"%s\"",
             kw, select_only ? "select" : "select_insert_update");
         goto reject;
+    }
+
+    {
+        const char *denied = NULL;
+        if (t2s_has_denied_call(sql, sqllen, &denied)) {
+            n = snprintf(buf, sizeof buf,
+                "statement calls %s(...), a function that changes state or "
+                "reaches outside the database, which generated SQL may not do", denied);
+            goto reject;
+        }
     }
 
     if (t2s_has_into_outfile(sql, sqllen)) {

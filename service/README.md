@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
 # FractalSQL service build
 
 The FractalSQL engine runs in `fractalsqld`, a separate process. `mariadbd`
@@ -13,13 +17,14 @@ the daemon over a Unix socket (a named pipe on Windows).
 | `protocol/` | MIT | Wire protocol v2: `fsq_protocol.h`, `opcodes.def`, `functions.def`. See `protocol/SPEC.md`. |
 | `common/fsq_sha256.h` | Public domain | SHA-256 and HMAC, used by shim and daemon. |
 | `cli/` | Apache-2.0 | `fsqlctl`, an independent control-plane CLI: no shim, daemon, or core header. |
+| `../mcp/` | Apache-2.0 | The MCP server, a separate process. An independent client like `cli/`: it includes no shim, daemon, or core header and shares no code with them. It reaches the engine only through SQL over libmariadb and the FSQL protocol to `fractalsqld`. `vendor/json.hpp` keeps its upstream MIT licence. |
 | `sql/install_spike.sql` | Apache-2.0 | Installs the subset of UDFs `tests/spike_test.sh` uses. |
 | `tests/`, `scripts/` | Apache-2.0 | Self-tests, license/boundary/symbol scans, code generators. |
 
 ## Build and test
 
     make -C service all      # build/fractalsql.so (shim) and build/fractalsqld (daemon)
-    make -C service scan     # license scan, shim/core boundary check, symbol scan
+    make -C service scan     # license scan, shim/core boundary check, MCP boundary check, symbol scan
     make -C service test     # protocol self-test + fsqlctl conformance
 
 `ASAN=1` / `UBSAN=1` / `COVERAGE=1` instrument the daemon (never the

@@ -95,6 +95,30 @@ process for every connection:
 ambient way to ask "what connection am I on," and each session needs its
 own in-memory context.
 
+**Locking the destructive functions.** `fractal_lock_destructive(session_id)` is a
+**one-way latch** (returns `1`): afterwards `fractal_ledger_flush`,
+`fractal_ledger_compact`, `fractal_ledger_reset_soft`,
+`fractal_ledger_reset_hard` and `fractal_ledger_load` refuse for that session
+id (they return `NULL`, the UDF error convention), whether or not an enterprise
+core is loaded. `fractal_ledger_load` is latched too because it overwrites the
+live in-memory ledger state, so a latched session must not be able to roll the
+ledger back. The read-only functions are unaffected. There is no
+unlock function: the latch lasts until the `fractalsqld` daemon restarts. The MCP
+server calls it with its own connection id when `FSQL_MCP_READ_ONLY=true`, on top
+of its own refusal of the `destructiveHint` tools, so a mis-annotated tool cannot
+wipe the ledger either.
+
+Know the limit: the latch is keyed by **the session id the caller passes**, and a
+MariaDB UDF cannot tell which connection is calling it. It therefore protects the
+calls that use the locked id (everything the MCP server itself sends), and it does
+**not** stop a caller who passes a different `session_id`. MariaDB has no
+per-function privileges for UDFs, so there is no equivalent of PostgreSQL's
+`REVOKE EXECUTE` or SQLite's `SQLITE_DIRECTONLY` here; to keep other people away
+from the ledger, restrict who can connect, or do not install the destructive
+ledger functions for that deployment. If the engine is older than the plugin and
+lacks the function, the MCP server logs a warning and keeps its own refusal in
+force.
+
 **Removing the library re-dormants the surface**: point `enterprise_lib`
 back at a missing path (or remove it) and restart `fractalsqld` -- while a
 library is loaded, reload refuses an `enterprise_lib` change, so
@@ -142,9 +166,11 @@ Reload semantics, verified in `src/fractalsql_enterprise.c`:
   like the rest, and are `1`/`0` flags or strings. The ledger key is a
   **secret**, and because it may sit in the conf in plaintext (like its
   reasoning sibling `reasoning_token`), the conf file itself is
-  permission-gated like the HMAC key file it lives next to: a world- or
-  groups-readable `fractalsqld.conf` refuses daemon startup *and* reload
-  (`chmod 600` on POSIX; a private, single-account ACL on Windows).
+  permission-gated like the HMAC key file it lives next to: a
+  world-readable `fractalsqld.conf` refuses daemon startup *and* reload
+  (`chmod 600` on POSIX; on Windows an ACL that grants Everyone,
+  Authenticated Users or Users refuses it too — a private, single-account
+  ACL is what it wants).
 - Reload validation is loud and named: unknown keys log a warning, an
   empty value is refused, and any key that comes with a range constraint
   rejects a bad value with the constraint itself (the conf file is the
@@ -162,6 +188,15 @@ when enterprise is active. Silently skipped on community, so none of
 them ever depend on a license to keep working. Query it directly (CONNECT
 mirror installed): `SELECT id, FROM_BASE64(blob_b64) FROM fractalsql_ledger
 WHERE kind = 2 ORDER BY id`.
+
+The `kind=2` chain is shared with the engine's own **shadow** payloads
+(the engine's storage tags are 1=truth, 2=shadow, 3=shadow_vectors), so
+a `WHERE kind = 2` query can return both a decision-audit record and an
+engine shadow blob. That is harmless: the ledger keeps one hash chain
+*per kind*, so the two never interleave or break each other's links,
+and the verifier walks one kind's chain at a time. Only the tags the
+ledger knows are accepted — a kind outside 1..16 is refused outright
+rather than appended under a tag nothing would ever walk.
 
 Every decision-making agent in `sql/install_agents.sql` logs its own
 decision to the same chain with the same best-effort, community-safe
@@ -235,6 +270,22 @@ the head hash somewhere independent). See **External anchoring** below
 for a recipe. (See `demo/enterprise-stress.sql` Phase D's tamper-evidence
 recipes.)
 
+**A corrupt length is refused, not believed.** The on-disk record header
+carries the blob's length as a 32-bit field, and the reader bounds it: a
+record claiming a length far beyond anything this extension writes is
+treated as a corrupt record and reported as one, rather than being
+allocated and hashed on the strength of a number that came out of the
+file. A tail that was truncated by a crash is still repaired
+automatically on the next write.
+
+**`first_failure_id` counts records in the file, not records of one
+kind.** One ledger file carries the QTL chain, the decision-audit chain
+and the write-ahead records side by side, and the verifier walks one
+kind's chain at a time. The id it reports on a failure is the record's
+position in the FILE (1-based), so it is the number an operator can
+actually go and look the record up by; the count of records verified
+(`rows_verified`) remains the count for the kind that was asked for.
+
 A CISO audit trail can still be read back with plain SQL:
 `sql/install_enterprise_connect.sql` maps the ledger's CSV mirror into a
 real, read-only table via MariaDB's CONNECT storage engine (a separate
@@ -246,6 +297,40 @@ SELECT fractal_audit_unpack(FROM_BASE64(blob_b64))
   FROM fractalsql_ledger WHERE kind = 1 ORDER BY id DESC LIMIT 1;
 -- [{"epoch":1,"doc_id":1,"signal":"truth"}, ...]
 ```
+
+#### Two things the CSV mirror does not do
+
+The **binary chain file is the sole authoritative store**; the CSV is a
+best-effort, read-only convenience view of it, and two gaps follow from
+that. Both are properties of the mirror, not of the chain — the chain
+itself is unaffected by either.
+
+1. **Torn-tail repair does not repair the mirror.** If a crash truncates
+   the binary file mid-record, the repair step truncates the *binary* file
+   at that record, but the CSV keeps the row for the record that was
+   discarded. After such a crash the mirror can therefore carry **one row
+   the chain no longer has** — and the mirror is never rewritten from the
+   binary file. `fractal_ledger_verify` reads the binary file, so it is
+   the authority on what the chain holds; treat a mirror row with no
+   corresponding chain record as an artifact of the crash, not as a
+   tampered record.
+2. **The mirror's path is not derived from the ledger's path.** The CSV
+   lives beside the binary chain file (`<ledger path>.csv`), but
+   `sql/install_enterprise_connect.sql` **hard-defaults** its `FILE_NAME`
+   to `/run/fractalsql/fractalsql_ledger.dat.csv`. If the daemon runs
+   with a non-default `enterprise_ledger_path`, set the path in the
+   install script's `@fsql_ledger_csv` variable (or edit the COALESCE)
+   to match. Getting this wrong is **silent**: the CONNECT table is
+   created fine and simply reads zero rows, which looks exactly like an
+   empty ledger.
+
+The mirror's `id` column is the record's position in the chain — a single
+sequence shared by kind=1 and kind=2 rows, so `ORDER BY id DESC` names
+the same row the chain's own tip does. It is taken from the chain's
+record count rather than re-derived from the mirror file's own line
+count, so a CSV row that failed to write (the CSV write is best-effort)
+leaves a gap in the mirror's ids instead of handing the same id out
+twice.
 
 ### External anchoring (closing the truncation gap)
 
@@ -300,10 +385,102 @@ SQL-visible `WARNING` channel reachable from this lazy, first-call load
 path) and the library still loads, so this is backward compatible with
 unsigned releases. An **invalid** signature (present but wrong) is
 always refused regardless of the setting: unambiguous tamper evidence,
-unlike a merely absent file. New enterprise releases only need a fresh
+unlike a merely absent file. A library that cannot be **read** for
+verification at all (an unreadable `.so`, an unreadable `.sig`, a
+permissions problem, a race with the operator re-signing) is refused
+on the same terms as a missing signature when the setting is on: the
+operator asked for a signed library, and a file nobody could read is
+not one. With the setting off, that library is still loaded — the load
+may well succeed where the read failed — and the log says it was
+loaded unverified. New enterprise releases only need a fresh
 signature from the same long-lived key; this extension never needs
 rebuilding, preserving the drop-in-`.so` design a hash pin would have broken.
-(See `build_test` gate 26.)
+
+### Data at rest
+
+What this tier writes to disk, and how each file is protected.
+
+| What | Where | Protection |
+| --- | --- | --- |
+| The hash-chained ledger | the file `enterprise_ledger_path` names — default `fractalsql_ledger.dat`, relative to the daemon's working directory | mode `0600`, tightened again on every open |
+| The CSV mirror | `<ledger>.csv`, beside the chain file | mode `0600`; the CONNECT table over it is `READONLY=1`, so a stray SQL client cannot rewrite a row through it |
+| The chain head | `<ledger>.head`, beside the chain file | mode `0600`; each record carries an HMAC-SHA256 MAC |
+| The ledger key | `enterprise_ledger_key` in `fractalsqld.conf` (or `FRACTALSQL_ENTERPRISE_LEDGER_KEY`) | a secret; the conf file's own permissions are checked at startup and at every reload |
+
+A file left behind by an older build keeps no wider permissions than a
+freshly created one: every open tightens the mode again rather than
+trusting what is on disk. Treat the ledger the way you treat the data it
+holds, and use encryption at rest on the volume when the data warrants it.
+
+**The head file is what makes a truncation visible.** A hash chain cannot
+show that its newest records were cut off the end — nothing follows the
+last record to disagree with it — so the number of records each chain was
+ever appended is recorded *outside* the chain, in `<ledger>.head`. A
+truncation cannot pull that counter down and hide itself.
+
+Each head record is written as `kind=<n> rows=<n>` with an HMAC-SHA256
+MAC over exactly that content, keyed with the enterprise ledger key, so a
+counter that has been edited by hand is detected rather than trusted. The
+head file is replaced atomically (a temporary file, then a rename), so a
+reader never sees a half-written record.
+
+`fractal_ledger_verify` names the failure rather than collapsing it into
+one "bad chain" answer:
+
+| What it found | What it says |
+| --- | --- |
+| The head record has no MAC | it was written before the ledger key was set |
+| The head record's MAC does not match its contents | the head was edited by hand |
+| The head file will not parse | it is corrupt, or was edited by hand |
+| The chain holds fewer rows than the head recorded | rows were removed, or the ledger was replaced |
+
+**The head can be published to a store the database administrator cannot
+rewrite.** With `FSQL_LEDGER_ANCHOR_LOG=stderr` (or `syslog` where the
+platform has one) the daemon emits one JSON line on every successful
+append:
+
+```json
+{"event":"ledger_head","kind":2,"rows":17,"hash":"<hex of the newest entry hash>"}
+```
+
+`kind` is the chain, `rows` is how many records that chain has ever held,
+and `hash` is the newest entry hash. A chain whose tail was deleted no
+longer matches the last line published, so a truncation is visible from
+the log even though it is invisible from the file alone. Nothing is
+published while the anchor log is off. This is the built-in counterpart
+to `scripts/enterprise/anchor-ledger.sh` described above: the script
+takes the tip on demand, and this setting publishes it on every append.
+
+**The free text of an audit entry can be redacted.** The question an agent
+was asked, the SQL it generated, the analysis it wrote and the rows it
+read can all carry customer data. `FSQL_AUDIT_REDACT` decides what the
+chain keeps:
+
+| `FSQL_AUDIT_REDACT` | What is stored |
+| --- | --- |
+| `none` (default) | The text, as it is. |
+| `hash` | `sha256:<hex> len=<bytes>` — the fingerprint of the text and its length, so equal texts stay comparable and the length is known, but the text is not. |
+| `truncate` | The first 64 characters of the text. |
+
+Redaction reaches the fields nested inside the entry as well as the entry
+itself, and leaves everything else alone: identifiers, counts, statuses
+and the attribution block are stored as they are. The values returned to
+the caller are never redacted — the agent still answers with the real
+question, the real SQL and the real analysis; only what is persisted
+changes.
+
+**The chain is capped, not rotated.** The ledger is append-only, so it is
+bounded by size rather than turned over: `FRACTALSQL_LEDGER_MAX_BYTES`
+(default 1 GiB; `0` for unbounded) is the size past which appends are
+refused. The operator archives the file and starts a new chain.
+
+**A native plugin has to be verified before it is loaded.** A native
+library is loaded only if its detached `.sig` is a valid Ed25519
+signature, or its SHA-256 matches `FRACTALSQL_REASONING_PLUGIN_SHA256` (64
+hex digits). A plugin with neither is refused.
+`FRACTALSQL_REASONING_ALLOW_UNVERIFIED` is the operator's explicit
+opt-out; set it only when you have another way to establish what you are
+loading.
 
 ---
 

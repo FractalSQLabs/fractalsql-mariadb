@@ -191,7 +191,7 @@ jobs:
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "2.0.10"
+              test "${VERSION}" = "2.0.11"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -391,7 +391,7 @@ jobs:
   # community-sovereign-c.a into the daemon, the same vendored core
   # archive the Linux build links.
   #
-  # Both cells run on macos-14, since GitHub retired the free macos-13
+  # Both cells run on macos-15, since GitHub retired the free macos-13 and macos-14
   # (Intel) runner in Dec 2025, so amd64 is a cross-compile
   # (`-arch x86_64`, via FSQ_ARCH_FLAGS) on the arm64 runner rather
   # than a native build. The vendored core archive is a real per-arch
@@ -417,7 +417,7 @@ jobs:
             platform_tag: osx_amd64
           - arch: arm64
             platform_tag: osx_arm64
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -438,7 +438,7 @@ jobs:
           # 'libmariadb' not found". Point pkg-config at the keg.
           echo "PKG_CONFIG_PATH=$(brew --prefix mariadb-connector-c)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      # The macos-14 runner is arm64, so arm-Homebrew's openssl@3 keg
+      # The macos-15 runner is arm64, so arm-Homebrew's openssl@3 keg
       # contains only arm64 objects; linking them into an -arch x86_64
       # build makes ld discard every member ("found architecture
       # 'arm64', required architecture 'x86_64'") and all EVP symbols
@@ -506,6 +506,26 @@ jobs:
           cp service/build/fractalsql.so "${OUT_DIR}/fractalsql.so"
           cp service/build/fractalsqld "${OUT_DIR}/fractalsqld"
           ls -l "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld"
+
+      # The MCP server for both architectures, from this one runner. MariaDB Connector/C and OpenSSL are linked
+      # statically and built for the target architecture (scripts/macos/build-mcp.sh), because Homebrew has the
+      # host architecture only; the Intel binary uses the x86_64 OpenSSL tree built above.
+      - name: Build fractalsql-mariadb-mcp
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+              OPENSSL_DIR="/tmp/openssl-x64"
+          else
+              OPENSSL_DIR="$(brew --prefix openssl@3)"
+          fi
+          bash scripts/macos/build-mcp.sh "${{ matrix.arch }}" "${OPENSSL_DIR}" "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp"
+          # The Intel binary can only run here under Rosetta, which may be absent; the native one always runs.
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+              "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --version
+              "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --list-tools | head -3
+          else
+              "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --version || echo "note: the x86_64 binary could not run on this arm64 runner"
+          fi
 
       - name: Posture checks (otool, size, exports)
         run: |
@@ -594,6 +614,7 @@ jobs:
                      _fractal_ledger_compact _fractal_ledger_compact_init _fractal_ledger_compact_deinit \
                      _fractal_ledger_reset_soft _fractal_ledger_reset_soft_init _fractal_ledger_reset_soft_deinit \
                      _fractal_ledger_reset_hard _fractal_ledger_reset_hard_init _fractal_ledger_reset_hard_deinit \
+                     _fractal_lock_destructive _fractal_lock_destructive_init _fractal_lock_destructive_deinit \
                      _fractal_ledger_truth_count _fractal_ledger_truth_count_init _fractal_ledger_truth_count_deinit \
                      _fractal_ledger_shadow_count _fractal_ledger_shadow_count_init _fractal_ledger_shadow_count_deinit \
                      _fractal_audit_unpack _fractal_audit_unpack_init _fractal_audit_unpack_deinit; do
@@ -626,9 +647,16 @@ jobs:
           cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
           cp sql/install_udf.sql "${STAGE}/install_udf.sql"
           cp sql/install_agents.sql "${STAGE}/install_agents.sql"
+          # MCP server: the executable and its two lock files sit together, which is
+          # where the server looks for the locks.
+          if [ -f "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" ]; then
+              install -d "${STAGE}/mcp"
+              install -m 0755 "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" "${STAGE}/mcp/fractalsql-mariadb-mcp"
+              install -m 0644 mcp/.mcp-schema-lock mcp/.mcp-safety-annotations-lock mcp/README.md mcp/manifest.json "${STAGE}/mcp/"
+          fi
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
-          fractalsql-mariadb 2.0.10 Community (${{ matrix.platform_tag }})
+          fractalsql-mariadb 2.0.11 Community (${{ matrix.platform_tag }})
 
           Unsigned, for macOS. Compatible with MariaDB 10.6 / 10.11 /
           11.4 LTS / 12.3 LTS via Homebrew.
@@ -856,6 +884,33 @@ jobs:
           if errorlevel 1 exit /b 1
           dir "%OUT_DIR%\fractalsql.dll"
 
+      # The MCP server ships in the same MSI, in its own folder under the MariaDB root, with its two
+      # lock files beside the executable (that is where the server looks for them).
+      - name: Build fractalsql-mariadb-mcp.exe
+        shell: cmd
+        env:
+          MARIADB_MAJOR: ${{ matrix.mariadb_major }}
+          VCPKG_ROOT: 'C:\vcpkg'
+        run: |
+          set MARIADB_DIR=%CD%\deps\mariadb\root
+          call mcp\scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          if not exist "mcp\dist\windows-mcp\fractalsql-mariadb-mcp.exe" (
+              echo ==^> ERROR: fractalsql-mariadb-mcp.exe was not produced
+              exit /b 1
+          )
+          if not exist "mcp\dist\windows-mcp\libmariadb.dll" (
+              echo ==^> ERROR: libmariadb.dll was not staged beside the MCP server
+              exit /b 1
+          )
+
+      - name: Smoke-check fractalsql-mariadb-mcp.exe
+        shell: cmd
+        run: |
+          mcp\dist\windows-mcp\fractalsql-mariadb-mcp.exe --version
+          if errorlevel 1 exit /b 1
+          mcp\dist\windows-mcp\fractalsql-mariadb-mcp.exe --list-tools
+
       - name: Smoke-check fractalsql.dll dependencies (dumpbin)
         shell: pwsh
         env:
@@ -977,3 +1032,25 @@ jobs:
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishes SHA256SUMS for every asset on the release. scripts/easy_install.sh refuses to install a
+  # download whose checksum does not match this file.
+  checksums:
+    needs: [package, build-macos, build-windows-msi]
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Compute and upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*' --skip-existing
+          rm -f SHA256SUMS
+          sha256sum * | sort -k2 > ../SHA256SUMS
+          cd ..
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

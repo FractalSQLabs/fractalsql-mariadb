@@ -72,7 +72,42 @@
 -- to primitives that already carry the right INVOKER/DEFINER setting;
 -- there's no privilege elevation need here the way
 -- fractal_vectorizer_create's own CREATE TRIGGER step has.
+--
+-- Shared helpers: the seven procedures named _fractalsql_agent_* below
+-- are the parts every engine used to repeat inline. They are private to
+-- this script (the leading underscore marks them, and the demo's
+-- agent-listing check ignores them), and they exist so the per-engine
+-- bodies stay readable:
+--
+--   _fractalsql_agent_fail        one SIGNAL, with the calling engine's
+--                                 name prefixed onto the reason, so every
+--                                 engine's error reads "<engine>: <why>"
+--   _fractalsql_agent_require_ident
+--                                 rejects a NULL identifier argument
+--   _fractalsql_agent_require_rows
+--                                 rejects an empty JSON row set
+--   _fractalsql_agent_reason      calls fractal_reason and applies the
+--                                 shared partial-mode sentinel split
+--   _fractalsql_agent_nearest1    pulls doc_id and dist out of the
+--                                 nearest-neighbour JSON
+--   _fractalsql_agent_pk_col      resolves a table's single-column
+--                                 PRIMARY KEY column name
+--   _fractalsql_agent_cohort      collects a table's primary keys as a
+--                                 JSON array, optionally filtered
+--
+-- Every message these helpers raise is byte-identical to the inline form
+-- it replaced; the helpers move the text, they do not reword it. Note
+-- that MariaDB's stored-routine grammar has no DEFAULT clause for a
+-- parameter (unlike MySQL 8.0.13+), so the helpers take their reason
+-- text as a required argument rather than a default.
 
+DROP PROCEDURE IF EXISTS _fractalsql_agent_fail;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_require_ident;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_require_rows;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_reason;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_nearest1;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_pk_col;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_cohort;
 DROP PROCEDURE IF EXISTS fractal_agent_anomaly_triage;
 DROP PROCEDURE IF EXISTS fractal_agent_allocate;
 DROP PROCEDURE IF EXISTS fractal_agent_diverse_portfolios;
@@ -98,6 +133,188 @@ DROP PROCEDURE IF EXISTS fractal_agent_detect_loop;
 DELIMITER $$
 
 -- =====================================================================
+-- Shared helpers for the agent tier.
+--
+-- Every engine below follows the same shape: check the arguments,
+-- gather some data, ask the reasoning tier for a narration, log the
+-- decision to the audit chain, and emit one JSON document. Four steps
+-- of that shape were spelled out in full in every engine -- and a step
+-- copied into twenty-one procedures is a step that eventually gets
+-- fixed in one of them and missed in the other twenty. These helpers
+-- are where the shared step lives.
+--
+-- They are ordinary stored procedures, SQL SECURITY INVOKER like the
+-- engines themselves, and carry the underscore prefix so they stay out
+-- of the public procedure namespace.
+--
+-- The tier's failure wording is "<procedure>: <reason>", and the reason
+-- text is part of the contract -- the build gates assert on it
+-- ("identifier arguments must not be NULL") -- so the helpers
+-- reproduce the existing wording exactly rather than rephrasing it.
+-- =====================================================================
+
+-- _fractalsql_agent_fail(proc, reason)
+-- The tier's standard error. SIGNAL's SET MESSAGE_TEXT takes a literal
+-- or a VARIABLE, not an expression, so the concatenation happens first.
+-- The declared width is generous on purpose: the longest message in
+-- this tier (the enterprise-tier-not-loaded notice) is well past the
+-- 128 characters MySQL documents, and MariaDB does not truncate it.
+CREATE PROCEDURE _fractalsql_agent_fail(
+    IN p_proc   VARCHAR(64),
+    IN p_reason VARCHAR(255)
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_msg VARCHAR(320) DEFAULT '';
+    SET v_msg = CONCAT(p_proc, ': ', p_reason);
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+END$$
+
+-- _fractalsql_agent_require_ident(proc, idents, reason)
+-- The required-argument guard: every argument in p_idents must be
+-- present. p_idents is a JSON array of the arguments that must not be
+-- NULL, and the reason is the caller's own wording ("identifier
+-- arguments must not be NULL" for the tier's standard case).
+--
+-- The reason is a required argument rather than a defaulted one:
+-- MariaDB's stored-routine grammar has no DEFAULT clause for
+-- parameters (MySQL 8.0.13 added one; MariaDB has not), so a helper
+-- that wanted a default would have to spell it out at every call
+-- site anyway.
+--
+-- JSON_ARRAY() keeps a NULL argument as a JSON null rather than
+-- dropping it, so the array still has one slot per argument the caller
+-- passed, and JSON_CONTAINS tells a JSON null apart from the STRING
+-- "null" -- an argument may legitimately be named "null".
+CREATE PROCEDURE _fractalsql_agent_require_ident(
+    IN p_proc   VARCHAR(64),
+    IN p_idents JSON,
+    IN p_reason VARCHAR(255)
+)
+SQL SECURITY INVOKER
+BEGIN
+    IF p_idents IS NULL OR JSON_LENGTH(p_idents) = 0 OR JSON_CONTAINS(p_idents, 'null') THEN
+        CALL _fractalsql_agent_fail(p_proc, p_reason);
+    END IF;
+END$$
+
+-- _fractalsql_agent_require_rows(proc, reason, hits)
+-- The "the search found nothing" guard. The reason is the caller's own
+-- wording ("no capability rows found", "no allocation rows found"), so
+-- each engine keeps the message it always had.
+CREATE PROCEDURE _fractalsql_agent_require_rows(
+    IN p_proc   VARCHAR(64),
+    IN p_reason VARCHAR(255),
+    IN p_hits   TEXT
+)
+SQL SECURITY INVOKER
+BEGIN
+    IF p_hits IS NULL OR JSON_LENGTH(p_hits) = 0 THEN
+        CALL _fractalsql_agent_fail(p_proc, p_reason);
+    END IF;
+END$$
+
+-- _fractalsql_agent_reason(session, prompt, context, OUT reason, OUT failed)
+-- The narration step: ask the reasoning tier, then split its
+-- partial-failure sentinel into the sibling detail field and a NULL
+-- rationale.
+--
+-- The split is what makes a reasoning-endpoint failure survivable: the
+-- data half of the answer still reaches the caller, and the failure
+-- rides alongside it as 'reasoning_step_failed' instead of turning the
+-- whole document into an error. A reasoning-endpoint failure with the
+-- session's partial mode on leaves the reply as
+-- {"reasoning_step_failed":...}; this is where that sentinel is
+-- recognised and split.
+--
+-- The split must happen exactly once per reply. An engine that asks
+-- for a narration through this helper gets the split here, and must
+-- not repeat it downstream -- a second split over an already-split
+-- value would overwrite the failure detail with NULL.
+CREATE PROCEDURE _fractalsql_agent_reason(
+    IN  p_session_id BIGINT UNSIGNED,
+    IN  p_prompt     TEXT,
+    IN  p_context    TEXT,
+    OUT o_reason     TEXT,
+    OUT o_failed     TEXT
+)
+SQL SECURITY INVOKER
+BEGIN
+    SET o_reason = fractal_reason(p_session_id, p_prompt, p_context);
+    SET o_failed = _fractalsql_reasoning_partial(o_reason);
+    IF o_failed IS NOT NULL THEN SET o_reason = NULL; END IF;
+END$$
+
+-- _fractalsql_agent_nearest1(hits, OUT doc_id, OUT dist)
+-- The nearest-hit extraction: every engine that searches a table ends
+-- by reading the first hit's id and distance, and every one of them
+-- used to spell that out by hand.
+CREATE PROCEDURE _fractalsql_agent_nearest1(
+    IN  p_hits   TEXT,
+    OUT o_doc_id VARCHAR(255),
+    OUT o_dist   DOUBLE
+)
+SQL SECURITY INVOKER
+BEGIN
+    SET o_doc_id = JSON_VALUE(p_hits, '$[0].doc_id');
+    SET o_dist   = JSON_VALUE(p_hits, '$[0].dist');
+END$$
+
+-- _fractalsql_agent_pk_col(proc, label, table, OUT pk_col)
+-- Resolve a table's single-column PRIMARY KEY, and fail with the
+-- caller's own wording if it does not have exactly one. The label is
+-- the argument name the caller used ("mem_table", "patient_table"),
+-- so the message still names what the caller passed.
+CREATE PROCEDURE _fractalsql_agent_pk_col(
+    IN  p_proc   VARCHAR(64),
+    IN  p_label  VARCHAR(64),
+    IN  p_table  VARCHAR(128),
+    OUT o_pk_col VARCHAR(64)
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_pk_count INT DEFAULT 0;
+    SELECT COUNT(*) INTO v_pk_count FROM information_schema.key_column_usage
+    WHERE table_schema = DATABASE() AND table_name = p_table AND constraint_name = 'PRIMARY';
+    IF v_pk_count <> 1 THEN
+        CALL _fractalsql_agent_fail(p_proc,
+            CONCAT(p_label, ' must have exactly one single-column PRIMARY KEY'));
+    END IF;
+    SELECT column_name INTO o_pk_col FROM information_schema.key_column_usage
+    WHERE table_schema = DATABASE() AND table_name = p_table AND constraint_name = 'PRIMARY' LIMIT 1;
+END$$
+
+-- _fractalsql_agent_cohort(table, pk_col, filter_col, filter_val, OUT cohort)
+-- The cohort builder: the table's own primary-key values, optionally
+-- restricted to a strict SQL filter, as one JSON array. A NULL
+-- filter_col means every row.
+CREATE PROCEDURE _fractalsql_agent_cohort(
+    IN  p_table      VARCHAR(128),
+    IN  p_pk_col     VARCHAR(64),
+    IN  p_filter_col VARCHAR(64),
+    IN  p_filter_val VARCHAR(255),
+    OUT o_cohort     JSON
+)
+SQL SECURITY INVOKER
+BEGIN
+    IF p_filter_col IS NULL THEN
+        SET @_fractalsql_cohort_sql = CONCAT(
+            'SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(p_pk_col),
+            ') INTO @_fractalsql_cohort FROM ', _fractalsql_quote_ident(p_table));
+    ELSE
+        SET @_fractalsql_cohort_sql = CONCAT(
+            'SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(p_pk_col),
+            ') INTO @_fractalsql_cohort FROM ', _fractalsql_quote_ident(p_table),
+            ' WHERE ', _fractalsql_quote_ident(p_filter_col), ' = ', QUOTE(p_filter_val));
+    END IF;
+    SET @_fractalsql_cohort = NULL;
+    PREPARE _fractalsql_cohort_stmt FROM @_fractalsql_cohort_sql;
+    EXECUTE _fractalsql_cohort_stmt;
+    DEALLOCATE PREPARE _fractalsql_cohort_stmt;
+    SET o_cohort = @_fractalsql_cohort;
+END$$
+
+-- =====================================================================
 -- Engine A: fractal_agent_anomaly_triage
 -- fractal_dimension_drift + fractal_reason. Reads one entity's metric
 -- time series from log_table (filtered by filter_col = filter_val,
@@ -119,12 +336,12 @@ BEGIN
     DECLARE v_series      TEXT;
     DECLARE v_drift        TEXT;
     DECLARE v_reasoning    TEXT;
+    DECLARE v_reasoning_failed TEXT;
     DECLARE v_window       INT DEFAULT IFNULL(p_baseline_window, 32);
     DECLARE v_audit        BIGINT DEFAULT 0;
 
-    IF p_log_table IS NULL OR p_metric_col IS NULL OR p_time_col IS NULL OR p_filter_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_anomaly_triage: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_anomaly_triage', JSON_ARRAY(p_log_table, p_metric_col, p_time_col, p_filter_col),
+        'identifier arguments must not be NULL');
 
     SET @_fractalsql_at_sql = CONCAT(
         'SELECT CONCAT(''['', GROUP_CONCAT(', _fractalsql_quote_ident(p_metric_col),
@@ -138,22 +355,24 @@ BEGIN
     SET v_series = @_fractalsql_at_series;
 
     IF v_series IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_anomaly_triage: no rows matching the filter';
+        CALL _fractalsql_agent_fail('fractal_agent_anomaly_triage', 'no rows matching the filter');
     END IF;
 
     SET v_drift = fractal_dimension_drift(v_series, v_window);
-    SET v_reasoning = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Triage this anomaly: ', v_drift),
-        JSON_OBJECT('table', p_log_table, p_filter_col, p_filter_val));
+        JSON_OBJECT('table', p_log_table, p_filter_col, p_filter_val),
+        v_reasoning, v_reasoning_failed);
 
     SET v_audit = fractal_audit_log('agent_anomaly_triage', JSON_OBJECT(
         'threat_score', IFNULL(JSON_VALUE(v_drift, '$.drift'), 0.0),
-        'anomaly_type', 'vector_drift', 'triage_summary', v_reasoning));
+        'anomaly_type', 'vector_drift', 'triage_summary', v_reasoning), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'threat_score', IFNULL(JSON_VALUE(v_drift, '$.drift'), 0.0),
         'anomaly_type', 'vector_drift',
-        'triage_summary', v_reasoning);
+        'triage_summary', v_reasoning,
+        'reasoning_step_failed', v_reasoning_failed);
 END$$
 
 -- =====================================================================
@@ -173,13 +392,15 @@ BEGIN
     DECLARE v_opt      TEXT;
     DECLARE v_sharpe    DOUBLE;
     DECLARE v_reasoning TEXT;
+    DECLARE v_reasoning_failed TEXT;
     DECLARE v_audit     BIGINT DEFAULT 0;
 
     SET v_opt = fractal_optimize_portfolio(p_mu, p_cov, p_cardinality, '{}');
     SET v_sharpe = IFNULL(JSON_VALUE(v_opt, '$.sharpe'), 0.0);
-    SET v_reasoning = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Explain this cardinality-constrained allocation and its risk/return: ', v_opt),
-        IFNULL(p_context, '{}'));
+        IFNULL(p_context, '{}'),
+        v_reasoning, v_reasoning_failed);
 
     -- Use JSON_EXTRACT(v_opt, '$'), not CAST(v_opt AS CHAR). We verified
     -- live that JSON_OBJECT() string-escapes a plain TEXT/JSON-typed
@@ -193,9 +414,11 @@ BEGIN
     -- Complements fractal_optimize_portfolio's own audit-chain entry:
     -- the optimizer logs the raw decision, this logs the narrated one.
     SET v_audit = fractal_audit_log('agent_allocate', JSON_OBJECT(
-        'sharpe', v_sharpe, 'cardinality', p_cardinality, 'rationale', v_reasoning));
+        'sharpe', v_sharpe, 'cardinality', p_cardinality, 'rationale', v_reasoning), CONNECTION_ID(), CURRENT_USER());
 
-    SET p_result = JSON_OBJECT('allocation', JSON_EXTRACT(v_opt, '$'), 'sharpe', v_sharpe, 'rationale', v_reasoning);
+    SET p_result = JSON_OBJECT(
+        'allocation', JSON_EXTRACT(v_opt, '$'), 'sharpe', v_sharpe, 'rationale', v_reasoning,
+        'reasoning_step_failed', v_reasoning_failed);
 END$$
 
 -- =====================================================================
@@ -220,34 +443,33 @@ BEGIN
     DECLARE v_dist       DOUBLE;
     DECLARE v_confidence DOUBLE;
     DECLARE v_rationale  TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_cost       INT DEFAULT IFNULL(p_cost_per_route, 150);
     DECLARE v_audit      BIGINT DEFAULT 0;
 
-    IF p_cap_table IS NULL OR p_cap_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_route_task: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_route_task', JSON_ARRAY(p_cap_table, p_cap_emb_col),
+        'identifier arguments must not be NULL');
 
     CALL fractal_search_telemetry(p_cap_table, p_cap_emb_col, p_task_emb, 1, v_telemetry);
-    IF v_telemetry IS NULL OR JSON_LENGTH(v_telemetry) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_route_task: no capability rows found';
-    END IF;
+    CALL _fractalsql_agent_require_rows('fractal_agent_route_task', 'no capability rows found', v_telemetry);
 
-    SET v_routed_to = JSON_VALUE(v_telemetry, '$[0].doc_id');
-    SET v_dist       = JSON_VALUE(v_telemetry, '$[0].dist');
+    CALL _fractalsql_agent_nearest1(v_telemetry, v_routed_to, v_dist);
     SET v_confidence  = 1.0 / (1.0 + v_dist);
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Route this task to capability ', IFNULL(v_routed_to, '?'),
                ' (cosine distance ', v_dist, '). Justify the routing in one sentence.'),
-        JSON_OBJECT('budget', p_budget, 'cost_per_route', v_cost));
+        JSON_OBJECT('budget', p_budget, 'cost_per_route', v_cost),
+        v_rationale, v_rationale_failed);
 
     SET v_audit = fractal_audit_log('agent_route_task', JSON_OBJECT(
         'routed_to', v_routed_to, 'confidence', v_confidence,
-        'remaining_budget', p_budget - v_cost, 'rationale', v_rationale));
+        'remaining_budget', p_budget - v_cost, 'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'routed_to', v_routed_to, 'confidence', v_confidence,
-        'remaining_budget', p_budget - v_cost, 'rationale', v_rationale);
+        'remaining_budget', p_budget - v_cost, 'rationale', v_rationale,
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -277,6 +499,7 @@ BEGIN
     DECLARE v_dist       DOUBLE;
     DECLARE v_intercepted BOOLEAN;
     DECLARE v_reason     TEXT;
+    DECLARE v_reason_failed TEXT;
     DECLARE v_audit      BIGINT DEFAULT 0;
     DECLARE v_corpus     JSON;
     DECLARE v_ids        JSON;
@@ -288,19 +511,17 @@ BEGIN
     DECLARE v_nearest    JSON;
 
     IF p_metric IS NULL OR p_metric NOT IN ('cosine', 'l2') THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: metric must be ''cosine'' or ''l2''';
+        CALL _fractalsql_agent_fail('fractal_agent_outlier_intercept',
+            'metric must be ''cosine'' or ''l2''');
     END IF;
-    IF p_history_table IS NULL OR p_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_outlier_intercept', JSON_ARRAY(p_history_table, p_emb_col),
+        'identifier arguments must not be NULL');
 
     IF p_metric = 'cosine' THEN
         -- The exact telemetry engine, as calibrated. Works for JSON and
         -- native VECTOR columns alike (the scan helper handles both).
         CALL fractal_search_telemetry(p_history_table, p_emb_col, p_state_vec, 1, v_telemetry);
-        IF v_telemetry IS NULL OR JSON_LENGTH(v_telemetry) = 0 THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: no bad-state rows found';
-        END IF;
+        CALL _fractalsql_agent_require_rows('fractal_agent_outlier_intercept', 'no bad-state rows found', v_telemetry);
 
         SET v_dist    = JSON_VALUE(v_telemetry, '$[0].dist');
         SET v_nearest = JSON_EXTRACT(v_telemetry, '$[0].doc_id');
@@ -314,24 +535,25 @@ BEGIN
         -- (it skips '[', ']', ',' and whitespace), so no CSV
         -- reformatting is needed here.
         CALL _fractalsql_scan_corpus(p_history_table, p_emb_col, v_corpus, v_ids);
-        IF v_corpus IS NULL OR JSON_LENGTH(v_corpus) = 0 THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: no bad-state rows found';
-        END IF;
+        CALL _fractalsql_agent_require_rows('fractal_agent_outlier_intercept', 'no bad-state rows found', v_corpus);
 
         SET v_dim = JSON_LENGTH(p_state_vec);
         IF v_dim IS NULL OR v_dim < 1 THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: state_vec must be a non-empty JSON array of numbers';
+            CALL _fractalsql_agent_fail('fractal_agent_outlier_intercept',
+                'state_vec must be a non-empty JSON array of numbers');
         END IF;
 
         SET v_n = JSON_LENGTH(v_corpus);
         WHILE v_i < v_n DO
             SET v_row = CAST(JSON_EXTRACT(v_corpus, CONCAT('$[', v_i, ']')) AS CHAR);
             IF JSON_LENGTH(v_row) <> v_dim THEN
-                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: a history row''s dimension differs from state_vec''s';
+                CALL _fractalsql_agent_fail('fractal_agent_outlier_intercept',
+                    'a history row''s dimension differs from state_vec''s');
             END IF;
             SET v_d = fractal_vector_lp_distance(v_row, p_state_vec, 2.0);
             IF v_d IS NULL THEN
-                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_outlier_intercept: L2 distance computation failed for a history row';
+                CALL _fractalsql_agent_fail('fractal_agent_outlier_intercept',
+                    'L2 distance computation failed for a history row');
             END IF;
             IF v_dist IS NULL OR v_d < v_dist THEN
                 SET v_dist    = v_d;
@@ -343,21 +565,23 @@ BEGIN
 
     SET v_intercepted = (v_dist < p_threshold);
 
-    SET v_reason = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Outlier intercept: nearest known-bad state is at ', p_metric, ' distance ', v_dist,
                ', threshold ', p_threshold, ', so ',
                IF(v_intercepted, 'INTERCEPT', 'allow'),
                '. Justify the decision in one sentence.'),
-        JSON_OBJECT('threshold', p_threshold, 'metric', p_metric, 'intercepted', v_intercepted));
+        JSON_OBJECT('threshold', p_threshold, 'metric', p_metric, 'intercepted', v_intercepted),
+        v_reason, v_reason_failed);
 
     -- High-value trail: this engine can block a proposed state/action.
     SET v_audit = fractal_audit_log('agent_outlier_intercept', JSON_OBJECT(
         'intercepted', v_intercepted, 'nearest_distance', v_dist,
-        'threshold', p_threshold, 'metric', p_metric, 'reason', v_reason));
+        'threshold', p_threshold, 'metric', p_metric, 'reason', v_reason), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT('intercepted', v_intercepted,
                                'nearest_distance', v_dist, 'nearest_doc_id', v_nearest,
-                               'metric', p_metric, 'reason', v_reason);
+                               'metric', p_metric, 'reason', v_reason,
+                               'reasoning_step_failed', v_reason_failed);
 END$$
 
 -- =====================================================================
@@ -378,43 +602,21 @@ CREATE PROCEDURE fractal_agent_recall_hybrid(
 SQL SECURITY INVOKER
 BEGIN
     DECLARE v_pk_col   VARCHAR(64);
-    DECLARE v_pk_count INT DEFAULT 0;
     DECLARE v_cohort   JSON;
     DECLARE v_hits     TEXT;
 
-    IF p_mem_table IS NULL OR p_vec_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_recall_hybrid: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_recall_hybrid', JSON_ARRAY(p_mem_table, p_vec_col),
+        'identifier arguments must not be NULL');
 
-    SELECT COUNT(*) INTO v_pk_count FROM information_schema.key_column_usage
-    WHERE table_schema = DATABASE() AND table_name = p_mem_table AND constraint_name = 'PRIMARY';
-    IF v_pk_count <> 1 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_recall_hybrid: mem_table must have exactly one single-column PRIMARY KEY';
-    END IF;
-    SELECT column_name INTO v_pk_col FROM information_schema.key_column_usage
-    WHERE table_schema = DATABASE() AND table_name = p_mem_table AND constraint_name = 'PRIMARY' LIMIT 1;
+    CALL _fractalsql_agent_pk_col('fractal_agent_recall_hybrid', 'mem_table', p_mem_table, v_pk_col);
 
     -- The "hybrid" is the cohort: a strict SQL filter (filter_col =
     -- filter_val), or every row when filter_col is NULL. This uses the
     -- table's own real PK values (see this file's header, point 1).
-    IF p_filter_col IS NULL THEN
-        SET @_fractalsql_rh_sql = CONCAT(
-            'SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(v_pk_col), ') INTO @_fractalsql_rh_cohort FROM ',
-            _fractalsql_quote_ident(p_mem_table));
-    ELSE
-        SET @_fractalsql_rh_sql = CONCAT(
-            'SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(v_pk_col), ') INTO @_fractalsql_rh_cohort FROM ',
-            _fractalsql_quote_ident(p_mem_table), ' WHERE ', _fractalsql_quote_ident(p_filter_col),
-            ' = ', QUOTE(p_filter_val));
-    END IF;
-    SET @_fractalsql_rh_cohort = NULL;
-    PREPARE _fractalsql_rh_stmt FROM @_fractalsql_rh_sql;
-    EXECUTE _fractalsql_rh_stmt;
-    DEALLOCATE PREPARE _fractalsql_rh_stmt;
-    SET v_cohort = @_fractalsql_rh_cohort;
+    CALL _fractalsql_agent_cohort(p_mem_table, v_pk_col, p_filter_col, p_filter_val, v_cohort);
 
     IF v_cohort IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_recall_hybrid: filter matched no rows';
+        CALL _fractalsql_agent_fail('fractal_agent_recall_hybrid', 'filter matched no rows');
     END IF;
 
     CALL fractal_hybrid_clinical_search(p_mem_table, p_vec_col, p_query_vec, v_cohort, IFNULL(p_k, 5), v_hits);
@@ -461,9 +663,8 @@ BEGIN
     DECLARE v_session_id BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_telemetry TEXT;
 
-    IF p_catalog_table IS NULL OR p_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_recommend_diverse: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_recommend_diverse', JSON_ARRAY(p_catalog_table, p_emb_col),
+        'identifier arguments must not be NULL');
 
     SELECT fractal_diversify_enable(v_session_id) INTO @_fractalsql_rd_unused;
 
@@ -479,12 +680,20 @@ END$$
 -- =====================================================================
 -- Engine G: fractal_agent_data_analyst (horizontal catch-all)
 -- fractal_sql_agent + fractal_reason.
+--
+-- p_auto_execute is a REQUIRED argument (MariaDB stored procedures cannot
+-- carry DEFAULT values, so there is no default to fall back on): pass
+-- FALSE to generate and validate the statement WITHOUT running it -- the
+-- SQL still comes back in generated_sql so the caller can run it itself,
+-- and result_json and analysis are null -- or TRUE for the full
+-- NL->SQL->run->reason path. A NULL is treated as FALSE.
 -- =====================================================================
 CREATE PROCEDURE fractal_agent_data_analyst(
     IN  p_question    TEXT,
     IN  p_table_names JSON,
     IN  p_max_retries INT,
     IN  p_context     TEXT,
+    IN  p_auto_execute BOOLEAN,
     OUT p_result      JSON
 )
 SQL SECURITY INVOKER
@@ -494,22 +703,38 @@ BEGIN
     DECLARE v_status      VARCHAR(20);
     DECLARE v_result_json JSON;
     DECLARE v_analysis    TEXT;
+    DECLARE v_analysis_failed TEXT;
     DECLARE v_audit       BIGINT DEFAULT 0;
+    DECLARE v_exec        BOOLEAN DEFAULT FALSE;
 
-    CALL fractal_sql_agent(p_question, p_table_names, IFNULL(p_max_retries, 2), TRUE, v_sql, v_status, v_result_json);
+    SET v_exec = IFNULL(p_auto_execute, FALSE);
 
-    SET v_analysis = fractal_reason(v_session_id,
-        CONCAT('Analyze this database query result and answer in one paragraph: ',
-               IFNULL(CAST(v_result_json AS CHAR), 'null')),
-        IFNULL(p_context, '{}'));
+    CALL fractal_sql_agent(p_question, p_table_names, IFNULL(p_max_retries, 2), v_exec, v_sql, v_status, v_result_json);
 
-    -- High-value trail: this engine auto-executes LLM-generated SQL.
+    -- The reasoning step runs only when there is a result to read: with
+    -- auto_execute off nothing was executed, so the LLM is not called at
+    -- all and v_analysis / v_analysis_failed stay NULL ("not attempted",
+    -- not "failed").
+    IF v_exec THEN
+        CALL _fractalsql_agent_reason(v_session_id,
+            CONCAT('Analyze this database query result and answer in one paragraph: ',
+                   IFNULL(CAST(v_result_json AS CHAR), 'null')),
+            IFNULL(p_context, '{}'),
+            v_analysis, v_analysis_failed);
+    END IF;
+
+    -- High-value trail: this engine can execute LLM-generated SQL.
+    -- auto_execute is recorded so the chain distinguishes "generated and
+    -- run" from "generated only".
     SET v_audit = fractal_audit_log('agent_data_analyst', JSON_OBJECT(
         'question', p_question, 'generated_sql', v_sql,
-        'execution_status', v_status, 'analysis', v_analysis));
+        'execution_status', v_status, 'analysis', v_analysis,
+        'auto_execute', v_exec), CONNECTION_ID(), CURRENT_USER());
 
     -- JSON_EXTRACT(v_result_json, '$'): see Engine B's identical comment above.
-    SET p_result = JSON_OBJECT('analysis', v_analysis, 'generated_sql', v_sql, 'result_json', JSON_EXTRACT(v_result_json, '$'));
+    SET p_result = JSON_OBJECT(
+        'analysis', v_analysis, 'generated_sql', v_sql, 'result_json', JSON_EXTRACT(v_result_json, '$'),
+        'reasoning_step_failed', v_analysis_failed);
 END$$
 
 -- =====================================================================
@@ -530,7 +755,6 @@ SQL SECURITY INVOKER
 BEGIN
     DECLARE v_session_id BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_pk_col     VARCHAR(64);
-    DECLARE v_pk_count   INT DEFAULT 0;
     DECLARE v_cohort     JSON;
     DECLARE v_hybrid     TEXT;
     DECLARE v_traj       TEXT;
@@ -538,45 +762,31 @@ BEGIN
     DECLARE v_cohort_dist DOUBLE;
     DECLARE v_traj_dist   DOUBLE;
     DECLARE v_rationale   TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_cohort_matches JSON;
     DECLARE v_audit        BIGINT DEFAULT 0;
 
-    IF p_patient_table IS NULL OR p_vec_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_patient_deterioration_triage: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_patient_deterioration_triage', JSON_ARRAY(p_patient_table, p_vec_col),
+        'identifier arguments must not be NULL');
 
     IF p_cohort_doc_ids IS NOT NULL THEN
         SET v_cohort = p_cohort_doc_ids;
     ELSE
-        SELECT COUNT(*) INTO v_pk_count FROM information_schema.key_column_usage
-        WHERE table_schema = DATABASE() AND table_name = p_patient_table AND constraint_name = 'PRIMARY';
-        IF v_pk_count <> 1 THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_patient_deterioration_triage: patient_table must have exactly one single-column PRIMARY KEY';
-        END IF;
-        SELECT column_name INTO v_pk_col FROM information_schema.key_column_usage
-        WHERE table_schema = DATABASE() AND table_name = p_patient_table AND constraint_name = 'PRIMARY' LIMIT 1;
+        CALL _fractalsql_agent_pk_col('fractal_agent_patient_deterioration_triage', 'patient_table', p_patient_table, v_pk_col);
 
-        SET @_fractalsql_pt_sql = CONCAT('SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(v_pk_col),
-            ') INTO @_fractalsql_pt_cohort FROM ', _fractalsql_quote_ident(p_patient_table));
-        SET @_fractalsql_pt_cohort = NULL;
-        PREPARE _fractalsql_pt_stmt FROM @_fractalsql_pt_sql;
-        EXECUTE _fractalsql_pt_stmt;
-        DEALLOCATE PREPARE _fractalsql_pt_stmt;
-        SET v_cohort = @_fractalsql_pt_cohort;
+        CALL _fractalsql_agent_cohort(p_patient_table, v_pk_col, NULL, NULL, v_cohort);
     END IF;
 
     IF v_cohort IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_patient_deterioration_triage: cohort matched no rows';
+        CALL _fractalsql_agent_fail('fractal_agent_patient_deterioration_triage',
+            'cohort matched no rows');
     END IF;
 
     CALL fractal_hybrid_clinical_search(p_patient_table, p_vec_col, p_query_vec, v_cohort, IFNULL(p_k, 5), v_hybrid);
-    IF v_hybrid IS NULL OR JSON_LENGTH(v_hybrid) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_patient_deterioration_triage: hybrid search returned no row';
-    END IF;
+    CALL _fractalsql_agent_require_rows('fractal_agent_patient_deterioration_triage', 'hybrid search returned no row', v_hybrid);
     CALL fractal_search_trajectory(p_patient_table, p_vec_col, p_baseline_vec, p_current_vec, 1, v_traj);
 
-    SET v_cohort_id   = JSON_VALUE(v_hybrid, '$[0].doc_id');
-    SET v_cohort_dist = JSON_VALUE(v_hybrid, '$[0].dist');
+    CALL _fractalsql_agent_nearest1(v_hybrid, v_cohort_id, v_cohort_dist);
     SET v_traj_dist   = JSON_VALUE(v_traj, '$[0].dist');
 
     -- v_hybrid already carries up to IFNULL(p_k, 5) ranked cohort matches
@@ -587,11 +797,12 @@ BEGIN
       INTO v_cohort_matches
     FROM JSON_TABLE(v_hybrid, '$[*]' COLUMNS (doc_id VARCHAR(255) PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Triage this patient: nearest cohort match is id ', IFNULL(v_cohort_id, '?'),
                ' at cosine distance ', v_cohort_dist, '; baseline->current drift distance is ', v_traj_dist,
                '. Justify the deterioration triage in one sentence.'),
-        JSON_OBJECT('cohort_distance', v_cohort_dist, 'drift_distance', v_traj_dist));
+        JSON_OBJECT('cohort_distance', v_cohort_dist, 'drift_distance', v_traj_dist),
+        v_rationale, v_rationale_failed);
 
     -- JSON_OBJECT() treats a JSON-typed variable as a plain string and
     -- re-escapes it rather than nesting it (MariaDB's JSON type is a
@@ -602,12 +813,13 @@ BEGIN
     SET v_audit = fractal_audit_log('agent_patient_deterioration_triage', JSON_OBJECT(
         'nearest_cohort_id', v_cohort_id, 'cohort_distance', v_cohort_dist,
         'drift_distance', v_traj_dist, 'rationale', v_rationale,
-        'cohort_matches', JSON_EXTRACT(v_cohort_matches, '$')));
+        'cohort_matches', JSON_EXTRACT(v_cohort_matches, '$')), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'nearest_cohort_id', v_cohort_id, 'cohort_distance', v_cohort_dist,
         'drift_distance', v_traj_dist, 'rationale', v_rationale,
-        'cohort_matches', JSON_EXTRACT(v_cohort_matches, '$'));
+        'cohort_matches', JSON_EXTRACT(v_cohort_matches, '$'),
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -641,9 +853,8 @@ BEGIN
         SELECT vc FROM _fractalsql_fa_warmup ORDER BY ord;
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
 
-    IF p_catalog_table IS NULL OR p_emb_col IS NULL OR p_warmup_table IS NULL OR p_warmup_vec_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_feedback_audit: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_feedback_audit', JSON_ARRAY(p_catalog_table, p_emb_col, p_warmup_table, p_warmup_vec_col),
+        'identifier arguments must not be NULL');
 
     SELECT fractal_diversify_enable(v_session_id) INTO v_ignored;
     SELECT fractal_diversify_set_params(v_session_id,
@@ -714,11 +925,11 @@ BEGIN
     DECLARE v_dist          DOUBLE;
     DECLARE v_confidence    DOUBLE;
     DECLARE v_rationale     TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_audit         BIGINT DEFAULT 0;
 
-    IF p_node_table IS NULL OR p_node_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_schedule_workload: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_schedule_workload', JSON_ARRAY(p_node_table, p_node_emb_col),
+        'identifier arguments must not be NULL');
 
     -- fractal_search's own corpus/query shape: a single-row corpus (the
     -- task vector itself) refines toward its own local optimum, the
@@ -737,24 +948,24 @@ BEGIN
     SET v_refined = JSON_EXTRACT(v_refined_json, '$.best_point');
 
     CALL fractal_search_telemetry(p_node_table, p_node_emb_col, v_refined, 1, v_telemetry);
-    IF v_telemetry IS NULL OR JSON_LENGTH(v_telemetry) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_schedule_workload: no node rows found';
-    END IF;
+    CALL _fractalsql_agent_require_rows('fractal_agent_schedule_workload', 'no node rows found', v_telemetry);
 
-    SET v_assigned   = JSON_VALUE(v_telemetry, '$[0].doc_id');
-    SET v_dist        = JSON_VALUE(v_telemetry, '$[0].dist');
+    CALL _fractalsql_agent_nearest1(v_telemetry, v_assigned, v_dist);
     SET v_confidence   = 1.0 / (1.0 + v_dist);
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Schedule this workload onto node ', IFNULL(v_assigned, '?'),
                ' (cosine distance ', v_dist, ' after fractal_search refinement). ',
                'Justify the placement in one sentence.'),
-        IFNULL(p_context, '{}'));
+        IFNULL(p_context, '{}'),
+        v_rationale, v_rationale_failed);
 
     SET v_audit = fractal_audit_log('agent_schedule_workload', JSON_OBJECT(
-        'assigned_node', v_assigned, 'confidence', v_confidence, 'rationale', v_rationale));
+        'assigned_node', v_assigned, 'confidence', v_confidence, 'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
-    SET p_result = JSON_OBJECT('assigned_node', v_assigned, 'confidence', v_confidence, 'rationale', v_rationale);
+    SET p_result = JSON_OBJECT('assigned_node', v_assigned, 'confidence', v_confidence,
+                               'rationale', v_rationale,
+                               'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -782,11 +993,11 @@ BEGIN
     DECLARE v_alloc_id  VARCHAR(255);
     DECLARE v_dist       DOUBLE;
     DECLARE v_rationale  TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_audit      BIGINT DEFAULT 0;
 
-    IF p_alloc_table IS NULL OR p_alloc_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_rebalance_sibling: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_rebalance_sibling', JSON_ARRAY(p_alloc_table, p_alloc_emb_col),
+        'identifier arguments must not be NULL');
 
     SET v_opt = fractal_optimize_portfolio(p_mu, p_cov, p_cardinality,
         JSON_OBJECT('seed', IFNULL(p_seed, 0)));
@@ -794,26 +1005,25 @@ BEGIN
     SET v_weights = JSON_EXTRACT(v_opt, '$.weights');
 
     CALL fractal_search_trajectory(p_alloc_table, p_alloc_emb_col, p_baseline_vec, v_weights, 1, v_traj);
-    IF v_traj IS NULL OR JSON_LENGTH(v_traj) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_rebalance_sibling: no allocation rows found';
-    END IF;
-    SET v_alloc_id = JSON_VALUE(v_traj, '$[0].doc_id');
-    SET v_dist      = JSON_VALUE(v_traj, '$[0].dist');
+    CALL _fractalsql_agent_require_rows('fractal_agent_rebalance_sibling', 'no allocation rows found', v_traj);
+    CALL _fractalsql_agent_nearest1(v_traj, v_alloc_id, v_dist);
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Rebalance triage: the optimized portfolio has Sharpe ', v_sharpe,
                ' and is nearest to historical allocation id ', IFNULL(v_alloc_id, '?'),
                ' (cosine distance ', v_dist, '). Justify the rebalance in one sentence.'),
-        IFNULL(p_context, '{}'));
+        IFNULL(p_context, '{}'),
+        v_rationale, v_rationale_failed);
 
     -- JSON_EXTRACT(v_weights, '$'): see Engine B's identical comment.
     SET v_audit = fractal_audit_log('agent_rebalance_sibling', JSON_OBJECT(
         'sharpe', v_sharpe, 'nearest_alloc_id', v_alloc_id,
-        'nearest_distance', v_dist, 'rationale', v_rationale));
+        'nearest_distance', v_dist, 'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'sharpe', v_sharpe, 'weights', JSON_EXTRACT(v_weights, '$'),
-        'nearest_alloc_id', v_alloc_id, 'nearest_distance', v_dist, 'rationale', v_rationale);
+        'nearest_alloc_id', v_alloc_id, 'nearest_distance', v_dist, 'rationale', v_rationale,
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -837,35 +1047,34 @@ BEGIN
     DECLARE v_dist      DOUBLE;
     DECLARE v_bc         DOUBLE;
     DECLARE v_rationale  TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_audit      BIGINT DEFAULT 0;
 
-    IF p_vehicle_table IS NULL OR p_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detour_classify: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_detour_classify', JSON_ARRAY(p_vehicle_table, p_emb_col),
+        'identifier arguments must not be NULL');
 
     CALL fractal_search_trajectory(p_vehicle_table, p_emb_col, p_baseline_vec, p_current_vec, 1, v_traj);
-    IF v_traj IS NULL OR JSON_LENGTH(v_traj) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detour_classify: no vehicle rows found';
-    END IF;
-    SET v_fleet_id = JSON_VALUE(v_traj, '$[0].doc_id');
-    SET v_dist      = JSON_VALUE(v_traj, '$[0].dist');
+    CALL _fractalsql_agent_require_rows('fractal_agent_detour_classify', 'no vehicle rows found', v_traj);
+    CALL _fractalsql_agent_nearest1(v_traj, v_fleet_id, v_dist);
 
     SET v_bc = fractal_dimension_boxcount(p_gps_trace, IFNULL(p_boxcount_dim, 2));
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Detour classify: vehicle ', IFNULL(v_fleet_id, '?'),
                ' deviates from its baseline by cosine distance ', v_dist,
                ' (nearest fleet peer); its GPS trace has box-counting dimension ', v_bc,
                '. Classify the detour in one sentence.'),
-        JSON_OBJECT('trajectory_distance', v_dist, 'trace_complexity', v_bc));
+        JSON_OBJECT('trajectory_distance', v_dist, 'trace_complexity', v_bc),
+        v_rationale, v_rationale_failed);
 
     SET v_audit = fractal_audit_log('agent_detour_classify', JSON_OBJECT(
         'nearest_fleet_id', v_fleet_id, 'trajectory_distance', v_dist,
-        'trace_complexity', v_bc, 'rationale', v_rationale));
+        'trace_complexity', v_bc, 'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'nearest_fleet_id', v_fleet_id, 'trajectory_distance', v_dist,
-        'trace_complexity', v_bc, 'rationale', v_rationale);
+        'trace_complexity', v_bc, 'rationale', v_rationale,
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -888,35 +1097,34 @@ BEGIN
     DECLARE v_dist      DOUBLE;
     DECLARE v_dfa        DOUBLE;
     DECLARE v_rationale   TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_audit       BIGINT DEFAULT 0;
 
-    IF p_track_table IS NULL OR p_emb_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_track_anomaly: identifier arguments must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_track_anomaly', JSON_ARRAY(p_track_table, p_emb_col),
+        'identifier arguments must not be NULL');
 
     CALL fractal_search_trajectory(p_track_table, p_emb_col, p_baseline_vec, p_current_vec, 1, v_traj);
-    IF v_traj IS NULL OR JSON_LENGTH(v_traj) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_track_anomaly: no track rows found';
-    END IF;
-    SET v_track_id = JSON_VALUE(v_traj, '$[0].doc_id');
-    SET v_dist      = JSON_VALUE(v_traj, '$[0].dist');
+    CALL _fractalsql_agent_require_rows('fractal_agent_track_anomaly', 'no track rows found', v_traj);
+    CALL _fractalsql_agent_nearest1(v_traj, v_track_id, v_dist);
 
     SET v_dfa = fractal_dimension_dfa(p_heading_series);
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Track anomaly: vessel/host ', IFNULL(v_track_id, '?'),
                ' deviates from baseline by cosine distance ', v_dist,
                '; its heading-change series has DFA exponent ', v_dfa,
                ' (dfa=-1 means insufficient window). Triage the track in one sentence.'),
-        JSON_OBJECT('trajectory_distance', v_dist, 'dfa_exponent', v_dfa));
+        JSON_OBJECT('trajectory_distance', v_dist, 'dfa_exponent', v_dfa),
+        v_rationale, v_rationale_failed);
 
     SET v_audit = fractal_audit_log('agent_track_anomaly', JSON_OBJECT(
         'nearest_fleet_id', v_track_id, 'trajectory_distance', v_dist,
-        'dfa_exponent', v_dfa, 'rationale', v_rationale));
+        'dfa_exponent', v_dfa, 'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'nearest_fleet_id', v_track_id, 'trajectory_distance', v_dist,
-        'dfa_exponent', v_dfa, 'rationale', v_rationale);
+        'dfa_exponent', v_dfa, 'rationale', v_rationale,
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -944,11 +1152,11 @@ BEGIN
     DECLARE v_dd            BOOLEAN;
     DECLARE v_threshold      DOUBLE DEFAULT IFNULL(p_drift_threshold, 0.5);
     DECLARE v_rationale       TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_audit           BIGINT DEFAULT 0;
 
-    IF p_point_cloud IS NULL OR p_drift_series IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_network_coverage_alert: point_cloud and drift_series are required';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_network_coverage_alert', JSON_ARRAY(p_point_cloud, p_drift_series),
+        'point_cloud and drift_series are required');
 
     SET v_morph = fractal_morphological_complexity(p_point_cloud, IFNULL(p_boxcount_dim, 2));
     SET v_md = IFNULL(JSON_VALUE(v_morph, '$.dimension'), 0.0);
@@ -958,20 +1166,22 @@ BEGIN
     SET v_dv = IFNULL(JSON_VALUE(v_drift, '$.drift'), 0.0);
     SET v_dd = (ABS(v_dv) > v_threshold);
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Network coverage alert: the sensor grid has morphological dimension ', v_md,
                ' and lacunarity ', v_lac, '; the telemetry drift is ', v_dv,
                ' (drift_detected=', v_dd, ', threshold ', v_threshold, '). ',
                'Issue the coverage alert in one sentence.'),
-        IFNULL(p_context, '{}'));
+        IFNULL(p_context, '{}'),
+        v_rationale, v_rationale_failed);
 
     SET v_audit = fractal_audit_log('agent_network_coverage_alert', JSON_OBJECT(
         'morph_dimension', v_md, 'lacunarity', v_lac,
-        'drift_detected', v_dd, 'rationale', v_rationale));
+        'drift_detected', v_dd, 'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'morph_dimension', v_md, 'lacunarity', v_lac,
-        'drift_detected', v_dd, 'rationale', v_rationale);
+        'drift_detected', v_dd, 'rationale', v_rationale,
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -997,11 +1207,11 @@ BEGIN
     DECLARE v_ba            DOUBLE;
     DECLARE v_threshold      DOUBLE DEFAULT IFNULL(p_drift_threshold, 0.5);
     DECLARE v_rationale       TEXT;
+    DECLARE v_rationale_failed TEXT;
     DECLARE v_audit           BIGINT DEFAULT 0;
 
-    IF p_series IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_regime_triage: series is required';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_regime_triage', JSON_ARRAY(p_series),
+        'series is required');
 
     SET v_dfa = fractal_dimension_dfa(p_series);
     SET v_drift = fractal_dimension_drift(p_series, IFNULL(p_win, 64));
@@ -1010,19 +1220,21 @@ BEGIN
     SET v_ra = IFNULL(JSON_VALUE(v_drift, '$.recent_alpha'), 0.0);
     SET v_ba = IFNULL(JSON_VALUE(v_drift, '$.baseline_alpha'), 0.0);
 
-    SET v_rationale = fractal_reason(v_session_id,
+    CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Regime triage: the series has DFA exponent ', v_dfa,
                ' and drift ', v_dv, ' (drift_detected=', v_dd, ', recent_alpha=', v_ra,
                ', baseline_alpha=', v_ba, '). Triage the regime change in one sentence.'),
-        IFNULL(p_context, '{}'));
+        IFNULL(p_context, '{}'),
+        v_rationale, v_rationale_failed);
 
     SET v_audit = fractal_audit_log('agent_regime_triage', JSON_OBJECT(
         'dfa_exponent', v_dfa, 'drift_detected', v_dd, 'drift', v_dv,
-        'rationale', v_rationale));
+        'rationale', v_rationale), CONNECTION_ID(), CURRENT_USER());
 
     SET p_result = JSON_OBJECT(
         'dfa_exponent', v_dfa, 'drift_detected', v_dd,
-        'recent_alpha', v_ra, 'baseline_alpha', v_ba, 'rationale', v_rationale);
+        'recent_alpha', v_ra, 'baseline_alpha', v_ba, 'rationale', v_rationale,
+        'reasoning_step_failed', v_rationale_failed);
 END$$
 
 -- =====================================================================
@@ -1056,13 +1268,14 @@ BEGIN
     DECLARE v_opt      TEXT;
     DECLARE v_n_found   INT;
     DECLARE v_reasoning TEXT;
+    DECLARE v_reasoning_failed TEXT;
     DECLARE v_mode      TEXT;
     DECLARE v_audit     BIGINT DEFAULT 0;
 
     SET v_mode = LOWER(IFNULL(p_objective_mode, 'sharpe'));
     IF v_mode NOT IN ('sharpe', 'pareto') THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-            'fractal_agent_diverse_portfolios: objective_mode must be ''sharpe'' or ''pareto''';
+        CALL _fractalsql_agent_fail('fractal_agent_diverse_portfolios',
+            'objective_mode must be ''sharpe'' or ''pareto''');
     END IF;
 
     IF v_mode = 'pareto' THEN
@@ -1072,15 +1285,16 @@ BEGIN
             8,                        -- max_front cap on the returned front
             0, 0, 'gaussian');        -- seed / use_obl / diffusion_mode
         IF v_opt IS NULL THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-                'fractal_agent_diverse_portfolios: enterprise tier not loaded (fractal_optimize_portfolio_multimodal_pareto returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md';
+            CALL _fractalsql_agent_fail('fractal_agent_diverse_portfolios',
+                'enterprise tier not loaded (fractal_optimize_portfolio_multimodal_pareto returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md');
         END IF;
 
         SET v_n_found = IFNULL(JSON_VALUE(v_opt, '$.n_found'), 0);
-        SET v_reasoning = fractal_reason(v_session_id,
+        CALL _fractalsql_agent_reason(v_session_id,
             CONCAT('Explain the trade-offs across these ', v_n_found,
                    ' diverse cardinality-constrained portfolio candidates on the non-dominated return/risk Pareto front: ', v_opt),
-            IFNULL(p_context, '{}'));
+            IFNULL(p_context, '{}'),
+            v_reasoning, v_reasoning_failed);
     ELSE
         SET v_opt = fractal_optimize_portfolio_multimodal(
             p_mu, p_cov, p_cardinality,
@@ -1090,20 +1304,21 @@ BEGIN
             0);
 
         IF v_opt IS NULL THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-                'fractal_agent_diverse_portfolios: enterprise tier not loaded (fractal_optimize_portfolio_multimodal returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md';
+            CALL _fractalsql_agent_fail('fractal_agent_diverse_portfolios',
+                'enterprise tier not loaded (fractal_optimize_portfolio_multimodal returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md');
         END IF;
 
         SET v_n_found = IFNULL(JSON_VALUE(v_opt, '$.n_found'), 0);
-        SET v_reasoning = fractal_reason(v_session_id,
+        CALL _fractalsql_agent_reason(v_session_id,
             CONCAT('Explain the trade-offs across these ', v_n_found,
                    ' diverse cardinality-constrained portfolio candidates, ranked by Sharpe: ', v_opt),
-            IFNULL(p_context, '{}'));
+            IFNULL(p_context, '{}'),
+            v_reasoning, v_reasoning_failed);
     END IF;
 
     SET v_audit = fractal_audit_log('agent_diverse_portfolios', JSON_OBJECT(
         'objective_mode', v_mode, 'n_found', v_n_found,
-        'cardinality', p_cardinality, 'rationale', v_reasoning));
+        'cardinality', p_cardinality, 'rationale', v_reasoning), CONNECTION_ID(), CURRENT_USER());
 
     -- v_opt is the full {"n_found":..,"candidates":[..]} object, nested
     -- under 'optimization' rather than 'candidates' to avoid a
@@ -1111,7 +1326,9 @@ BEGIN
     -- Engine B above -- see that procedure's own comment for why
     -- CAST(v_opt AS CHAR) does not nest v_opt as a real JSON sub-object
     -- here.
-    SET p_result = JSON_OBJECT('optimization', JSON_EXTRACT(v_opt, '$'), 'rationale', v_reasoning);
+    SET p_result = JSON_OBJECT(
+        'optimization', JSON_EXTRACT(v_opt, '$'), 'rationale', v_reasoning,
+        'reasoning_step_failed', v_reasoning_failed);
 END$$
 
 -- =====================================================================
@@ -1156,7 +1373,6 @@ CREATE PROCEDURE fractal_agent_trajectory_predict(
 SQL SECURITY INVOKER
 BEGIN
     DECLARE v_pk_col        VARCHAR(64);
-    DECLARE v_pk_count      INT DEFAULT 0;
     DECLARE v_type          VARCHAR(64);
     DECLARE v_is_vec        BOOLEAN;
     DECLARE v_col_expr      TEXT;
@@ -1168,17 +1384,10 @@ BEGIN
     DECLARE v_drift         DOUBLE;
     DECLARE v_threshold     DOUBLE DEFAULT IFNULL(p_risk_threshold, 0.5);
 
-    IF p_table IS NULL OR p_vec_col IS NULL OR p_baseline_id IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_trajectory_predict: table, vector_col and baseline_id must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_trajectory_predict', JSON_ARRAY(p_table, p_vec_col, p_baseline_id),
+        'table, vector_col and baseline_id must not be NULL');
 
-    SELECT COUNT(*) INTO v_pk_count FROM information_schema.key_column_usage
-    WHERE table_schema = DATABASE() AND table_name = p_table AND constraint_name = 'PRIMARY';
-    IF v_pk_count <> 1 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_trajectory_predict: table must have exactly one single-column PRIMARY KEY';
-    END IF;
-    SELECT column_name INTO v_pk_col FROM information_schema.key_column_usage
-    WHERE table_schema = DATABASE() AND table_name = p_table AND constraint_name = 'PRIMARY' LIMIT 1;
+    CALL _fractalsql_agent_pk_col('fractal_agent_trajectory_predict', 'table', p_table, v_pk_col);
 
     -- Same native-VECTOR(n) detection as _fractalsql_scan_corpus (sql/
     -- install_udf.sql, above): a plain SELECT of a VECTOR column returns
@@ -1187,7 +1396,8 @@ BEGIN
     SELECT MIN(data_type) INTO v_type FROM information_schema.columns
     WHERE table_schema = DATABASE() AND table_name = p_table AND column_name = p_vec_col;
     IF v_type IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_trajectory_predict: vector_col not found on table';
+        CALL _fractalsql_agent_fail('fractal_agent_trajectory_predict',
+            'vector_col not found on table');
     END IF;
     SET v_is_vec = (LOWER(v_type) = 'vector');
     SET v_col_expr = IF(v_is_vec,
@@ -1204,7 +1414,8 @@ BEGIN
     SET v_baseline_vec = @_fractalsql_tp_baseline;
 
     IF v_baseline_vec IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_trajectory_predict: no row with the given baseline_id, or its vector is NULL';
+        CALL _fractalsql_agent_fail('fractal_agent_trajectory_predict',
+            'no row with the given baseline_id, or its vector is NULL');
     END IF;
 
     SET @_fractalsql_tp_sql2 = CONCAT(
@@ -1217,15 +1428,13 @@ BEGIN
     SET v_current_vec = @_fractalsql_tp_current;
 
     IF v_current_vec IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_trajectory_predict: table has no rows, or its vector is NULL';
+        CALL _fractalsql_agent_fail('fractal_agent_trajectory_predict',
+            'table has no rows, or its vector is NULL');
     END IF;
 
     CALL fractal_search_trajectory(p_table, p_vec_col, v_baseline_vec, v_current_vec, 1, v_traj);
-    IF v_traj IS NULL OR JSON_LENGTH(v_traj) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_trajectory_predict: no predicted state found';
-    END IF;
-    SET v_predicted_id = JSON_VALUE(v_traj, '$[0].doc_id');
-    SET v_drift         = JSON_VALUE(v_traj, '$[0].dist');
+    CALL _fractalsql_agent_require_rows('fractal_agent_trajectory_predict', 'no predicted state found', v_traj);
+    CALL _fractalsql_agent_nearest1(v_traj, v_predicted_id, v_drift);
 
     SET @_fractalsql_tp_sql3 = CONCAT(
         'SELECT ', v_col_expr, ' INTO @_fractalsql_tp_predicted FROM ',
@@ -1271,21 +1480,21 @@ BEGIN
     DECLARE v_doc_ids    JSON;
     DECLARE v_context    JSON;
     DECLARE v_answer     TEXT;
+    DECLARE v_answer_failed TEXT;
     DECLARE v_started    DATETIME(6);
 
     -- p_iterations is accepted for signature symmetry, but
     -- _fractalsql_telemetry_topk (the shared search core every
     -- table-backed composition in this repo already goes through)
-    -- hardcodes max_generation=15 itself, same as
+    -- hardcodes iterations=15 itself, same as
     -- fractal_search_telemetry/_hybrid_clinical_search/_search_trajectory.
-    IF p_query IS NULL OR p_table_name IS NULL OR p_vector_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_search_agent: query, table_name and vector_col must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_search_agent', JSON_ARRAY(p_query, p_table_name, p_vector_col),
+        'query, table_name and vector_col must not be NULL');
     SET v_started = SYSDATE(6);
 
     SET v_query_vec = fractal_embed(v_session_id, p_query);
     IF v_query_vec IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_search_agent: embedding failed';
+        CALL _fractalsql_agent_fail('fractal_search_agent', 'embedding failed');
     END IF;
 
     CALL _fractalsql_scan_corpus(p_table_name, p_vector_col, v_corpus, v_ids);
@@ -1294,12 +1503,14 @@ BEGIN
     SET v_doc_ids = IFNULL(JSON_EXTRACT(v_topk, '$[*].doc_id'), JSON_ARRAY());
     CALL _fractalsql_fetch_row_context(p_table_name, p_vector_col, v_doc_ids, v_context);
 
-    SET v_answer = fractal_reason(v_session_id, p_query, v_context);
+    CALL _fractalsql_agent_reason(v_session_id, p_query, v_context,
+        v_answer, v_answer_failed);
 
     SET p_result = JSON_OBJECT(
         'answer', v_answer,
         'source_doc_ids', JSON_EXTRACT(v_doc_ids, '$'),
-        'execution_time_ms', TIMESTAMPDIFF(MICROSECOND, v_started, SYSDATE(6)) / 1000.0);
+        'execution_time_ms', TIMESTAMPDIFF(MICROSECOND, v_started, SYSDATE(6)) / 1000.0,
+        'reasoning_step_failed', v_answer_failed);
 END$$
 
 -- fractal_rag_agent(query, table_name, vector_col, meta_filter, OUT answer)
@@ -1311,6 +1522,11 @@ END$$
 -- than a second copy of the same pipeline. p_meta_filter is accepted
 -- for future use but currently UNUSED: reserved for a future WHERE
 -- clause; for now the whole corpus is scanned.
+--
+-- S-FT-004: this OUT is the bare answer scalar, so a session in
+-- partial mode that hit a reasoning-endpoint failure returns NULL
+-- here; the failure detail and source_doc_ids ride the underlying
+-- fractal_search_agent document (see its comment, one procedure up).
 CREATE PROCEDURE fractal_rag_agent(
     IN  p_query        TEXT,
     IN  p_table_name   VARCHAR(128),
@@ -1361,13 +1577,12 @@ BEGIN
     DECLARE v_dist       DOUBLE;
     DECLARE v_vec        JSON;
 
-    IF p_initial_state IS NULL OR p_strategy_table IS NULL OR p_vector_col IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_plan_explore: initial_state, strategy_table and vector_col must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_plan_explore', JSON_ARRAY(p_initial_state, p_strategy_table, p_vector_col),
+        'initial_state, strategy_table and vector_col must not be NULL');
 
     SET v_query_vec = fractal_embed(v_session_id, p_initial_state);
     IF v_query_vec IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_plan_explore: embedding failed';
+        CALL _fractalsql_agent_fail('fractal_agent_plan_explore', 'embedding failed');
     END IF;
 
     CALL _fractalsql_scan_corpus(p_strategy_table, p_vector_col, v_corpus, v_ids);
@@ -1470,21 +1685,22 @@ BEGIN
     DECLARE v_cycle_len INT;
     DECLARE v_at_index  INT;
 
-    IF p_agent_id IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: agent_id must not be NULL';
-    END IF;
+    CALL _fractalsql_agent_require_ident('fractal_agent_detect_loop', JSON_ARRAY(p_agent_id),
+        'agent_id must not be NULL');
     IF p_state_log IS NULL OR JSON_LENGTH(p_state_log) = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: state_log must be a non-empty JSON array of state vectors';
+        CALL _fractalsql_agent_fail('fractal_agent_detect_loop',
+            'state_log must be a non-empty JSON array of state vectors');
     END IF;
 
     SET v_n_bits  = IFNULL(p_n_bits, 64);
     SET v_seed    = IFNULL(p_seed, 42.0);
     SET v_hamming = IFNULL(p_hamming_threshold, 0);
     IF v_n_bits < 1 OR v_n_bits > 512 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: n_bits must be 1..512';
+        CALL _fractalsql_agent_fail('fractal_agent_detect_loop', 'n_bits must be 1..512');
     END IF;
     IF v_hamming < 0 OR v_hamming >= v_n_bits THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: hamming_threshold must be 0..n_bits-1';
+        CALL _fractalsql_agent_fail('fractal_agent_detect_loop',
+            'hamming_threshold must be 0..n_bits-1');
     END IF;
     SET v_n_bytes = (v_n_bits + 7) DIV 8;
 
@@ -1494,12 +1710,14 @@ BEGIN
         SET v_state = CAST(JSON_EXTRACT(p_state_log, CONCAT('$[', v_i, ']')) AS CHAR);
         SET v_dim   = JSON_LENGTH(v_state);
         IF v_dim IS NULL OR v_dim < 1 THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: every state must be a non-empty JSON array of numbers';
+            CALL _fractalsql_agent_fail('fractal_agent_detect_loop',
+                'every state must be a non-empty JSON array of numbers');
         END IF;
         IF v_i = 0 THEN
             SET v_first_dim = v_dim;
         ELSEIF v_dim <> v_first_dim THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: all states must have the same dimension';
+            CALL _fractalsql_agent_fail('fractal_agent_detect_loop',
+                'all states must have the same dimension');
         END IF;
 
         -- SimHash fingerprint; the parser inside accepts the raw JSON
@@ -1509,7 +1727,8 @@ BEGIN
         -- concatenated as-is.
         SET v_fp = fractal_state_fingerprint(v_state, v_n_bits, v_seed);
         IF v_fp IS NULL THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: fingerprinting failed for a state (check state values are finite numbers)';
+            CALL _fractalsql_agent_fail('fractal_agent_detect_loop',
+                'fingerprinting failed for a state (check state values are finite numbers)');
         END IF;
         SET v_fp_stream = CONCAT(v_fp_stream, v_fp);
 
@@ -1536,7 +1755,8 @@ BEGIN
     -- Brent's streaming cycle kernel over the fingerprint stream.
     SET v_cycle = fractal_cycle_detect(v_fp_stream, v_n_bytes, v_hamming);
     IF v_cycle IS NULL THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_agent_detect_loop: cycle detection failed (check n_bytes vs the fingerprint stream)';
+        CALL _fractalsql_agent_fail('fractal_agent_detect_loop',
+            'cycle detection failed (check n_bytes vs the fingerprint stream)');
     END IF;
     -- JSON_VALUE stringifies a JSON boolean as '1'/'0' on this server
     -- family (JSON_EXTRACT preserves 'true'/'false'; JSON_VALUE does

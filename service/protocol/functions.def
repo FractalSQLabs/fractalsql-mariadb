@@ -26,6 +26,7 @@
 /* Search and discovery */
 X(fractal_search, STR, r)
 X(fractal_search_explore, STR, r)
+X(fractal_search_debug, STR, r)
 /* Dimension, analytics, and informational */
 X(fractal_version, STR, r)
 X(fractal_edition, STR, r)
@@ -34,6 +35,7 @@ X(fractal_dimension_boxcount, REAL, r)
 X(fractal_dimension_drift, STR, r)
 X(fractal_change_point_detect, STR, r)
 X(fractal_periodogram, STR, r)
+X(fractal_spectrogram_entropy, STR, r)
 X(fractal_state_fingerprint, STR, r)
 X(fractal_cycle_detect, STR, r)
 X(fractal_tda_persistence_diagram, STR, r)
@@ -45,6 +47,9 @@ X(fractal_optimize_portfolio_multimodal, STR, r)
 X(fractal_optimize_portfolio_multimodal_ex, STR, r)
 X(fractal_optimize_portfolio_multimodal_pareto, STR, r)
 /* Vector */
+X(fractal_vector, STR, r)
+X(fractal_vector_from_text, STR, r)
+X(fractal_vector_to_json, STR, r)
 X(fractal_vector_dims, INT, r)
 X(fractal_vector_norm, REAL, r)
 X(fractal_vector_normalize, STR, r)
@@ -70,6 +75,14 @@ X(fractal_t2s_config, STR, r)
 X(fractal_t2s_generate, STR, e)
 X(fractal_t2s_review, STR, e)
 X(fractal_t2s_check_allowlist, STR, r)
+/* Per-session configuration overlay (fractalsql_config.h). The set /
+ * reset pair mutates the daemon's per-session overlay, so it is
+ * stateful; the reads are pure. */
+X(fractal_config_set, STR, s)
+X(fractal_config_get, STR, r)
+X(fractal_config_reset, INT, s)
+X(fractal_config_list, STR, r)
+X(fractal_config_keys, STR, r)
 /* Diversify and feedback */
 X(fractal_diversify_enable, INT, s)
 X(fractal_diversify_disable, INT, s)
@@ -77,6 +90,10 @@ X(fractal_diversify_set_params, INT, s)
 X(fractal_detect_collapse, REAL, r)
 X(fractal_explain_result, STR, r)
 X(fractal_session_close, INT, s)
+/* Per-session S-FT-004 opt-in (default off; see SPEC.md's retry-tier note:
+ * the write mutates session registry state, so stateful like
+ * fractal_session_close). */
+X(fractal_agent_partial_fail, STR, s)
 X(fractal_feedback_report, INT, s)
 /* Ledger and audit (enterprise-gated) */
 X(fractal_ledger_flush, INT, s)
@@ -84,6 +101,7 @@ X(fractal_ledger_load, INT, s)
 X(fractal_ledger_compact, INT, s)
 X(fractal_ledger_reset_soft, INT, s)
 X(fractal_ledger_reset_hard, INT, s)
+X(fractal_lock_destructive, INT, s)
 X(fractal_ledger_truth_count, INT, r)
 X(fractal_ledger_shadow_count, INT, r)
 X(fractal_ledger_verify, STR, r)

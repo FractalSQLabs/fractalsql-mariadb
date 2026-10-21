@@ -67,6 +67,18 @@ GATE31_REPLY = "```sql\nINSERT INTO bt_sql_agent_sp (id, val) VALUES (1, 'x')\n`
 REVIEW_PASS_MARKER = "FRACTALSQL_BT_REVIEW_PASS_MARKER"
 REVIEW_PASS_REPLY = "PASS, this candidate correctly answers the request."
 
+# The "the model replied with prose, not SQL" case. fractal_text_to_sql's
+# GENERATE step (RESPONSE_MODE=code) gets a response with no fenced
+# block in it at all, so there is no candidate to allowlist, let alone
+# execute. Routed the same way as the two replies above: a marker
+# string embedded in the question, which ends up verbatim in the
+# chat-completions request body.
+#
+# Every other gate's question never contains this marker, so their
+# reply is unaffected.
+NO_SQL_MARKER = "FRACTALSQL_BT_NO_SQL_MARKER"
+NO_SQL_REPLY = "I'm sorry -- I can't answer that with a SQL statement."
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -84,6 +96,8 @@ class Handler(BaseHTTPRequestHandler):
                 reply = GATE31_REPLY
             elif REVIEW_PASS_MARKER in body_text:
                 reply = REVIEW_PASS_REPLY
+            elif NO_SQL_MARKER in body_text:
+                reply = NO_SQL_REPLY
             else:
                 reply = CHAT_REPLY
             body = json.dumps(

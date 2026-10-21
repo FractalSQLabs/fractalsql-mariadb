@@ -11,3 +11,10 @@ scripts/confidence/out/
 packaging/debian/.debhelper/
 packaging/rpm/BUILD/
 packaging/rpm/BUILDROOT/
+mcp/dist/
+mcp/tests/
+mcp/**/*.o
+mcp/fractalsql-mariadb-mcp
+mcp/**/*.gcda
+mcp/**/*.gcno
+mcp/**/*.o

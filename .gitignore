@@ -18,7 +18,7 @@ deps/
 
 *.gcno
 *.gcda
-coverage_html/
+coverage_html*/
 
 *.deb
 *.rpm
@@ -55,3 +55,10 @@ docker-compose.override.yml
 demo-run-logs/
 run-all-demos.sh
 service/build/
+
+devtools/
+fractalsql_bt_*
+/mcp/fractalsql-mariadb-mcp
+/mcp/.mcp-build-mode
+
+.env

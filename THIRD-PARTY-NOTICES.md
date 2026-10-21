@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
 Third-Party Notices
 
 This file contains licensing and attribution notices for third-party software components incorporated into FractalSQL.
@@ -246,3 +250,7 @@ components. Mirrors core's own THIRD-PARTY-NOTICES-COMMUNITY.md.
   cap); generalizes the portfolio entry above beyond a
   Sharpe-ratio-specific objective, not itself a port of a separate
   published algorithm.
+
+- **nlohmann/json 3.11.3** (`mcp/vendor/json.hpp`): header-only JSON library
+  used by the MCP server. MIT licence, Copyright 2013-2023 Niels Lohmann.
+  Its licence text and SPDX tag are kept in the file.

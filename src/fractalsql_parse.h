@@ -12,7 +12,7 @@
  * <mysql.h> dependency, so both fractalsql.c and fractalsql_vector.c
  * share one implementation (a parser bug fix lands once, not twice) and
  * so tests/fuzz's libFuzzer drivers can link it without a MariaDB dev
- * package at all -- see build_test.sh's gate 21.
+ * package at all.
  */
 #ifndef FRACTALSQL_PARSE_H
 #define FRACTALSQL_PARSE_H

@@ -1,10 +1,11 @@
 -- demo/benchmark-api-reference.sql
 --
 -- Real, structural details worth knowing before reading this file:
---   - fractal_search_debug is not a separate function here: its
---     capability (a "trace" object with the converged best point/fit)
---     is a "debug":true flag on fractal_search's own params instead
---     (see docs/api-discovery.md), demonstrated in Section 1 below.
+--   - fractal_search_debug IS a separate function (the convergence view
+--     of the SFS: no corpus, the trace always on); fractal_search's own
+--     "debug":true params flag still adds a trace to a corpus search.
+--     Both are demonstrated in Section 1 below; see
+--     docs/api-discovery.md.
 --   - fractal_store_morphology and fractal_mine_topology_negatives
 --     (Section 8, "Named feature store") are stored PROCEDUREs here
 --     (CALL + OUT param), composing the existing fractal_vector_l2_squared
@@ -17,10 +18,12 @@
 --     objects use the key "dist".
 --
 -- A coverage pass over every callable function in sql/install_udf.sql
--- (roughly 46 functions: 9 core, a 4-function vectorizer group, 31
+-- (roughly 55 functions: 9 core, a 4-function vectorizer group, 31
 -- v2.x additions including the 10 v2.0.25 analytics/vector primitives
--- (Section 10), and the 2-procedure Named Feature Store), grouped by
--- area. Distinct from demo/benchmark.sql (a
+-- (Section 10), the 3-function canonical vector form (Section 11), the
+-- 5-function per-session configuration overlay (Section 12), and the
+-- 2-procedure Named Feature Store), grouped by area. Distinct from
+-- demo/benchmark.sql (a
 -- narrower Sniper/Scout/vectorizer head-to-head), this one's job is
 -- coverage, not comparison.
 --
@@ -65,7 +68,7 @@ DELIMITER ;
 -- === 0. Meta (2 functions): fractal_edition, fractal_version ===
 SELECT fractal_edition(), fractal_version();
 
--- === 1. Search (2 functions): fractal_search (plain + debug-trace modes), fractal_search_explore ===
+-- === 1. Search (3 functions): fractal_search (plain + debug-trace modes), fractal_search_debug, fractal_search_explore ===
 DROP TABLE IF EXISTS bmk_corpus;
 CREATE TABLE bmk_corpus (id INT AUTO_INCREMENT PRIMARY KEY, emb_arr JSON);
 INSERT INTO bmk_corpus (emb_arr)
@@ -76,12 +79,20 @@ FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n <
 -- converges with no real corpus (see demo.sql Section 2).
 SELECT fractal_search('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 30}');
 
--- Debug-trace mode: no separate fractal_search_debug function here,
--- it's a "debug":true params flag instead (see docs/api-discovery.md).
+-- Debug-trace mode: a "debug":true params flag adds the trace to a
+-- corpus search (see docs/api-discovery.md).
 SELECT JSON_EXTRACT(
     fractal_search('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 10, "debug": true}'),
     '$.trace.best_fit'
 ) AS debug_trace_best_fit;
+
+-- fractal_search_debug: the convergence view of the SFS -- no corpus at
+-- all, the trace always on. The seed pins the walk for a byte-stable
+-- result; left out, the walk is non-deterministic.
+SELECT JSON_EXTRACT(
+    fractal_search_debug('[0.6,0.8,0,0,0,0,0,0]', 10, 50, 2, 12345),
+    '$.trace.best_fit'
+) AS search_debug_best_fit;
 
 -- fractal_search_explore(corpus, query, params) takes the corpus inline
 -- rather than as a table/column reference (see demo.sql Section 4).
@@ -291,7 +302,7 @@ SELECT JSON_VALUE(r, '$.doc_id') AS doc_id, JSON_VALUE(r, '$.dist') AS dist
 FROM JSON_TABLE(@bmk_r4, '$[*]' COLUMNS (r JSON PATH '$')) t;
 
 -- ------------------------------------------------------------------
--- 10. New analytics + vector quantization (10 functions)
+-- 10. New analytics + vector quantization (11 functions)
 -- ------------------------------------------------------------------
 -- The v2.0.25 primitives: change-point detection, periodogram, SimHash
 -- state fingerprinting, streaming Brent's cycle detection, the TDA
@@ -316,6 +327,17 @@ SET @bmk_pg = fractal_periodogram(
 );
 SELECT JSON_EXTRACT(@bmk_pg, '$.freqs[0]') AS top_freq,
        JSON_EXTRACT(@bmk_pg, '$.power[0]') AS top_power;
+
+-- Short-time spectral entropy of the same sine: 7 frames of window 16 /
+-- hop 8, each reading how ordered that frame's spectrum is (a bare JSON
+-- array, so it can feed fractal_change_point_detect directly).
+SELECT fractal_spectrogram_entropy(
+    (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t), ']') FROM (
+        WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 64)
+        SELECT t, SIN(2*PI()*t/8.0) AS v FROM seq
+    ) c),
+    16, 8
+) AS spectrogram_entropy;
 
 -- SimHash state fingerprint: a JSON array of the (n_bits+7)/8 output
 -- bytes; nearly-identical states collapse to near-identical fingerprints
@@ -374,6 +396,67 @@ SELECT fractal_optimize_subset(
     '[0.6, 0.6, 0.6, 0.6, 0.6]',
     2, '{}'
 ) AS subset_allocation;
+
+-- ------------------------------------------------------------------
+-- 11. The canonical vector form (3 functions)
+-- ------------------------------------------------------------------
+-- The canonical form is a fixed binary layout -- uint16 dimension
+-- little-endian, uint16 reserved, then float32 little-endian values --
+-- carried as LOWERCASE HEX: byte-stable across architectures,
+-- charset-safe, and storable in a VARCHAR or a BLOB column (UNHEX()
+-- turns it back into the binary bytes). It travels as hex rather than
+-- as a BLOB because the engine's client protocol carries strings, not
+-- blobs.
+--
+-- fractal_vector(dim) builds the ZERO vector of that dimension;
+-- fractal_vector_from_text accepts EITHER form and returns the
+-- canonical one; fractal_vector_to_json accepts either form and
+-- returns a JSON array of numbers (the bridge to MariaDB 11.7+'s
+-- native VECTOR(n): VEC_FROMTEXT(fractal_vector_to_json(v))).
+SELECT fractal_vector(3) AS canonical_zero_dim3;
+SELECT fractal_vector_from_text('[1,2,3]') AS canonical_of_json;
+SELECT fractal_vector_to_json(fractal_vector_from_text('[1,2,3]')) AS canonical_round_trip;
+-- The canonical form is accepted anywhere a vector is, so a stored
+-- vector round-trips through either representation with no conversion
+-- step:
+SELECT fractal_vector_lp_distance(
+    fractal_vector_from_text('[1,0,0]'),
+    fractal_vector_from_text('[0.9,0.1,0]'),
+    2.0
+) AS canonical_lp2_distance;
+
+-- ------------------------------------------------------------------
+-- 12. The per-session configuration overlay (5 functions)
+-- ------------------------------------------------------------------
+-- The daemon's config file is process-wide: changing it means a
+-- filesystem edit plus a reload, which is the right shape for an
+-- operator and the wrong shape for a session that wants one knob
+-- changed for its own work. These five functions give a CONNECTION a
+-- live, per-session override of the TUNING keys.
+--
+-- The session key is the caller's own CONNECTION_ID() -- the same key
+-- every other session-scoped function in this extension uses. A
+-- session may only override its OWN key.
+--
+-- fractal_config_set RETURNS the refusal reason rather than raising
+-- it: MariaDB's UDF ABI has no error text on the runtime path, so a
+-- refusal has to hand the caller something it can read.
+SELECT fractal_config_keys() AS known_config_keys;
+SELECT fractal_config_set('think', 'medium', CONNECTION_ID()) AS set_think;
+SELECT fractal_config_get('think', CONNECTION_ID()) AS effective_think;
+SELECT fractal_config_list(CONNECTION_ID()) AS session_overrides;
+SELECT fractal_config_reset(CONNECTION_ID()) AS dropped_overrides;
+
+-- A session may NOT change the keys that decide which code the daemon
+-- loads, where its outbound traffic goes, what credentials it uses, or
+-- its transport posture. The refusal is decided by the engine, by
+-- name, with the reason -- 'reasoning_plugin' is refused because a
+-- session that could name its own .so would run attacker-chosen code
+-- as the daemon.
+SELECT fractal_config_set('reasoning_plugin', '/tmp/evil.so', CONNECTION_ID()) AS refused_plugin;
+-- A secret's value is never returned: '<redacted>' when configured,
+-- '<unset>' when not.
+SELECT fractal_config_get('reasoning_token', CONNECTION_ID()) AS token_never_leaks;
 
 -- Benchmark complete, full API surface exercised. Tables left in
 -- place for inspection. Clean up with:

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
 # Security Policy
 
 This repository follows the FractalSQLabs organization-wide security

@@ -22,6 +22,19 @@ Files: service/common/fsq_sha256.h
 Copyright: none, dedicated to the public domain
 License: public-domain
 
+Files: mcp/*
+Copyright: 2026 Daniel Gardiner d/b/a FractalSQLabs
+License: Apache-2.0
+Comment: The MCP server fractalsql-mariadb-mcp, a separate process. It
+ contains no GPL-2.0-only shim code and no core code; it talks to the
+ database over libmariadb (dynamically linked) and to fractalsqld over the
+ MIT-licensed FSQ protocol. It links OpenSSL.
+
+Files: mcp/vendor/*
+Copyright: 2013-2023 Niels Lohmann
+License: MIT
+Comment: nlohmann/json, header-only.
+
 Files: include/*
 Copyright: 2026 Daniel Gardiner d/b/a FractalSQLabs
 License: Apache-2.0

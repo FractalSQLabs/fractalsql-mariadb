@@ -57,7 +57,7 @@ You should see:
 
 ```
 edition   version
-Community 2.0.10
+Community 2.0.11
 ```
 
 MariaDB has no `CREATE EXTENSION` mechanism and nothing equivalent to
@@ -174,7 +174,7 @@ parts still run for the three no-LLM agents (`recall_hybrid`,
 (enterprise-tier, the sixteenth) probes for its own dormant state
 separately, see [`docs/api-agency.md`](api-agency.md).
 
-> **The eleven industry starter kits are here too.** Eleven runnable
+> **The forty-two industry starter kits are here too.** Forty-two runnable
 > industry walkthroughs (`demo-vertical-*.sql`) ship with this repo,
 > live-verified against a real MariaDB server and a real Ollama endpoint.
 > `demo-agents.sql` above

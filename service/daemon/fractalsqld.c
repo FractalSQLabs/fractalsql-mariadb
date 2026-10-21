@@ -3,7 +3,7 @@
  *
  * fractalsqld: separate process that serves the FractalSQL UDFs to the
  * GPL-2.0-only shim over the FSQ protocol (../protocol). The spike build
- * links no core library. Handlers are added per phase (spec Section 13).
+ * links no core library. Handlers are added per phase.
  */
 
 #define _GNU_SOURCE
@@ -24,6 +24,7 @@
 
 #include "../common/fsq_sha256.h"
 #include "../protocol/fsq_protocol.h"
+#include "fractalsql_config.h"     /* src/: the shared path rules */
 #include "fractalsql_interrupt.h"  /* src/: the cancel seams the UDF bodies poll */
 #include "fractalsql_provider.h"   /* src/: the conf -> provider-consumer push */
 
@@ -31,7 +32,7 @@
  * threads on Windows. Everything below this block is shared. */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
+#  include <Windows.h>
 #  include <process.h>
 #  include <sddl.h>
 #  include <aclapi.h>
@@ -86,7 +87,7 @@ typedef volatile int fsq_atomic_int;
 #  define FSQ_ATOMIC_SET(p,v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
 #endif
 
-#define FSQL_DAEMON_VERSION     "2.0.10"
+#define FSQL_DAEMON_VERSION     "2.0.11"
 #define FSQ_CONFIG_ENV          "FRACTALSQL_CONFIG"
 #define FSQ_MAX_ALLOWED_UIDS    16
 #define FSQ_PEER_MAX            160
@@ -148,8 +149,26 @@ struct fsq_reply {
 static volatile sig_atomic_t g_stop = 0;
 static fsq_sock g_listen_fd = FSQ_SOCK_INVALID;
 
+/* Coverage-profile flushing (see the block near the bottom of this
+ * file). Declared up here because the request path calls the tick
+ * before the block's definition.
+ *
+ * Only the TICK exists on POSIX: the daemon there is stopped with
+ * SIGTERM and exits normally, so gcov's own atexit hook writes the
+ * profile and there is nothing to flush by hand. The init/now pair
+ * exist only on Windows, where the harness stops the daemon with a
+ * hard kill that skips the CRT exit handlers -- so those two are
+ * declared (and defined) under _WIN32, and a POSIX build never sees
+ * them at all. Leaving the POSIX stubs in place without their call
+ * sites is a -Werror=unused-function build failure. */
+static void coverage_flush_tick(void);
+#if defined(_WIN32)
+static void coverage_flush_init(void);
+static void coverage_flush_now(void);
+#endif
+
 /* One line per event on stderr, which the container runtime collects.
- * Payloads and query text are never logged (spec S6); only opcodes, sizes,
+ * Payloads and query text are never logged; only opcodes, sizes,
  * peer uids and the adapter's own error text. */
 static FILE *g_logf = NULL;
 
@@ -242,6 +261,22 @@ static int process_user_sid(char *out, size_t outlen) {
 }
 #endif
 
+/* Case-insensitive equality against a lower-case ASCII word. */
+static int cfg_word_is(const char *v, const char *word) {
+    for (; *v && *word; v++, word++) {
+        char c = *v;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != *word) return 0;
+    }
+    return *v == '\0' && *word == '\0';
+}
+
+static int cfg_bool_true(const char *v) {
+    if (v[0] == '\0' || strcmp(v, "0") == 0) return 0;
+    if (cfg_word_is(v, "false") || cfg_word_is(v, "off") || cfg_word_is(v, "no")) return 0;
+    return 1;
+}
+
 static int load_config(const char *path, struct fsq_config *cfg) {
     FILE *f = fopen(path, "r");
     char line[1024];
@@ -269,9 +304,12 @@ static int load_config(const char *path, struct fsq_config *cfg) {
             strcpy(cfg->field, v); \
         } while (0)
         /* A boolean value reads like the corresponding FRACTALSQL_* env
-         * name: any non-empty value except "0" is true, empty is false. */
+         * name: any non-empty value except "0" is true, empty is false --
+         * and, so that "reasoning_allow_plaintext = false" cannot silently
+         * mean the opposite, the words false / off / no (any case) are
+         * false too. */
 #define CFG_SET_BOOL(field) \
-        do { cfg->field = (v[0] != '\0' && strcmp(v, "0") != 0); } while (0)
+        do { cfg->field = cfg_bool_true(v); } while (0)
         if (strcmp(k, "socket_path") == 0) {
             CFG_SET_STR(socket_path);
         } else if (strcmp(k, "hmac_key_file") == 0) {
@@ -385,7 +423,7 @@ static int load_config(const char *path, struct fsq_config *cfg) {
         LocalFree(sid);
     }
 #else
-    if (strlen(cfg->socket_path) >= 108) return -1;
+    if (strlen(cfg->socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
     if (cfg->n_allowed == 0) cfg->allowed_uids[cfg->n_allowed++] = geteuid();
 #endif
     if (cfg->max_connections <= 0 || cfg->max_connections > FSQ_MAX_CONNECTIONS_LIMIT) return -1;
@@ -519,6 +557,39 @@ static int validate_provider_cfg(const struct fsq_config *cfg) {
         if ((p & strs[i].bit) && strs[i].val[0] == '\0') {
             fsq_log("ERROR", "provider key %s: value must not be empty", strs[i].name);
             return -1;
+        }
+    }
+    /* Path keys are checked for shape HERE, at configuration time, rather
+     * than left to fail later at load time with no context. The rules
+     * (absolute, no ".." segment) live in one place --
+     * fractalsql_config.c's fractal_config_validate_path -- so the
+     * daemon's config loader, the session overlay and the MCP's config
+     * writer all refuse the same values for the same reasons.
+     *
+     * A relative path is refused because the daemon's working directory
+     * is not a contract: the same conf file would name a different file
+     * depending on how the daemon was started. A ".." segment is
+     * refused because a path that walks out of its directory is a path
+     * whose meaning is decided by whatever the operator's tree happens
+     * to contain, not by the conf file. */
+    {
+        struct {
+            uint32_t    bit;
+            const char *val;
+            const char *name;
+        } paths[] = {
+            { FSQL_PROV_REASONING_PLUGIN, cfg->reasoning_plugin,        "reasoning_plugin" },
+            { FSQL_PROV_ENT_LIB,         cfg->enterprise_lib,          "enterprise_lib" },
+            { FSQL_PROV_ENT_LEDGER_PATH, cfg->enterprise_ledger_path,  "enterprise_ledger_path" },
+        };
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            char err[256];
+            if (!(p & paths[i].bit)) continue;
+            if (fractal_config_validate_path(paths[i].val, err, sizeof err) != 0) {
+                fsq_log("ERROR", "provider key %s: %s (got '%s')",
+                        paths[i].name, err, paths[i].val);
+                return -1;
+            }
         }
     }
     /* Upper bound is generous (no real provider's context window comes
@@ -1034,24 +1105,39 @@ static void handle_init(const uint8_t *p, uint32_t n, struct fsq_reply *rep) {
         return;
     }
 
+    /* The handle id is allocated first (it goes into the reply body),
+     * but the handle is only LINKED into the registry once the body
+     * has been allocated. Registering it and then failing left a handle
+     * in the registry whose id the caller never learned, with the
+     * adapter's init already run: its resources needed a deinit that
+     * nothing would ever call, for as long as the connection lived. */
     FSQ_LOCK(g_handles_mu);
     h->id = g_next_handle++;
-    h->owner = t_conn;
-    h->next = g_handles;
-    g_handles = h;
     FSQ_UNLOCK(g_handles_mu);
 
     /* Body: handle u64, max_length u32, maybe_null u8, nargs u32, types[nargs] u8. */
     rep->status = FSQ_OK;
     rep->body_len = 17 + nargs;
     body = calloc(rep->body_len, 1);
-    if (!body) { set_text(rep, FSQ_ERR_INTERNAL, "out of memory"); return; }
+    if (!body) {
+        ((fsq_deinit_fn) h->fn->deinit)(&h->init);
+        handle_free_args(h);
+        free(h);
+        set_text(rep, FSQ_ERR_INTERNAL, "out of memory");
+        return;
+    }
     fsq_put_u64(body, h->id);
     fsq_put_u32(body + 8, (uint32_t) h->init.max_length);
     body[12] = h->init.maybe_null ? 1 : 0;
     fsq_put_u32(body + 13, nargs);
     for (uint32_t i = 0; i < nargs; i++) body[17 + i] = item_to_wire(h->args.arg_type[i]);
     rep->body = body;
+
+    FSQ_LOCK(g_handles_mu);
+    h->owner = t_conn;
+    h->next = g_handles;
+    g_handles = h;
+    FSQ_UNLOCK(g_handles_mu);
 }
 
 static void tlv_result(struct fsq_reply *rep, uint8_t type, int is_null,
@@ -1115,6 +1201,13 @@ struct fsq_cache_entry {
     int32_t  core_rc;
     uint32_t body_len;
     uint8_t *body;      /* NULL when the slot is empty */
+    /* The function the cached reply belongs to. The token alone is
+     * enough to identify a resend (the shim mints one per logical
+     * call), but the name is checked as well so a token that somehow
+     * arrives with a different function cannot be answered with
+     * another function's result. */
+    uint8_t  name_len;
+    char     name[64];
 };
 
 static fsq_mutex g_cache_mu = FSQ_MUTEX_INIT;
@@ -1131,8 +1224,11 @@ static struct fsq_cache_entry *cache_find_locked(uint64_t token) {
 /* Returns 1 and fills rep when token has a cached response. The body is
  * cloned: rep->body is the caller's to free like any dispatch result.
  * An out-of-memory clone is reported as a miss -- the call re-executes,
- * which the retry classes say is safe for everything that got this far. */
-static int cache_replay(uint64_t token, struct fsq_reply *rep) {
+ * which the retry classes say is safe for everything that got this far.
+ * A token that belongs to a DIFFERENT function is a miss too: the reply
+ * belongs to the call that was made, not to the token alone. */
+static int cache_replay(uint64_t token, struct fsq_reply *rep,
+                        const char *name, uint8_t name_len) {
     struct fsq_cache_entry *e;
     uint32_t status, len;
     int32_t core_rc;
@@ -1140,6 +1236,10 @@ static int cache_replay(uint64_t token, struct fsq_reply *rep) {
     FSQ_LOCK(g_cache_mu);
     e = cache_find_locked(token);
     if (!e) { FSQ_UNLOCK(g_cache_mu); return 0; }
+    if (e->name_len != name_len || (name_len && memcmp(e->name, name, name_len) != 0)) {
+        FSQ_UNLOCK(g_cache_mu);
+        return 0;
+    }
     status = e->status; core_rc = e->core_rc; len = e->body_len;
     body = malloc(len ? len : 1);
     if (body && len) memcpy(body, e->body, len);
@@ -1154,11 +1254,17 @@ static int cache_replay(uint64_t token, struct fsq_reply *rep) {
     return 1;
 }
 
-static void cache_put(uint64_t token, const struct fsq_reply *rep) {
+static void cache_put(uint64_t token, const struct fsq_reply *rep,
+                      const char *name, uint8_t name_len) {
     uint32_t len = rep->body_len;
     uint8_t *copy;
     struct fsq_cache_entry *slot;
     if (token == 0 || len > FSQ_CACHE_ENTRY_MAX) return;
+    /* A name too long for the slot's field cannot be remembered, and a
+     * reply that cannot be matched to its function is not safe to
+     * replay -- so such a call is simply not cached. Every name in the
+     * daemon's table is far shorter than the field. */
+    if (name_len == 0 || name_len >= sizeof slot->name) return;
     copy = malloc(len ? len : 1);
     if (!copy) return;
     if (len) memcpy(copy, rep->body, len);
@@ -1189,6 +1295,15 @@ static void cache_put(uint64_t token, const struct fsq_reply *rep) {
             g_cache_next = (g_cache_next + 1) % FSQ_CACHE_ENTRIES;
         }
         slot = &g_cache[g_cache_next];
+        if (g_cache_bytes + len > FSQ_CACHE_MAX_BYTES) {
+            /* The scan bound was exhausted and the aggregate cap still
+             * does not admit the new body: an accounting slip. Skip the
+             * insert rather than exceed the cap -- the comment above
+             * promises exactly this, and the code did not do it. */
+            FSQ_UNLOCK(g_cache_mu);
+            free(copy);
+            return;
+        }
         if (slot->body) {
             g_cache_bytes -= slot->body_len;
             free(slot->body);
@@ -1200,6 +1315,8 @@ static void cache_put(uint64_t token, const struct fsq_reply *rep) {
     slot->core_rc = rep->core_rc;
     slot->body_len = len;
     slot->body = copy;
+    slot->name_len = name_len;
+    memcpy(slot->name, name, name_len);
     g_cache_bytes += len;
     FSQ_UNLOCK(g_cache_mu);
 }
@@ -1231,6 +1348,22 @@ static void handle_call(uint64_t token, const uint8_t *p, uint32_t n, struct fsq
         return;
     }
 
+    /* Idempotent resend: a stateful call's response, answered from the
+     * cache rather than re-executed. This check comes BEFORE the handle
+     * lookup, and that order is the whole point: the resend arrives on
+     * some other, newer connection (the old socket is the thing that
+     * died), and a handle belongs to the connection that created it --
+     * the daemon frees a connection's handles when it closes. So the
+     * handle the resend carries is GONE by the time the resend lands,
+     * and the handle gate below would refuse the call with
+     * FSQ_ERR_ARGS: the retry could never be answered, and for a
+     * stateful function the side effect had already happened, so the
+     * caller was told "failed" about work that was really done. The
+     * cache is keyed by the token (minted once per logical call), and
+     * the function name is checked as well, so a replay can only
+     * answer the call it belongs to. */
+    if (token != 0 && cache_replay(token, rep, name, namelen)) return;
+
     FSQ_LOCK(g_handles_mu);
     h = handle_find_locked(id);
     FSQ_UNLOCK(g_handles_mu);
@@ -1240,7 +1373,7 @@ static void handle_call(uint64_t token, const uint8_t *p, uint32_t n, struct fsq
         return;
     }
 
-    /* Between-calls cancellation checkpoint (SS11.4): a row-by-row statement
+    /* Between-calls cancellation checkpoint: a row-by-row statement
      * reuses this handle across many UDF_CALLs, so refusing to start the
      * next one here stops the remaining rows without touching the core. A
      * call already running when CANCEL arrived is instead stopped by the
@@ -1250,11 +1383,6 @@ static void handle_call(uint64_t token, const uint8_t *p, uint32_t n, struct fsq
         set_text(rep, FSQ_ERR_BUSY, "cancelled");
         return;
     }
-
-    /* Idempotent resend: a stateful call's response, answered from the
-     * cache rather than re-executed -- the resend arrives on some other,
-     * newer connection, which is why the cache is not per-connection. */
-    if (token != 0 && cache_replay(token, rep)) return;
 
     for (i = 0; i < nargs; i++) {
         enum Item_result t = h->args.arg_type[i];
@@ -1330,11 +1458,20 @@ static void handle_call(uint64_t token, const uint8_t *p, uint32_t n, struct fsq
      * FSQ_ERR_CORE is cached too (a stateful function erroring twice should
      * stay one execution); effect-free statuses are not. */
     if (token != 0 && (rep->status == FSQ_OK || rep->status == FSQ_ERR_CORE))
-        cache_put(token, rep);
+        cache_put(token, rep, h->fn->name, (uint8_t) strlen(h->fn->name));
 
 done:
     t_active_handle = NULL;
-    for (i = 0; i < nargs; i++) free(bufs[i]);
+    for (i = 0; i < nargs; i++) {
+        free(bufs[i]);
+        /* The per-call argument values are valid only for the duration of
+         * the call: the string buffers are freed right here, and the
+         * numeric ones point into this frame's stack. Leaving those
+         * pointers in the handle would leave it holding freed memory that
+         * the next reader would take for a live argument value. */
+        h->args.args[i] = NULL;
+        h->args.lengths[i] = 0;
+    }
 }
 
 static void handle_deinit(const uint8_t *p, uint32_t n, struct fsq_reply *rep) {
@@ -1496,7 +1633,7 @@ static void dispatch(const struct fsq_config *cfg, const struct fsq_header *h,
             handle_cancel(payload, plen, rep);
             return;
         case FSQ_OP_RELOAD:
-            /* Spec'd as a payload-less request: anything attached is a
+            /* RELOAD is a payload-less request: anything attached is a
              * malformed reload, refused without touching the running
              * config (future revisions could carry options here). */
             if (plen != 0) { set_text(rep, FSQ_ERR_ARGS, "RELOAD takes no payload"); return; }
@@ -1686,7 +1823,7 @@ static void handle_release_owner(uint64_t conn) {
                 released, (unsigned long long) conn);
 }
 
-static FSQ_THREAD_RET serve_connection(void *arg) {
+static FSQ_THREAD_RET serve_connection_body(void *arg) {
     struct conn_arg *ca = arg;
     fsq_sock fd = ca->fd;
     /* Borrow the current snapshot: idle timeout, vetting and this
@@ -1749,6 +1886,7 @@ static FSQ_THREAD_RET serve_connection(void *arg) {
         }
 
         dispatch(cfg, &h, payload, h.payload_len, &rep);
+        coverage_flush_tick();
         free(payload);
         if (rep.status != FSQ_OK)
             fsq_log("WARN", "opcode 0x%04x failed: status %u, core rc %d, %.200s",
@@ -1768,6 +1906,145 @@ static FSQ_THREAD_RET serve_connection(void *arg) {
     cfg_release(snap);
     return FSQ_THREAD_EXIT;
 }
+
+/* The connection thread's entry point.
+ *
+ * The body is wrapped rather than tidied up inline so that EVERY exit
+ * path -- the early refusal, an error return, the normal end of the
+ * request loop -- releases this connection thread's per-thread ledger
+ * read buffers exactly once. Those buffers are handed to the engine,
+ * which never frees them; normally the next read of the same kind
+ * frees the previous one, but a connection that reads a ledger kind
+ * once and then closes would strand them for the life of the daemon.
+ * The daemon runs one thread per connection, so the stranding would
+ * grow with the number of connections ever served. */
+extern void fractal_enterprise_release_thread_read_buffers(void);
+
+static FSQ_THREAD_RET serve_connection(void *arg) {
+    FSQ_THREAD_RET r = serve_connection_body(arg);
+    fractal_enterprise_release_thread_read_buffers();
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* Coverage-profile flushing (instrumented Windows builds only)       */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/* WHY THIS EXISTS:                                                  */
+/*   The LLVM coverage runtime writes its .profraw file at NORMAL     */
+/*   PROCESS EXIT. The Windows harness stops fractalsqld with a hard   */
+/*   kill (Stop-Process -Force), which does NOT run the CRT's exit    */
+/*   handlers -- so an instrumented daemon would leave no profile      */
+/*   behind and the Windows coverage report would come out empty.     */
+/*                                                                    */
+/*   The POSIX side has no such problem: there the harness stops the  */
+/*   daemon with SIGTERM, the daemon's signal handler unwinds the     */
+/*   listener cleanly, the process exits normally, and gcov's own      */
+/*   atexit hook writes the .gcda. The Windows daemon has no such      */
+/*   signal, so it flushes the profile ITSELF, periodically, while it  */
+/*   is running.                                                      */
+/*                                                                    */
+/*   The two runtime entry points are resolved DYNAMICALLY            */
+/*   (GetProcAddress), so a build without the coverage runtime -- the */
+/*   normal MSVC build -- has no link-time dependency on it at all,   */
+/*   and the whole feature is dormant unless the harness sets         */
+/*   FRACTALSQL_PROFILE_FLUSH_MS.                                    */
+/*                                                                    */
+/*   The write is followed by a counter RESET, which is what makes the */
+/*   numbers right: the runtime MERGES each write into the file it    */
+/*   already wrote, so a write of the running totals would be added   */
+/*   to the running totals again, once per flush. Writing the delta   */
+/*   and resetting leaves the file holding the run's true totals.     */
+/* ------------------------------------------------------------------ */
+#if defined(_WIN32)
+typedef int  (*fsq_prof_write_fn)(void);
+typedef void (*fsq_prof_reset_fn)(void);
+
+static fsq_prof_write_fn g_prof_write = NULL;
+static fsq_prof_reset_fn g_prof_reset = NULL;
+static DWORD             g_prof_interval_ms = 0;
+static DWORD             g_prof_next_ms = 0;
+static CRITICAL_SECTION  g_prof_lock;
+static int               g_prof_lock_ready = 0;
+
+static void
+coverage_flush_init(void)
+{
+    const char *iv = getenv("FRACTALSQL_PROFILE_FLUSH_MS");
+    long        ms;
+    HMODULE     self;
+    FARPROC     w, r;
+
+    if (iv == NULL || *iv == '\0') return;
+    ms = strtol(iv, NULL, 10);
+    if (ms <= 0) return;
+
+    self = GetModuleHandleA(NULL);
+    if (self == NULL) return;
+    /* Both symbols exist only in a build that links the LLVM coverage
+     * runtime (clang-cl -fprofile-instr-generate). A normal MSVC build
+     * has neither, and simply never flushes. */
+    w = GetProcAddress(self, "__llvm_profile_write_file");
+    r = GetProcAddress(self, "__llvm_profile_reset_counters");
+    if (w == NULL || r == NULL) {
+        fsq_log("WARN", "FRACTALSQL_PROFILE_FLUSH_MS is set but this build has no coverage runtime; ignoring it");
+        return;
+    }
+    g_prof_write       = (fsq_prof_write_fn) (void *) w;
+    g_prof_reset       = (fsq_prof_reset_fn) (void *) r;
+    g_prof_interval_ms = (DWORD) ms;
+    InitializeCriticalSection(&g_prof_lock);
+    g_prof_lock_ready = 1;
+    /* The FIRST tick is due immediately (0 = always overdue), so a
+     * short gate run still leaves a profile behind: with the first
+     * write deferred by a full interval, a run whose daemon lives
+     * less than one interval would produce no .profraw at all, and
+     * the harness would report "no coverage" for a run that did
+     * execute code. Writing more often than the interval is safe --
+     * each write is a DELTA, and the file accumulates them. */
+    g_prof_next_ms = 0;
+    fsq_log("INFO", "coverage profile flushing enabled (every %ld ms)", ms);
+}
+
+/* Writes the profile and resets the counters, so the file ends up
+ * holding the run's true totals rather than a sum of totals. */
+static void
+coverage_flush_now(void)
+{
+    if (g_prof_write == NULL) return;
+    if (g_prof_lock_ready) EnterCriticalSection(&g_prof_lock);
+    g_prof_write();
+    g_prof_reset();
+    if (g_prof_lock_ready) LeaveCriticalSection(&g_prof_lock);
+}
+
+/* Called from the request path. The due-check is INSIDE the lock, so
+ * two connections finishing at once cannot both decide they are due
+ * (the second one would then write an empty delta and reset the
+ * counters the first one had just written). */
+static void
+coverage_flush_tick(void)
+{
+    DWORD now;
+    if (g_prof_write == NULL) return;
+    EnterCriticalSection(&g_prof_lock);
+    now = GetTickCount();
+    if ((LONG) (now - g_prof_next_ms) >= 0) {
+        g_prof_next_ms = now + g_prof_interval_ms;
+        g_prof_write();
+        g_prof_reset();
+    }
+    LeaveCriticalSection(&g_prof_lock);
+}
+#else
+/* POSIX: the daemon is stopped with SIGTERM and exits normally, so
+ * gcov's own atexit hook writes the profile. Nothing to do here --
+ * but the TICK is still called from the request path (unconditionally,
+ * on both platforms), so the stub has to exist. The init/now pair are
+ * Windows-only and are not defined at all here; see the forward
+ * declarations near the top of this file. */
+static void coverage_flush_tick(void) {}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Main                                                                */
@@ -1855,6 +2132,10 @@ static HANDLE g_stop_event = NULL;
 static BOOL WINAPI on_console_event(DWORD ev) {
     (void) ev;
     fsq_log("INFO", "stop requested by console control event");
+    /* A graceful stop is the one path where the process is going to
+     * exit normally, so this is the last chance to write the coverage
+     * profile out. */
+    coverage_flush_now();
     SetEvent(g_stop_event);
     return TRUE;
 }
@@ -1969,13 +2250,20 @@ static int run_listener(void) {
         }
         next = create_pipe_instance(cfg->socket_path, 0);
         {
+            /* The limit is re-read per accept, so a reload applies to the
+             * next connection rather than whenever this loop restarted.
+             * The check and the increment happen in ONE critical section:
+             * reading g_conns outside the lock and incrementing inside it
+             * let two concurrent accepts both see "room for one more" and
+             * push the daemon past max_connections. */
             struct fsq_config_snap *ssnap = cfg_acquire();
-            over = g_conns >= ssnap->cfg.max_connections;
+            int max_conns = ssnap->cfg.max_connections;
             cfg_release(ssnap);
+            FSQ_LOCK(g_conn_mu);
+            over = (g_conns >= max_conns);
+            if (!over) g_conns++;
+            FSQ_UNLOCK(g_conn_mu);
         }
-        FSQ_LOCK(g_conn_mu);
-        if (!over) g_conns++;
-        FSQ_UNLOCK(g_conn_mu);
         if (over) {
             fsq_log("WARN", "connection refused: max_connections reached");
             CloseHandle(cur);
@@ -2057,14 +2345,19 @@ static void run_listener(void) {
 #endif
         {
             /* Re-read the limit per accept, so a reload applies it to the
-             * next connection rather than whenever this loop restarted. */
+             * next connection rather than whenever this loop restarted.
+             * The check and the increment happen in ONE critical section:
+             * reading g_conns outside the lock and incrementing inside it
+             * let two concurrent accepts both see "room for one more" and
+             * push the daemon past max_connections. */
             struct fsq_config_snap *ssnap = cfg_acquire();
-            over = g_conns >= ssnap->cfg.max_connections;
+            int max_conns = ssnap->cfg.max_connections;
             cfg_release(ssnap);
+            FSQ_LOCK(g_conn_mu);
+            over = (g_conns >= max_conns);
+            if (!over) g_conns++;
+            FSQ_UNLOCK(g_conn_mu);
         }
-        FSQ_LOCK(g_conn_mu);
-        if (!over) g_conns++;
-        FSQ_UNLOCK(g_conn_mu);
         if (over) {
             fsq_log("WARN", "connection refused: max_connections reached");
             close(fd);
@@ -2191,6 +2484,10 @@ int main(int argc, char **argv) {
         }
     }
     atexit(log_exit);
+    /* Coverage builds flush their own profile (see the block above):
+     * the harness stops this daemon with a hard kill, which would
+     * otherwise leave no profile behind at all. */
+    coverage_flush_init();
     /* Startup: gate on the config (platform checks + provider checks),
      * then push the provider settings the consumers boot from. Refusing
      * to start on a bad value beats lazily surfacing it on the first LLM

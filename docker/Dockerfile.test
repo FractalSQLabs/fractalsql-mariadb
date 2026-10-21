@@ -31,6 +31,8 @@ USER root
 # unless you check `ldd` on the plugin directly, so it's easy to miss
 # without this dependency being explicit here. python3: scripts/ci/
 # mock_llm.py, the reasoning-tier gates' deterministic HTTP stub.
+# pkg-config: mcp/Makefile asks it for OpenSSL's flags; without it the MCP
+# server links without -lssl/-lcrypto and fails, and gate 40 (mcp_https) skips.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         binutils \
@@ -43,6 +45,7 @@ RUN apt-get update \
         libssl-dev \
         mariadb-plugin-connect \
         openssl \
+        pkg-config \
         python3 \
  && rm -rf /var/lib/apt/lists/*
 

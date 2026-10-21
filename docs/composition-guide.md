@@ -17,9 +17,15 @@ is just a `CREATE PROCEDURE ... SQL SECURITY INVOKER` that calls them in
 sequence, feeds one's output into the next's input via a local `DECLARE`d
 variable, and returns a shaped result through an `OUT JSON` parameter. The
 16 shipped agents are exactly this, productized. Read any of them in
-`sql/install_agents.sql` as a worked template; they're all under 100 lines
-and follow the same shape (validate inputs → gather via a search primitive
-or dynamic SQL → analyze → `fractal_reason` → assemble the `OUT` JSON).
+`sql/install_agents.sql` as a worked template; they follow the same shape
+(validate inputs → gather via a search primitive or dynamic SQL → analyze
+→ `fractal_reason` → assemble the `OUT` JSON). Fifteen of the sixteen
+lettered engines are under 100 lines; `fractal_agent_detect_loop` is the
+longest, at about 125. The parts every engine shares — argument
+validation, the `fractal_reason` call and its partial-mode handling, the
+nearest-neighbour and primary-key lookups — live in seven
+`_fractalsql_agent_*` helper procedures at the top of the same file, so
+a new agent can call them instead of copying the boilerplate.
 
 > **No separate "Universal Agent" C-level tier here, but all six are
 > available.** MariaDB's C UDF ABI has no way to run SQL against the
@@ -263,3 +269,9 @@ Two issues surfaced while building the shipped agents, and apply equally to any 
   [reasoning-setup.md](reasoning-setup.md).
 - **Validate your composition** against the same demo path the shipped
   agents use → `mariadb -uroot -p fractalsql_demo < demo/demo-agents.sql`.
+
+  The client does not stop at the first error, so it carries on past an
+  expected one and the rest of the file still runs. The file prints one:
+  an enterprise-tier call reports that the tier is not loaded on a
+  Community build. The client's exit code is the file's verdict - read
+  the log rather than assuming a fault.

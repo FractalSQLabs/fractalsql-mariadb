@@ -21,6 +21,19 @@ case "${ARCH}" in
     *) echo "unknown arch '${ARCH}': expected amd64 or arm64" >&2; exit 2 ;;
 esac
 
+# Everything after the arch positional must be recognized: an
+# unrecognized flag is rejected rather than silently ignored, because a
+# build nobody asked for is worse than a build that refuses to start.
+# (Counter skip instead of "${@:2}", which breaks under `set -u` with
+# zero or one args on old bash -- macOS ships 3.2.)
+_arg_i=0
+for arg in "$@"; do
+    _arg_i=$((_arg_i + 1))
+    [[ ${_arg_i} -eq 1 ]] && continue
+    echo "unknown argument '${arg}': this build takes only an arch (amd64|arm64)" >&2
+    exit 2
+done
+
 BASE_IMAGE="rockylinux:9"
 GLIBC_CEILING="34"
 SIZE_CEILING_BYTES="3145728"   # 3 MB
@@ -28,7 +41,15 @@ CORE_VARIANT="community-sovereign-c"
 
 DIST_DIR="${DIST_DIR:-./dist}"
 DOCKERFILE="${DOCKERFILE:-docker/Dockerfile}"
-PLATFORM="linux/${ARCH}"
+# The arch -> platform mapping, dispatched explicitly rather than
+# interpolated. The default arm is the last line of defense: an arch
+# that somehow slips past the validation above must fail loudly here
+# rather than produce a build for a platform nobody asked for.
+case "${ARCH}" in
+    amd64) PLATFORM="linux/amd64" ;;
+    arm64) PLATFORM="linux/arm64" ;;
+    *) echo "internal error: unhandled arch '${ARCH}' (validate it above)" >&2; exit 2 ;;
+esac
 OUT_DIR="${DIST_DIR}/${ARCH}"
 
 mkdir -p "${OUT_DIR}"
@@ -54,5 +75,5 @@ DOCKER_BUILDKIT=1 docker buildx build \
 
 echo
 echo "Built artifact for ${ARCH}:"
-ls -l "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld"
-file "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld" 2>/dev/null || true
+ls -l "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld" "${OUT_DIR}/fractalsql-mariadb-mcp"
+file "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld" "${OUT_DIR}/fractalsql-mariadb-mcp" 2>/dev/null || true

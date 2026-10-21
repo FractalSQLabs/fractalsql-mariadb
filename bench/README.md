@@ -59,6 +59,26 @@ python3 bench/data_gen.py --host 127.0.0.1 --password <root password> \
 python3 bench/head_to_head.py --host 127.0.0.1 --password <root password>   # seconds for 5 queries at the default scale
 ```
 
+### The connection target is checked before anything runs
+
+Every bench script validates its `--host`, `--port` and `--database`
+before it opens a connection, and refuses with a clear message if any of
+them is not what a benchmark target should be:
+
+* `--host` must be a plain hostname or IP literal. A URL, a path or a
+  socket spec is rejected — the driver would accept it, but a benchmark
+  that silently connects somewhere you did not intend is worse than one
+  that stops.
+* `--database` must be a plain SQL identifier (letters, digits,
+  underscore). A name that would need quoting is rejected rather than
+  quoted-and-escaped.
+* `--port` must be in 1–65535.
+
+The password is never validated, never logged and never put in a
+connection string: it goes straight into the driver's own `password=`
+argument, so it cannot end up in a DSN, an exception message or a log
+line. The shared check lives in `bench/bench_target.py`.
+
 ## What you should see
 
 The output is a per-query table followed by an average. This example is
@@ -314,3 +334,15 @@ built shim + daemon (see `service/tests/spike_test.sh` for the pattern), then
 run `MYSQL_SOCKET=<unix sock> BENCH_ITERATIONS=5000 node tester/scalar_bench.js`
 and `MYSQL_SOCKET=<unix sock> BENCH_N=10000 BENCH_DIM=128 BENCH_ITERATIONS=10 node tester/run.js`
 against it.
+
+The search tester sends the whole corpus to the server in a single
+statement, so the server has to accept a statement of that size: at
+N=10000, dim=128 the corpus is roughly 26 MB of text, and a server left
+at MariaDB's default `max_allowed_packet` of 16 MB rejects it with
+`ER_NET_PACKET_TOO_LARGE`. Raise it before the run:
+
+```sql
+SET GLOBAL max_allowed_packet = 67108864;   -- 64 MB
+```
+
+The scalar tester is unaffected - it sends one short vector per call.

@@ -42,6 +42,8 @@ import sys
 import time
 from contextlib import contextmanager
 
+from bench_target import check_target
+
 import numpy as np
 
 try:
@@ -92,6 +94,13 @@ def main() -> int:
                     help="print only the final averages line (for sweep drivers)")
     args = ap.parse_args()
 
+    # The connection target is caller-supplied text that decides where the
+    # benchmark reads from. Pin it to a plain hostname/IP and a plain schema
+    # identifier before connecting, so a malformed --host cannot silently
+    # redirect the run at some other server. See bench/bench_target.py.
+    if not check_target( "head_to_head.py", args.host, args.port, args.database ):
+        return 2
+
     conn = mariadb.connect(host=args.host, port=args.port, user=args.user,
                            password=args.password, database=args.database,
                            autocommit=True)
@@ -111,9 +120,11 @@ def main() -> int:
     has_native = cur.fetchone()[0] == 1
 
     if not args.quiet:
+        native_label = ("available" if has_native else
+                        "NOT AVAILABLE (run data_gen.py --with-native-vector "
+                        "on MariaDB 11.7+)")
         print(f"Benchmark: {n_total} stored vectors, {K} clusters, dim={dim}")
-        print(f"  Native VECTOR(n) index: {'available' if has_native else 'NOT AVAILABLE '
-              '(run data_gen.py --with-native-vector on MariaDB 11.7+)'}, LIMIT {args.top_k}")
+        print(f"  Native VECTOR(n) index: {native_label}, LIMIT {args.top_k}")
         print(f"  Scout (fractal_search_explore): population={args.top_k}, "
               f"iterations={args.sfs_iter}, mdn={args.sfs_mdn}, walk=0.0 "
               f"(brute-force relevance scan + MMR)")

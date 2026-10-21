@@ -11,6 +11,7 @@ REM
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\lib\plugin\fractalsql.dll
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\fractalsqld\fractalsqld.exe
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\fractalsqld\LICENSE (Apache-2.0)
+REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\fractalsql-mcp\fractalsql-mariadb-mcp.exe (+ libmariadb.dll, the two lock files)
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\fractalsql-mariadb\LICENSE
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\fractalsql-mariadb\LICENSE-THIRD-PARTY
 REM     C:\Program Files\MariaDB ^<MARIADB_MAJOR^>\share\doc\fractalsql-mariadb\install_udf.sql
@@ -24,11 +25,12 @@ REM Prerequisites
 REM   * WiX Toolset v3.x installed (candle.exe / light.exe on PATH).
 REM   * dist\windows\mdb^<MARIADB_MAJOR^>\fractalsql.dll already produced
 REM     by scripts\windows\build.bat.
+REM   * mcp\dist\windows-mcp\ already produced by mcp\scripts\windows\build.bat.
 REM
 REM Environment
 REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 ^| 12.3: selects UpgradeCode and install-folder name
 REM   MSI_ARCH      x64 ^| arm64: passed to candle -arch
-REM   MSI_VERSION   overrides Product Version (default 2.0.10, read from src\fractalsql.c's FSQL_VERSION if not set)
+REM   MSI_VERSION   overrides Product Version (default 2.0.11, read from src\fractalsql.c's FSQL_VERSION if not set)
 
 setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 
@@ -67,6 +69,14 @@ if not exist "%DAEMON%" (
     exit /b 1
 )
 
+REM The MCP server, built by mcp\scripts\windows\build.bat (libmariadb.dll is staged next to it).
+set MCPDIST=mcp\dist\windows-mcp
+for %%F in (fractalsql-mariadb-mcp.exe libmariadb.dll) do if not exist "%MCPDIST%\%%F" (
+    echo ==^> ERROR: %MCPDIST%\%%F missing: run mcp\scripts\windows\build.bat first
+    popd
+    exit /b 1
+)
+
 REM Per-(major, arch) staging dir so candle can reference a stable
 REM "dist\windows\staging-...\fractalsql.dll" path from the wxs. Avoids
 REM threading MARIADB_MAJOR through every File/@Source attribute.
@@ -83,6 +93,15 @@ copy /Y sql\install_udf.sql    "%STAGE%\install_udf.sql"    > nul
 copy /Y LICENSES\GPL-2.0-only.txt "%STAGE%\LICENSE"  > nul
 copy /Y GPL-SOURCE-OFFER.txt "%STAGE%\GPL-SOURCE-OFFER.txt" > nul
 copy /Y THIRD-PARTY-NOTICES.md "%STAGE%\LICENSE-THIRD-PARTY" > nul
+
+REM MCP server: the executable, its client library and the two lock files go into one folder (the server looks for
+REM the locks beside itself); the README and manifest ride along as documentation.
+copy /Y "%MCPDIST%\fractalsql-mariadb-mcp.exe"  "%STAGE%\fractalsql-mariadb-mcp.exe" > nul
+copy /Y "%MCPDIST%\libmariadb.dll"              "%STAGE%\libmariadb.dll"              > nul
+copy /Y mcp\.mcp-schema-lock                    "%STAGE%\.mcp-schema-lock"            > nul
+copy /Y mcp\.mcp-safety-annotations-lock        "%STAGE%\.mcp-safety-annotations-lock" > nul
+copy /Y mcp\README.md                           "%STAGE%\mcp-README.md"               > nul
+copy /Y mcp\manifest.json                       "%STAGE%\mcp-manifest.json"           > nul
 
 REM Per-cell README ships in the MSI so users who only grab the .msi
 REM still see the "which MariaDB major, which arch" pairing without
@@ -117,6 +136,11 @@ REM hopping to GitHub.
   echo         "*S-1-5-18:F" "*S-1-5-32-544:F" "*S-1-5-19:R" "*^<MariaDB service SID^>:R"
   echo     Start-Service fractalsqld
   echo Or start it by hand with -c ^<config^> before mariadbd.
+  echo.
+  echo The MCP ^(Model Context Protocol^) server is installed under
+  echo     C:\Program Files\MariaDB %MARIADB_MAJOR%\fractalsql-mcp\fractalsql-mariadb-mcp.exe
+  echo with its schema and safety lock files in the same folder. See
+  echo README.md there for usage.
   echo.
   echo After install, activate the UDFs once per server. Note the SONAME
   echo rewrite: MariaDB's UDF loader takes SONAME literally, so install_

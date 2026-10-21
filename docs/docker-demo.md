@@ -47,7 +47,7 @@ Confirm the UDF set loaded:
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
   "SELECT fractal_edition(), fractal_version();"
-# expect: Community, 2.0.10
+# expect: Community, 2.0.11
 ```
 
 Run any demo (re-runnable; each recreates its own fixture tables):
@@ -57,6 +57,23 @@ docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/<
 (Redirect from the **host** side: the `mariadb` client reads its script
 from stdin, unlike `psql`'s `-f` flag. Add `-T` to `docker compose exec` if
 you're piping from a host file through a non-interactive shell.)
+
+Or run every demo in `demo/` in one pass:
+```bash
+docker compose exec mariadb /demo/run_demo.sh
+```
+Logs each file to `/tmp/fractalsql_demo_run/` inside the container and
+prints a final `N ok, M non-zero exit` tally. A non-zero exit from one
+file is a "go read its log" signal, not proof of a bug — the `mariadb`
+client stops at the first error in a file, so a demo that demonstrates
+an error on purpose (a deliberate CHECK-constraint failure, an
+unknown-metric rejection, the enterprise-tier-gated demos on this
+Community build) can end early even though its own handlers would
+otherwise have carried on. `run_demo.sh --help` lists the known ones
+plus `--only`/`--skip`/`--quiet` flags and how to also exercise
+`response-modes.sql` (skipped by default — see
+[Response modes](../demo/README.md#response-modes) for why it needs
+separate treatment).
 
 ### 2. Cognition: pull a model (opt-in)
 
@@ -94,6 +111,75 @@ embedding pipelines:
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/demo-vectorizer.sql
 ```
+
+### 4. Try the MCP server
+
+The demo image stages the **MCP client helpers** — `demo/mcp/call-tool.sh`
+and `demo/mcp/call-tool.py` — a one-shot JSON-RPC client that drives the
+real MCP server binary with its tool table narrowed (launch-time `--tool`
+filter) to exactly four tools (`fractal_search`, `fractal_reason`,
+`fractal_agent_data_analyst`, `fractal_agent_diverse_portfolios`),
+chosen to prove the MCP call shapes end to end on real demo data. There
+is no second demo-server implementation to keep in sync: the helpers
+speak JSON-RPC to the production server.
+
+The server binary **is** part of the demo image: the `demo` build
+stage compiles [`mcp/`](../mcp/) and stages the server at
+`/usr/local/bin/fractalsql-mariadb-mcp`, so the one-liner below works
+with no host build at all. The wrapper still falls back to `PATH` and to
+a checkout's `mcp/` directory, so the same script works outside the
+container against a locally built server.
+
+The server is stdio-only: MariaDB has no server process for an MCP
+layer to front, so it is just another process `docker compose exec`'d
+inside the container that's already running — no new container, nothing
+new to install beyond what's already in the image. (A standalone image
+of the server alone is available too:
+`docker build --target mcp -t fractalsql-mariadb-mcp -f docker/Dockerfile .`
+— the same binary, with no database in it.)
+
+The MCP server is a **client of the database**, not an in-process
+extension: it opens its own MariaDB connection and calls the engine's
+stored procedures and UDFs over it, while the UDF bodies themselves
+run in the separate `fractalsqld` daemon. That is why the wrapper
+passes the demo compose project's own credentials — deliberately not a
+production posture.
+
+One-liner real tool call round-trip (search needs no model):
+
+```bash
+docker compose exec mariadb /demo/mcp/call-tool.sh fractal_search \
+  '{"query":[0.6,0.8,0.0],"corpus":[[0.1,0.9,0.0],[0.6,0.8,0.0]],"k":1}'
+```
+
+…then a reasoned agent answer over the demo data (needs a model from
+step 2; run `demo/demo.sql` first so its fixture tables exist):
+
+```bash
+docker compose exec mariadb /demo/mcp/call-tool.sh fractal_agent_data_analyst \
+  '{"question":"how many rows are in demo_embeddings"}'
+```
+
+…and the enterprise clean-error path, proven on the demo's
+Community-only install (this is part of the demo, not a bug):
+
+```bash
+docker compose exec mariadb /demo/mcp/call-tool.sh fractal_agent_diverse_portfolios \
+  '{"mu":[0.05,0.1],"cov":[1.0,0.0,0.0,1.0],"cardinality":1}'
+# TOOL ERROR: fractalsql: enterprise tier not loaded (...)
+```
+
+If you have Node available and want the richer, interactive Explorer,
+the MCP inspector talks to the same binary's stdio transport like any
+other MCP client (inside the container:
+`npx @modelcontextprotocol/inspector /usr/local/bin/fractalsql-mariadb-mcp --tool fractal_search`,
+or drop the `--tool` list to see the full catalog); optional, not
+required.
+
+The demo server reuses the demo compose project's own credentials and
+posture, *not* a production configuration. For the full tool catalog,
+a real client config, and the production server, see
+**[docs/mcp-plugin.md](mcp-plugin.md)**.
 
 ---
 
@@ -159,7 +245,8 @@ does and when to use it.
 `demo-text-to-sql.sql`, `demo-vectorizer.sql`, `demo-fractal-vector.sql`,
 `benchmark.sql`, `benchmark-api-reference.sql`, the `text-to-sql-spike-*.sql`
 series, and the enterprise-tier `enterprise-qtl-audit.sql`/`enterprise-stress.sql`
-(see [`docs/enterprise.md`](enterprise.md)). Run any the same way.
+(see [`docs/enterprise.md`](enterprise.md)). Run any the same way — or run
+the whole directory in one pass with `/demo/run_demo.sh` (see step 1).
 `demo-vertical-biotech-genomics.sql` (TDA + L_p on a cyclic cell-cycle
 trajectory and gene-expression profiles, no reasoning needed) is in the
 image too. See

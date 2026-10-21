@@ -25,6 +25,7 @@ sys/socket.h
 sys/un.h
 unistd.h
 windows.h
+Windows.h
 ../common/fsq_sha256.h
 ../protocol/fsq_protocol.h
 shim_udfs.h
@@ -33,6 +34,14 @@ shim_udfs.h
 tmp=$(mktemp) || exit 2
 trap 'rm -f "$tmp"' EXIT
 
+# The allow-list is matched EXACTLY (grep -qx), so the Windows SDK header
+# is listed under BOTH spellings: the shim includes the canonical
+# <Windows.h>, while the allow-list has always carried the lowercase
+# <windows.h>. The check's job is to keep core and vendored headers out
+# of the shim, not to police the case of a header the SDK ships under
+# both names -- and a case-sensitive filesystem would reject the
+# lowercase spelling outright, so the canonical one is the only one a
+# POSIX build could ever compile.
 f=shim/fractalsql_shim.c
 grep -n '^[[:space:]]*#[[:space:]]*include' "$f" > "$tmp"
 while IFS= read -r line; do

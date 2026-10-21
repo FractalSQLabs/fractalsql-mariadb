@@ -118,9 +118,21 @@ if errorlevel 1 (
 
 REM Daemon. CC_DAEMON, CRT_FLAG and SAN_FLAGS let build_test.ps1 build an
 REM instrumented daemon (-Asan: cl /fsanitize=address; -Ubsan: clang-cl
-REM -fsanitize=undefined). The shim is always built plain. /DFSQL_STATIC: the vendored core is a static .lib, so FSQL_API
+REM -fsanitize=undefined; -Coverage: clang-cl -fprofile-instr-generate
+REM -fcoverage-mapping). The shim is always built plain. /DFSQL_STATIC: the vendored core is a static .lib, so FSQL_API
 REM must be a plain extern rather than dllimport. _WINDLL is not defined
 REM (no /LD here), so openssl/e_os2.h takes the static-library branch.
+REM
+REM LINK_EXPORTS exists for the COVERAGE build only. The daemon flushes its
+REM own LLVM profile on a timer (service\daemon\fractalsqld.c, the
+REM FRACTALSQL_PROFILE_FLUSH_MS path) and finds the two runtime entry
+REM points with GetProcAddress -- but GetProcAddress can only see an EXE's
+REM EXPORTED symbols, and the coverage runtime is linked statically
+REM (clang_rt.profile-x86_64.lib), so without an explicit export the
+REM lookup fails and the daemon never writes a profile. Exporting them
+REM is a coverage-build-only change; a normal build has no such symbols
+REM and no exports, and the daemon's lookup then finds nothing and stays
+REM dormant, exactly as intended.
 echo.
 echo ==^> Building daemon
 if "%CC_DAEMON%"=="" set CC_DAEMON=cl.exe
@@ -134,7 +146,8 @@ if "%CRT_FLAG%"=="" set CRT_FLAG=/MT
         src\fractalsql_vector.c src\fractalsql_cognition.c ^
         src\fractalsql_textsql.c src\fractalsql_enterprise.c ^
         src\fractalsql_interrupt.c ^
-    /link /DEBUG ^
+        src\fractalsql_config.c src\fractalsql_config_udf.c ^
+    /link /DEBUG %LINK_EXPORTS% ^
         "%CORE_LIB%" ^
         "%OPENSSL_DIR%\lib\libcrypto.lib" ^
         ws2_32.lib crypt32.lib advapi32.lib user32.lib gdi32.lib bcrypt.lib

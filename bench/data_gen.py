@@ -60,6 +60,8 @@ import argparse
 import sys
 import time
 
+from bench_target import check_target
+
 import numpy as np
 
 try:
@@ -114,6 +116,13 @@ def main() -> int:
                     help="RNG seed (default: %(default)s)")
     args = ap.parse_args()
 
+    # The connection target is caller-supplied text that decides where the
+    # benchmark writes. Pin it to a plain hostname/IP and a plain schema
+    # identifier before connecting, so a malformed --host cannot silently
+    # redirect the run at some other server. See bench/bench_target.py.
+    if not check_target( "data_gen.py", args.host, args.port, args.database ):
+        return 2
+
     rng = np.random.default_rng(args.seed)
 
     print(f"Generating {args.n} points in R^{args.dim}, "
@@ -143,7 +152,12 @@ def main() -> int:
     cur.execute("DROP TABLE IF EXISTS bench_vectors")
     cur.execute("DROP TABLE IF EXISTS bench_centers")
 
-    vec_col = f",\n            emb_vec    VECTOR({args.dim}) NOT NULL" if has_native else ""
+    # args.dim reaches SQL text below (the VECTOR(n) column type), so it is
+    # re-cast to int at the point of use rather than trusted as whatever
+    # argparse handed back. argparse already types it as int, but the value
+    # that ends up inside a DDL string should not depend on that.
+    dim = int(args.dim)
+    vec_col = f",\n            emb_vec    VECTOR({dim}) NOT NULL" if has_native else ""
     cur.execute(f"""
         CREATE TABLE bench_vectors (
             id         INT PRIMARY KEY,

@@ -1,0 +1,37 @@
+# service/tests/tsan_suppressions.txt
+#
+# ThreadSanitizer suppressions for the concurrent-ledger-write runner
+# (build_test.sh gate 46, --tsan only).
+#
+# WHY THIS FILE IS COMMENT-ONLY:
+#
+# The runner links the ledger code directly into its own binary. It does
+# NOT load an extension at runtime, so there is no per-connection
+# initialization step and no global "api pointer" that several
+# connections could race to publish. That is the one race a
+# runtime-loaded ledger extension has to suppress (such an extension
+# writes a global API pointer when it is loaded on N connections at
+# once); this product's analogue does not exist here, because the ledger
+# code is linked in, not dlopen'd.
+#
+# Everything else the runner touches is either thread-local (the
+# worker's own payload buffer) or protected by the ledger's own
+# process-wide lock (g_ent_lock, a pthread_mutex_t on POSIX), and
+# ThreadSanitizer understands pthread_mutex_lock/unlock, so it sees the
+# happens-before edge the lock creates. The CSV mirror is written under
+# that same lock.
+#
+# A COMMENT-ONLY FILE IS VALID: ThreadSanitizer accepts a suppressions
+# file with no active entries. It is kept (and wired into TSAN_OPTIONS
+# by gate 46) so that a genuinely benign finding -- a race inside a
+# third-party library, say -- has a documented home, and so that adding
+# an entry is a one-line change rather than a change to the gate.
+#
+# Format reminder (TSan's own):
+#   race:<function or file or library>
+#   race_top:<function>
+#   called_from_lib:<libname>
+#
+# Example of a benign entry, if one is ever needed:
+#   race:__tz_convert
+#   called_from_lib:libc.so.6

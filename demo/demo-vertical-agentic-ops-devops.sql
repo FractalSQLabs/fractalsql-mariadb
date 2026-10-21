@@ -198,8 +198,7 @@ INSERT INTO vao_known_bad_states (state_id, description, state_vec) VALUES
 -- (the 1.1% norm wobble is below the DFA's fluctuation floor). Either
 -- way, the agent is flagged as looping. For a period-2 cycle_len=2
 -- closure, the two states must be far enough apart that their
--- fingerprints actually differ (see build_test gate 24's distinct-states
--- case).
+-- fingerprints actually differ.
 CREATE TABLE vao_agent_state_log (
     agent_id  VARCHAR(64),
     event_ts  INT,

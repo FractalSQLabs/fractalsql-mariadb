@@ -5,8 +5,7 @@
  *
  * Hand-rolled vector/index text parsers, factored out of fractalsql.c so
  * they can be linked and fuzzed standalone (no <mysql.h>, no UDF_INIT/
- * UDF_ARGS, no MariaDB server needed) -- see tests/fuzz/ drivers and
- * build_test.sh --fuzz.
+ * UDF_ARGS, no MariaDB server needed) -- see the tests/fuzz/ drivers.
  *
  * parse_vector_csv is the highest-value fuzz target here: it runs on
  * fractal_embed()'s raw, unvalidated HTTP response body (whatever text
@@ -24,6 +23,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +34,24 @@
 /* Same cap as MAX_QUERY_DIM in fractalsql.c. Bounds the growth buffer
  * so a large CSV can't amplify into a much larger allocation. */
 #define PARSE_MAX_ELEMS ((size_t) 1u * 1024u * 1024u)
+
+/* Overflow guard for the growth buffers below. Their sizes are
+ * products of data-controlled operands -- a row count and a
+ * dimension, or an element count -- and the callers' own input caps
+ * live in a different translation unit (fractalsql.c's MAX_CORPUS_BYTES
+ * and MAX_QUERY_DIM), so this file cannot rely on them: these
+ * functions are exported public API (fractalsql_parse.h), and a
+ * caller that omits its cap -- or a 32-bit build -- would wrap the
+ * product and the realloc would hand back a buffer too small for the
+ * copy that follows it. Returns false when the product cannot be
+ * represented in a size_t. */
+static bool
+mul_ok(size_t a, size_t b, size_t c)
+{
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    if (c != 0 && a * b > SIZE_MAX / c) return false;
+    return true;
+}
 
 /* Matches mysql.h's MYSQL_ERRMSG_SIZE (512), a long-stable MySQL/MariaDB
  * client-library ABI constant. Kept as this TU's own copy rather than
@@ -75,7 +93,12 @@ parse_vector_binary(const char *s, size_t n,
                     double **out, size_t *n_out, char *errmsg)
 {
     size_t  count = n / 4;
-    double *v = malloc(count * sizeof(double));
+    double *v;
+    if (!mul_ok(count, sizeof(double), 1)) {
+        SFS_INIT_ERROR(errmsg, "fractalsql: VECTOR is too large");
+        return false;
+    }
+    v = malloc(count * sizeof(double));
     if (v == NULL) {
         SFS_INIT_ERROR(errmsg, "fractalsql: oom decoding VECTOR");
         return false;
@@ -154,6 +177,10 @@ parse_vector_csv(const char *src, size_t srclen,
         }
         if (n == cap) {
             size_t ncap = cap * 2;
+            if (ncap < cap || !mul_ok(ncap, sizeof(double), 1)) {
+                SFS_INIT_ERROR(errmsg, "fractalsql: vector is too large");
+                free(buf); free(v); return false;
+            }
             double *nv = realloc(v, ncap * sizeof(double));
             if (nv == NULL) {
                 SFS_INIT_ERROR(errmsg, "fractalsql: oom growing vector");
@@ -253,6 +280,11 @@ parse_corpus(const char *src, size_t srclen, size_t expected_dim,
             }
             if (n_rows == cap_rows) {
                 size_t ncap = cap_rows ? cap_rows * 2 : 16;
+                if (ncap < cap_rows || !mul_ok(ncap, dim, sizeof(double))) {
+                    SFS_INIT_ERROR(errmsg,
+                        "fractalsql: corpus is too large to index");
+                    free(row); free(store); return false;
+                }
                 double *nv = realloc(store, ncap * dim * sizeof(double));
                 if (nv == NULL) {
                     SFS_INIT_ERROR(errmsg, "fractalsql: oom growing corpus");
@@ -327,6 +359,16 @@ parse_index_csv(const char *src, size_t srclen,
 
         if (n == cap) {
             size_t ncap = cap * 2;
+            /* The element count is bounded by the input's own length
+             * (each element needs at least one character), so the
+             * buffer cannot be grown without bound -- but the product
+             * below is still computed and checked here, because this
+             * file's contract is that a caller cannot make the size
+             * arithmetic wrap. */
+            if (ncap < cap || !mul_ok(ncap, sizeof(size_t), 1)) {
+                SFS_INIT_ERROR(errmsg, "fractalsql: index array is too large");
+                free(buf); free(v); return false;
+            }
             size_t *nv = realloc(v, ncap * sizeof(size_t));
             if (nv == NULL) {
                 SFS_INIT_ERROR(errmsg, "fractalsql: oom growing index array");

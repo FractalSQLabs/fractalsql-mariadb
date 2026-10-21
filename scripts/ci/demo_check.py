@@ -21,6 +21,9 @@ import sys
 # ERROR lines a demo is expected to produce. Anything else is a failure.
 ALLOWED_ERRORS = {
     "demo-fractal-vector": ["CONSTRAINT"],
+    # plan_explore needs a real embedding endpoint; without one the call
+    # reports "embedding failed" and the rest of the kit still runs.
+    "scenario-planning-simulation": ["embedding failed"],
 }
 
 results = []  # (status, name, message)

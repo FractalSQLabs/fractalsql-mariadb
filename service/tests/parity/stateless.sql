@@ -5,6 +5,7 @@ SELECT fractal_dimension_boxcount('0,0;1,0;0,1;1,1;0.5,0.5', 2);
 SELECT fractal_dimension_drift('1,2,3,4,5,6,7,8,9,10,11,12', 4);
 SELECT fractal_change_point_detect('1,1,1,1,5,5,5,5', 2, 0.5, 4);
 SELECT fractal_periodogram('1,0,-1,0,1,0,-1,0,1,0,-1,0', 3);
+SELECT fractal_spectrogram_entropy('1,0,-1,0,1,0,-1,0,1,0,-1,0', 8, 4);
 SELECT fractal_state_fingerprint('0.1,0.2,0.3,0.4', 16, 7);
 SELECT fractal_cycle_detect('0101,0101,1010,0101', 2, 1);
 SELECT fractal_tda_persistence_diagram('0,0;1,0;0,1;1,1', 0, 1, 2.0, 10);

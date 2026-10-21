@@ -58,6 +58,37 @@ endpoint. Confirm reasoning before running the cognition agents:
 SELECT fractal_reason(CONNECTION_ID(), 'reply with a short confirmation');
 ```
 
+> **Partial-result honesty (opt-in, S-FT-004).** By default, a
+> reasoning-endpoint failure inside a composed agent discards the LLM
+> half (the agent's summary/rationale/answer field comes back `NULL`
+> against an intact data half — `threat_score`, `allocation`, the matched
+> rows, and so on are all already computed inside the procedure and are
+> not affected). Setting
+> `fractal_agent_partial_fail(CONNECTION_ID(), 'on')` changes what a
+> transient endpoint failure looks like: `fractal_reason` returns the
+> one-key document `{"reasoning_step_failed":"<plugin detail>"}` and every
+> composed agent that runs a reasoning step (the thirteen `fractal_agent_*`
+> recipes with an LLM step — all but `recall_hybrid`, `recommend_diverse`
+> and `feedback_audit` — plus `fractal_search_agent` and, through it,
+> `fractal_rag_agent`) surfaces that detail as a sibling
+> `"reasoning_step_failed"` field of its result instead of a `NULL`
+> summary. The detail is **bounded**: the plugin's own diagnostic is
+> capped, and one too long to show in full is cut with an explicit
+> `...[truncated]` marker at the end, so a client can always tell a
+> shortened message from a whole one. The reasoning surface itself
+> (`fractal_reason`,
+> `fractal_embed`, `fractal_text_to_sql`) is not rescued: there the
+> reasoning call is the whole result or preempts the data half, so with
+> the flag on, calling `fractal_reason` directly returns the sentinel
+> document — treat it as the failure it is — and an *unconfigured*
+> reasoning plugin still fails as it always has (a setup error, not a
+> transient endpoint failure, is not eligible for partial mode) in both
+> modes. Default 'off'
+> leaves existing behavior bit-for-bit unchanged. The MCP server sets
+> this flag on each of its sessions at connect
+> (`FSQL_MCP_AGENT_PARTIAL=off` restores the default); see
+> [`mcp-plugin.md`](mcp-plugin.md).
+
 ---
 
 ## Which agent should I use?
@@ -218,8 +249,7 @@ task_emb, 1)` finds the nearest capability by real cosine distance. (2)
 p_cost_per_route` is the accounted remaining budget. (4) `fractal_reason`
 explains the routing choice.
 
-**Example** (live-verified against a real Ollama endpoint, see
-`build_test.sh`'s `gate_24_agents`):
+**Example** (live-verified against a real Ollama endpoint):
 ```sql
 DROP TABLE IF EXISTS bt_caps;
 CREATE TABLE bt_caps (id BIGINT PRIMARY KEY AUTO_INCREMENT, emb TEXT);
@@ -308,8 +338,7 @@ primary keys], k)` restricted to the rows where `filter_col = filter_val`
 (or every row, when `filter_col` is `NULL`): a real metadata-filtered
 cohort, not a post-filter over an unfiltered top-k.
 
-**Example** (live-verified against a real 2-row cohort, `build_test.sh`
-`gate_24_agents`):
+**Example** (live-verified against a real 2-row cohort):
 ```sql
 DROP TABLE IF EXISTS bt_memories;
 CREATE TABLE bt_memories (id BIGINT PRIMARY KEY AUTO_INCREMENT, region VARCHAR(20), vec TEXT, content VARCHAR(100));
@@ -357,7 +386,7 @@ afterward.** Call
 [`feedback_audit`](#feedback-audit-fractal_agent_feedback_audit-pure-analytics-no-llm) below,
 which cleans up after itself.
 
-**Example** (live-verified, `build_test.sh` `gate_24_agents`):
+**Example** (live-verified):
 ```sql
 CALL fractal_agent_recommend_diverse('bt_memories', 'vec', '[1,0,0]', 2, @result);
 SELECT @result;  -- contains "item_id" keys, real scored items
@@ -379,10 +408,11 @@ above; this is the general-purpose recipe.
 | `p_table_names` | `JSON` | e.g. `'["orders","customers"]'`, or `NULL` for auto-discovery of all visible tables |
 | `p_max_retries` | `INT` | GENERATE/ALLOWLIST/EXPLAIN retry budget |
 | `p_context` | `TEXT` | optional label passed to the final reason call (NULL ok) |
+| `p_auto_execute` | `BOOLEAN` | explicit opt-in to RUN the generated statement (`TRUE`) or to only generate and validate it (`FALSE`, the safe choice) |
 | `p_result` (OUT) | `JSON` | `{"analysis":.., "generated_sql":.., "result_json":{..}}` |
 
 **How it works.** (1) `fractal_sql_agent(question, table_names,
-max_retries, auto_execute=TRUE)`, the self-correcting GENERATE →
+max_retries, auto_execute=p_auto_execute)`, the self-correcting GENERATE →
 ALLOWLIST → EXPLAIN-equivalent → EXECUTE pipeline (see
 [`text-to-sql-setup.md`](text-to-sql-setup.md)). (2) `fractal_reason`
 narrates the result set into `analysis`.
@@ -390,7 +420,7 @@ narrates the result set into `analysis`.
 **Example**
 ```sql
 CALL fractal_agent_data_analyst(
-    'How many paid orders does each customer have?', NULL, 2, NULL, @result);
+    'How many paid orders does each customer have?', NULL, 2, NULL, TRUE, @result);
 SELECT @result;
 ```
 
@@ -399,6 +429,17 @@ SELECT @result;
 answered by a disallowed statement type (e.g. an UPDATE, with the default
 `allowed_statements=select`) returns an `execution_status` of `"failed"`
 with the real rejection reason, never silently executes it anyway.
+
+**`p_auto_execute` is required, and `FALSE` is the safe choice.** Running
+LLM-generated SQL is an explicit, per-call decision at every layer — the
+engine-level procedure and the MCP tool alike. With `FALSE` the statement is
+still generated and validated (the allowlist plus EXPLAIN), and `generated_sql`
+comes back so you can run it yourself — but it is **not** executed, `result_json`
+is null, and the reasoning step is skipped entirely (there is no result to
+read, so `analysis` is null too). With `TRUE` the full path runs: the
+statement executes under the caller's privileges and `analysis` is the reason
+call's read of the real rows. MariaDB stored procedures cannot carry DEFAULT
+values, so the flag has no default — a `NULL` is treated as `FALSE`.
 
 ---
 
@@ -830,7 +871,8 @@ living in `sql/install_agents.sql` (five of them) and `sql/install_udf.sql`
   either the DFA scaling exponent on the per-state L2 norms exceeds 0.9, or a
   fingerprint cycle closes: each state is SimHash-fingerprinted
   (`fractal_state_fingerprint`, `n_bits`/`seed`, NULL for the 64-bit/42.0
-  defaults) and the stream feeds a streaming Brent's-algorithm cycle kernel
+  defaults; `n_bits` and `n_bits` times the vector length are bounded as
+  documented for `fractal_state_fingerprint`) and the stream feeds a streaming Brent's-algorithm cycle kernel
   (`fractal_cycle_detect`, `hamming_threshold`, 0 = exact-match only). The
   cycle kernel catches near-identical repeats the old exact-hash period scan
   could not; `agent_id` is echoed back for auditability, and the result adds
@@ -863,6 +905,8 @@ same convention as the 16 recipes above.
 - **Diversify/Repulsion state**: `fractal_diversify_enable`/`_disable`/
   `_set_params`, `fractal_feedback_report`, `fractal_detect_collapse`,
   connection-scoped via `CONNECTION_ID()`.
+- **Agent partial mode**: `fractal_agent_partial_fail(session_id, mode)`,
+  the S-FT-004 opt-in above.
 
 Every one of these is an ordinary function or procedure you can `CALL`/
 `SELECT` directly and compose into your own stored procedure: a custom
@@ -936,7 +980,7 @@ live install. Run it with:
 mariadb -u<user> -p <database> < demo/demo-agents.sql
 ```
 
-`build_test.sh`'s gate 24 (`gate_24_agents`) smoke-tests three of the
+The test suite smoke-tests three of the
 compositions (`recall_hybrid`, `recommend_diverse`, `route_task`) in a
 throwaway cluster against a real reasoning round trip, so the agent wiring
 is also covered by the automated regression suite across all four

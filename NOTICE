@@ -10,3 +10,8 @@ Copyright (c) The OpenSSL Project Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0. A copy of the License
 is included in this distribution as LICENSES/Apache-2.0.txt.
+
+fractalsql-mariadb-mcp (the MCP server) is likewise a separate Apache-2.0
+process. It is linked against OpenSSL and dynamically against the MariaDB
+client library (libmariadb, LGPL-2.1-or-later), and includes nlohmann/json
+(MIT, header-only). It contains no code from the GPL-2.0-only shim.

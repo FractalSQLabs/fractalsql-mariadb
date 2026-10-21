@@ -415,6 +415,15 @@ function Install-MsiPackage {
     if (-not $major) { Write-Die "couldn't determine the MariaDB major version from install directory '$($Target.Dir)'. Pass -MdbDir pointing at a 'MariaDB <major>' directory." }
     $asset = "FractalSQL-MariaDB-$major-$Version-x64.msi"
     $assetUrl = "https://github.com/$Repo/releases/download/v$Version/$asset"
+    # The URL above is written with an https:// scheme on purpose, and
+    # this asserts it rather than trusting it: a release asset fetched
+    # over plaintext http would let anyone on the path swap the .msi
+    # for their own, and this script runs it with msiexec. The scheme
+    # is the one thing here that must never be relaxed, so it gets a
+    # hard check instead of a comment.
+    if (-not $assetUrl.StartsWith('https://')) {
+        Write-Die "refusing to download the release asset over a non-https scheme: $assetUrl"
+    }
     $tmp = Join-Path $env:TEMP "fsql-easy-install-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
@@ -927,31 +936,42 @@ function Set-TimeoutEnvAndRestart {
     return $true
 }
 
-function Invoke-Wizard {
-    param($Target)
-    $bin = Join-Path $Target.Dir 'bin'
-    $mdbPort = if ($Port) { $Port } else { $Target.Port }
-    Resolve-RootPassword
+# --- Phase C: the wizard's steps, one function each ----------------------
+# The wizard is the long part of this script, and it used to be one long
+# function: provider selection, config resolution, the config write, and
+# the post-write verification all in one body. Split them out below --
+# same steps, same order, same prompts, same messages -- so each piece
+# is small enough to read on its own.
 
-    if (-not $Database) { $Database = Prompt-Value "Target database for the agent stored procedures (must already exist; UDFs themselves don't need one)" }
-    if (-not $Database) { Write-Die "a target database is required to register the agent procedures. Pass -Database <name>." }
-    $dbExists = Invoke-Mariadb $bin $mdbPort @("SHOW DATABASES LIKE '$($Database -replace "'", "''")';")
-    if ($dbExists -ne $Database) { Write-Die "database '$Database' doesn't exist. Create it first (CREATE DATABASE $Database;), then re-run with -Database $Database." }
+# Asks which reasoning provider to configure. Returns 'ollama',
+# 'openai-compatible', or 'skip'.
+function Select-ReasoningProvider {
+    Write-Step "Reasoning provider:"
+    Write-Host "  1) Local Ollama"
+    Write-Host "  2) Cloud / OpenAI-compatible endpoint"
+    Write-Host "  3) Skip: search-only install, configure reasoning later"
+    $choice = Prompt-Value "Choice" "1"
+    # Assign the switch to a variable and return that, rather than
+    # `return switch (...)`: the latter is a parse error in both
+    # Windows PowerShell 5.1 and PowerShell 7.
+    $selected = switch ($choice) { '1' { 'ollama' } '2' { 'openai-compatible' } default { 'skip' } }
+    return $selected
+}
 
-    if (-not $Provider) {
-        Write-Step "Reasoning provider:"
-        Write-Host "  1) Local Ollama"
-        Write-Host "  2) Cloud / OpenAI-compatible endpoint"
-        Write-Host "  3) Skip: search-only install, configure reasoning later"
-        $choice = Prompt-Value "Choice" "1"
-        $Provider = switch ($choice) { '1' { 'ollama' } '2' { 'openai-compatible' } default { 'skip' } }
-    }
-
-    # Live plugin_dir (resolved once in main via Resolve-PluginDir), not a
-    # hardcoded 'lib\plugin' guess under the install root -- see this
-    # file's own Resolve-PluginDir comment for why.
-    $pluginDll = Join-Path $script:PluginDir 'fractalsql-reasoning-http.dll'
-
+# Resolves the reasoning-provider config, prompting for any missing
+# piece exactly as the wizard did inline. Returns an object with the
+# (possibly still unset, if 'skip') Provider plus the two built
+# ordered hashtables: the reasoning_* conf keys the daemon reads from
+# fractalsqld.conf, and the env-only FSQL_* timeout knobs the service's
+# registry Environment carries. Prompted values are returned via the
+# Url/Model/etc. properties too so the caller's own copies stay in
+# sync with anything a prompt just filled in.
+function Resolve-ReasoningConfig {
+    param(
+        [string]$Provider, [string]$Url, [string]$Model, [string]$Token,
+        [string]$EmbedUrl, [string]$EmbedModel, [string]$Think, [string]$ThinkProvider,
+        [string]$PluginDll, [int]$TimeoutSecs
+    )
     # Provider settings go into the daemon's conf file as reasoning_*
     # conf keys (preferred source, see this file's .DESCRIPTION); the
     # service's registry Environment gets only the env-only FSQL_*
@@ -966,7 +986,7 @@ function Invoke-Wizard {
             if (-not $EmbedModel) { $EmbedModel = Prompt-Value "Embedding model" "nomic-embed-text" }
             if (-not $Think) { $Think = 'off' }
             if (-not $ThinkProvider) { $ThinkProvider = 'ollama' }
-            $confValues['reasoning_plugin'] = $pluginDll
+            $confValues['reasoning_plugin'] = $PluginDll
             $confValues['reasoning_url'] = $Url
             $confValues['reasoning_allow_plaintext'] = '1'
             $confValues['reasoning_model'] = $Model
@@ -989,7 +1009,7 @@ function Invoke-Wizard {
             if (-not $Url) { Write-Die "a URL is required for a cloud/OpenAI-compatible endpoint" }
             if (-not $Model) { $Model = Prompt-Value "Model" "gpt-4o-mini" }
             if (-not $Token) { $Token = Prompt-Secret "API token (masked, never logged)" }
-            $confValues['reasoning_plugin'] = $pluginDll
+            $confValues['reasoning_plugin'] = $PluginDll
             $confValues['reasoning_url'] = $Url
             $confValues['reasoning_token'] = $Token
             $confValues['reasoning_model'] = $Model
@@ -1001,33 +1021,113 @@ function Invoke-Wizard {
             Write-Step "Skipping reasoning config. Search functions like fractal_search and fractal_search_explore work with no model."
         }
     }
+    return [pscustomobject]@{
+        Provider    = $Provider
+        Url         = $Url
+        Model       = $Model
+        Token       = $Token
+        EmbedUrl    = $EmbedUrl
+        EmbedModel  = $EmbedModel
+        Think       = $Think
+        ThinkProvider = $ThinkProvider
+        ConfValues  = $confValues
+        EnvValues   = $envValues
+    }
+}
+
+# Confirms and applies the reasoning config for a non-'skip' provider
+# (the caller only invokes this when $Provider -ne 'skip'). Returns
+# $true only when the config was actually applied -- the conf keys
+# written AND the daemon restarted -- and $false when a step was
+# declined, failed, or the run was a dry run.
+function Write-ReasoningConfig {
+    param($ConfValues, $EnvValues, [switch]$DryRun)
+
+    if ($DryRun) {
+        Write-Step "About to write (conf file '$(Get-FractalsqldConfPath)', reasoning keys):"
+        foreach ($k in $ConfValues.Keys) {
+            if ($k -eq 'reasoning_token') { Write-Host '  reasoning_token = ***' } else { Write-Host "  $k = $($ConfValues[$k])" }
+        }
+        if ($EnvValues.Count -gt 0) {
+            Write-Step "About to set (service environment for '$script:FractalsqldServiceName', env-only timeout knobs):"
+            foreach ($k in $EnvValues.Keys) { Write-Host "  $k=$($EnvValues[$k])" }
+        }
+        Write-Warn2 "(-DryRun: not actually writing anything). Conf keys take effect at the service restart (no Windows fsqlctl)."
+        return $false
+    }
+    # Conf keys first (the preferred source). When there are env-only
+    # knobs to set too, the conf step defers its restart to
+    # Set-TimeoutEnvAndRestart below: that restart is the one that
+    # applies the conf keys, so the daemon restarts once and picks up
+    # both halves.
+    $applied = Write-ConfProviderKeys $ConfValues -Restart (-not ($EnvValues.Count -gt 0))
+    if ($EnvValues.Count -gt 0) {
+        if (-not $applied) {
+            Write-Warn2 "The reasoning_* conf keys were not written (see the warning above), so they won't be applied even by the restart below."
+        }
+        $applied = $applied -and (Set-TimeoutEnvAndRestart $EnvValues)
+    }
+    return $applied
+}
+
+# Post-write version check + optional live smoke test -- split out of
+# Invoke-Wizard to keep it short and flat. No return value (pure side
+# effects; nothing downstream reads any state this sets).
+function Test-InstalledVersionAndSmoke {
+    param([string]$Bin, [int]$MdbPort, [string]$Database, [string]$Version, [string]$Provider, [bool]$Applied, [string]$Repo)
+    $ed = Invoke-Mariadb $Bin $MdbPort @('SELECT fractal_edition();') -Db $Database
+    $ver = Invoke-Mariadb $Bin $MdbPort @('SELECT fractal_version();') -Db $Database
+    Write-Ok "fractal_edition() = $ed, fractal_version() = $ver"
+    if ($ver -ne $Version) {
+        Write-Warn2 "That's not $Version, the version this script expected. The installed fractalsql.dll itself is out of date. Reinstall the current .msi from https://github.com/$Repo/releases over this install to actually update it, then re-run this script."
+    }
+    if ($Provider -ne 'skip' -and $Applied -and (Confirm-Step "Run a live reasoning smoke test (SELECT fractal_reason(CONNECTION_ID(), 'say ok'))? A cloud endpoint may incur cost, and a cold local model can take several minutes the first time.")) {
+        try {
+            $reply = Invoke-Mariadb $Bin $MdbPort @("SELECT fractal_reason(CONNECTION_ID(), 'say ok');") -Db $Database
+            Write-Host "  $reply"
+        } catch {
+            Write-Warn2 "That failed. If it looks like a timeout on a slow/cold local model, see docs/reasoning-setup.md's 'Handling Constrained Hardware' section."
+        }
+    } elseif ($Provider -ne 'skip' -and -not $Applied) {
+        Write-Warn2 "Reasoning config wasn't applied (a step was declined or failed above), so skipping the smoke test. fractal_reason() will use whatever config the daemon already has."
+    }
+}
+
+function Invoke-Wizard {
+    param($Target)
+    $bin = Join-Path $Target.Dir 'bin'
+    $mdbPort = if ($Port) { $Port } else { $Target.Port }
+    Resolve-RootPassword
+
+    if (-not $Database) { $Database = Prompt-Value "Target database for the agent stored procedures (must already exist; UDFs themselves don't need one)" }
+    if (-not $Database) { Write-Die "a target database is required to register the agent procedures. Pass -Database <name>." }
+    $dbExists = Invoke-Mariadb $bin $mdbPort @("SHOW DATABASES LIKE '$($Database -replace "'", "''")';")
+    if ($dbExists -ne $Database) { Write-Die "database '$Database' doesn't exist. Create it first (CREATE DATABASE $Database;), then re-run with -Database $Database." }
+
+    if (-not $Provider) { $Provider = Select-ReasoningProvider }
+
+    # Live plugin_dir (resolved once in main via Resolve-PluginDir), not a
+    # hardcoded 'lib\plugin' guess under the install root -- see this
+    # file's own Resolve-PluginDir comment for why.
+    $pluginDll = Join-Path $script:PluginDir 'fractalsql-reasoning-http.dll'
+
+    $resolved = Resolve-ReasoningConfig -Provider $Provider -Url $Url -Model $Model `
+        -Token $Token -EmbedUrl $EmbedUrl -EmbedModel $EmbedModel -Think $Think `
+        -ThinkProvider $ThinkProvider -PluginDll $pluginDll -TimeoutSecs $TimeoutSecs
+    $Provider = $resolved.Provider
+    $Url = $resolved.Url
+    $Model = $resolved.Model
+    $Token = $resolved.Token
+    $EmbedUrl = $resolved.EmbedUrl
+    $EmbedModel = $resolved.EmbedModel
+    $Think = $resolved.Think
+    $ThinkProvider = $resolved.ThinkProvider
+    $confValues = $resolved.ConfValues
+    $envValues = $resolved.EnvValues
 
     $applied = $false
     if ($Provider -ne 'skip') {
-        if ($DryRun) {
-            Write-Step "About to write (conf file '$(Get-FractalsqldConfPath)', reasoning keys):"
-            foreach ($k in $confValues.Keys) {
-                if ($k -eq 'reasoning_token') { Write-Host '  reasoning_token = ***' } else { Write-Host "  $k = $($confValues[$k])" }
-            }
-            if ($envValues.Count -gt 0) {
-                Write-Step "About to set (service environment for '$script:FractalsqldServiceName', env-only timeout knobs):"
-                foreach ($k in $envValues.Keys) { Write-Host "  $k=$($envValues[$k])" }
-            }
-            Write-Warn2 "(-DryRun: not actually writing anything). Conf keys take effect at the service restart (no Windows fsqlctl)."
-        } else {
-            # Conf keys first (the preferred source). When there are
-            # env-only knobs to set too, the conf step defers its restart
-            # to Set-TimeoutEnvAndRestart below: that restart is the one
-            # that applies the conf keys, so the daemon restarts once and
-            # picks up both halves.
-            $applied = Write-ConfProviderKeys $confValues -Restart (-not ($envValues.Count -gt 0))
-            if ($envValues.Count -gt 0) {
-                if (-not $applied) {
-                    Write-Warn2 "The reasoning_* conf keys were not written (see the warning above), so they won't be applied even by the restart below."
-                }
-                $applied = $applied -and (Set-TimeoutEnvAndRestart $envValues)
-            }
-        }
+        $applied = Write-ReasoningConfig -ConfValues $confValues -EnvValues $envValues -DryRun:$DryRun
     }
 
     Write-Step "Registering UDFs + agent procedures..."
@@ -1057,22 +1157,8 @@ function Invoke-Wizard {
     }
 
     if (-not $DryRun) {
-        $ed = Invoke-Mariadb $bin $mdbPort @('SELECT fractal_edition();') -Db $Database
-        $ver = Invoke-Mariadb $bin $mdbPort @('SELECT fractal_version();') -Db $Database
-        Write-Ok "fractal_edition() = $ed, fractal_version() = $ver"
-        if ($ver -ne $Version) {
-            Write-Warn2 "That's not $Version, the version this script expected. The installed fractalsql.dll itself is out of date. Reinstall the current .msi from https://github.com/$Repo/releases over this install to actually update it, then re-run this script."
-        }
-        if ($Provider -ne 'skip' -and $applied -and (Confirm-Step "Run a live reasoning smoke test (SELECT fractal_reason(CONNECTION_ID(), 'say ok'))? A cloud endpoint may incur cost, and a cold local model can take several minutes the first time.")) {
-            try {
-                $reply = Invoke-Mariadb $bin $mdbPort @("SELECT fractal_reason(CONNECTION_ID(), 'say ok');") -Db $Database
-                Write-Host "  $reply"
-            } catch {
-                Write-Warn2 "That failed. If it looks like a timeout on a slow/cold local model, see docs/reasoning-setup.md's 'Handling Constrained Hardware' section."
-            }
-        } elseif ($Provider -ne 'skip' -and -not $applied) {
-            Write-Warn2 "Reasoning config wasn't applied (a step was declined or failed above), so skipping the smoke test. fractal_reason() will use whatever config the daemon already has."
-        }
+        Test-InstalledVersionAndSmoke -Bin $bin -MdbPort $mdbPort -Database $Database `
+            -Version $Version -Provider $Provider -Applied $applied -Repo $Repo
     }
 
     Write-Host ""

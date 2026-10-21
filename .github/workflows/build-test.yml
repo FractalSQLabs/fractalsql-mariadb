@@ -16,17 +16,12 @@ name: build-test
 #              winx64 zip, MariaDB 10.6/10.11/11.4/12.3 on
 #              windows-latest. See build_test.ps1's own .DESCRIPTION.
 #   darwin-gate-matrix: build_test.sh (the same script, unmodified) on
-#              macos-14, matrixed across the same 4 majors as
-#              gate-matrix/windows-gate-matrix. Homebrew ships versioned
-#              formulae for 3 of the 4 (mariadb@10.6, mariadb@10.11,
-#              mariadb@11.4); the 12.3 cell installs the unversioned
-#              `mariadb` formula, which tracks 12.3.x -- matching this
-#              pin exactly today, though it is still not an exact-
-#              version pin and will drift once a newer major hits the
-#              formula -- see that matrix entry's own comment.
+#              macos-15, matrixed across the same 4 majors as
+#              gate-matrix/windows-gate-matrix, each pinned to Homebrew's
+#              versioned formula (mariadb@10.6, @10.11, @11.4, @12.3).
 #   linux-asan / linux-ubsan: build_test.sh --asan / --ubsan, MariaDB
 #              11.4 LTS only (the recommended ASan/UBSan
-#              representative), weekly/workflow_dispatch-only cadence.
+#              representative), weekly, workflow_dispatch and 2.x-push cadence.
 #              Instruments fractalsqld, never the shim. Installs 11.4
 #              directly via MariaDB's official apt repo on
 #              ubuntu-latest, not Docker, for a reason worth spelling
@@ -36,9 +31,9 @@ name: build-test
 #              mariadb:11.4 Docker image has that problem, so this job
 #              sidesteps it rather than assuming it's fine.
 #   windows-asan/windows-ubsan, darwin-asan/darwin-ubsan: same 11.4-
-#              only, weekly-cadence pattern as linux-asan/ubsan above.
+#              only, same cadence as linux-asan/ubsan above.
 #   linux-tsan/darwin-tsan: build_test.sh --tsan, same 11.4-only,
-#              weekly/workflow_dispatch-only cadence. No windows-tsan:
+#              weekly, workflow_dispatch and 2.x-push cadence. No windows-tsan:
 #              MSVC/clang-cl implement no -fsanitize=thread at all.
 #              Unlike darwin-asan, darwin-tsan does NOT skip the cluster
 #              gates -- --tsan only instruments fractalsqld, a
@@ -46,15 +41,20 @@ name: build-test
 #              mariadbd itself, so the Darwin dyld/SIP/late-injection
 #              problems documented on darwin-asan below don't apply
 #              here at all.
-#   coverage: weekly/on-demand only. A gcov-instrumented build_test.sh
+#   coverage: weekly, on-demand and on 2.x pushes. A gcov-instrumented build_test.sh
 #              --coverage run, with the lcov/genhtml report uploaded as
 #              a workflow artifact.
 
+# Which jobs run when: the gate matrices run on every push and PR (not on the
+# weekly schedule). The sanitizer jobs (asan/ubsan/tsan on Linux, Windows and
+# macOS) and coverage run on the weekly schedule, on manual dispatch, and on every
+# push to the 2.x branch; pushes to main and pull requests skip them.
+
 on:
   push:
-    branches: [main]
+    branches: [main, '2.x']
   pull_request:
-    branches: [main]
+    branches: [main, '2.x']
   schedule:
     - cron: '30 5 * * 1'
   workflow_dispatch: {}
@@ -94,7 +94,7 @@ jobs:
     name: build_test.ps1 mdb${{ matrix.mdb }} (Windows)
     if: github.event_name != 'schedule'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -172,7 +172,7 @@ jobs:
   darwin-gate-matrix:
     name: build_test.sh mdb${{ matrix.mdb }} (macOS)
     if: github.event_name != 'schedule'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -185,12 +185,10 @@ jobs:
           - mdb: "11.4"
             formula: "mariadb@11.4"
           - mdb: "12.3"
-            # No mariadb@12.3 Homebrew formula -- the unversioned
-            # `mariadb` formula tracks 12.3.x, matching this pin today.
-            # Still not a Linux/Windows-style exact-version pin: it
-            # drifts to a newer major when Homebrew updates the
-            # formula; revisit then.
-            formula: "mariadb"
+            # Pinned to the versioned formula. The unversioned `mariadb`
+            # formula tracks the newest major (13.0 now), so it cannot
+            # stand in for 12.3.
+            formula: "mariadb@12.3"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -202,7 +200,7 @@ jobs:
           # fractalsql_enterprise.c (the SDK ships no OpenSSL headers,
           # and openssl@3 is keg-only -- the Makefile resolves the keg
           # itself via `brew --prefix openssl@3`).
-          brew install jq openssl@3 "${{ matrix.formula }}"
+          brew install jq openssl@3 pkgconf coreutils "${{ matrix.formula }}"
 
       - name: build_test.sh --mdb ${{ matrix.mdb }}
         run: |
@@ -212,8 +210,8 @@ jobs:
 
   linux-asan:
     name: build_test.sh --asan mdb11.4
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: ubuntu-24.04  # not ubuntu-latest: MariaDB's apt repo has no release for Ubuntu 26.04 ('resolute')
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -222,17 +220,17 @@ jobs:
       - name: Install MariaDB 11.4
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y wget gnupg jq
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -qq -y wget gnupg jq
           wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
               | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
-          sudo apt-get update -qq
+          sudo apt-get -o Acquire::Retries=5 update -qq
           # libssl-dev named explicitly: fractalsqld's build links -lcrypto
           # for fractalsql_enterprise.c's Ed25519 check, rather than
           # leaning on mariadb-server to pull it in transitively.
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+          sudo apt-get -o Acquire::Retries=5 install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential pkg-config
 
       - name: build_test.sh --asan
         run: |
@@ -243,8 +241,8 @@ jobs:
 
   linux-ubsan:
     name: build_test.sh --ubsan mdb11.4
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: ubuntu-24.04  # not ubuntu-latest: MariaDB's apt repo has no release for Ubuntu 26.04 ('resolute')
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -253,17 +251,17 @@ jobs:
       - name: Install MariaDB 11.4
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y wget gnupg jq
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -qq -y wget gnupg jq
           wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
               | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
-          sudo apt-get update -qq
+          sudo apt-get -o Acquire::Retries=5 update -qq
           # libssl-dev named explicitly: fractalsqld's build links -lcrypto
           # for fractalsql_enterprise.c's Ed25519 check, rather than
           # leaning on mariadb-server to pull it in transitively.
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+          sudo apt-get -o Acquire::Retries=5 install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential pkg-config
 
       - name: build_test.sh --ubsan
         run: |
@@ -274,8 +272,8 @@ jobs:
 
   linux-tsan:
     name: build_test.sh --tsan mdb11.4
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: ubuntu-24.04  # not ubuntu-latest: MariaDB's apt repo has no release for Ubuntu 26.04 ('resolute')
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -284,17 +282,17 @@ jobs:
       - name: Install MariaDB 11.4
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y wget gnupg jq
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -qq -y wget gnupg jq
           wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
               | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
-          sudo apt-get update -qq
+          sudo apt-get -o Acquire::Retries=5 update -qq
           # libssl-dev named explicitly: fractalsqld's build links -lcrypto
           # for fractalsql_enterprise.c's Ed25519 check, rather than
           # leaning on mariadb-server to pull it in transitively.
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+          sudo apt-get -o Acquire::Retries=5 install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential pkg-config
 
       # ubuntu-latest runs this natively, not in a container -- important
       # for --tsan specifically: the ASLR workaround build_test.sh applies
@@ -314,9 +312,9 @@ jobs:
 
   windows-asan:
     name: build_test.ps1 -Asan mdb11.4 (Windows)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -356,9 +354,9 @@ jobs:
 
   windows-ubsan:
     name: build_test.ps1 -Ubsan mdb11.4 (Windows)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -413,8 +411,8 @@ jobs:
     # The Linux/Windows ASan cells cover the same portable C source;
     # full-cluster ASan on macOS would need a source-built ASan mariadbd.
     name: build_test.sh --asan (macOS)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -426,7 +424,7 @@ jobs:
           # one tracks whatever Homebrew currently calls latest (now
           # 12.3.x), which silently drifted past this job's --mdb-less
           # default of 11.4 and broke mdb_setup's version check.
-          brew install mariadb@11.4 jq openssl@3
+          brew install mariadb@11.4 jq openssl@3 pkgconf
       - name: build_test.sh --asan
         run: |
           set -euo pipefail
@@ -435,8 +433,8 @@ jobs:
 
   darwin-ubsan:
     name: build_test.sh --ubsan (macOS)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -444,7 +442,7 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb@11.4 jq openssl@3
+          brew install mariadb@11.4 jq openssl@3 pkgconf
       - name: build_test.sh --ubsan
         run: |
           set -euo pipefail
@@ -462,8 +460,8 @@ jobs:
     # doesn't; this script's --tsan ASLR workaround is Linux-only and a
     # no-op on Darwin by design, see build_test.sh's own comment).
     name: build_test.sh --tsan (macOS)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -471,7 +469,7 @@ jobs:
       - name: Install MariaDB (Homebrew)
         run: |
           set -euo pipefail
-          brew install mariadb@11.4 jq openssl@3
+          brew install mariadb@11.4 jq openssl@3 pkgconf
       - name: build_test.sh --tsan
         run: |
           set -euo pipefail
@@ -480,8 +478,8 @@ jobs:
 
   coverage:
     name: coverage (lcov)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
+    runs-on: ubuntu-24.04  # not ubuntu-latest: MariaDB's apt repo has no release for Ubuntu 26.04 ('resolute')
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -490,17 +488,17 @@ jobs:
       - name: Install MariaDB 11.4 + lcov
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y wget gnupg lcov jq
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -qq -y wget gnupg lcov jq
           wget -qO- --max-redirect=0 https://mariadb.org/mariadb_release_signing_key.pgp \
               | sudo gpg --dearmor -o /etc/apt/keyrings/mariadb.gpg
           echo "deb [signed-by=/etc/apt/keyrings/mariadb.gpg] https://deb.mariadb.org/11.4/ubuntu $(lsb_release -cs) main" \
               | sudo tee /etc/apt/sources.list.d/mariadb.list
-          sudo apt-get update -qq
+          sudo apt-get -o Acquire::Retries=5 update -qq
           # libssl-dev named explicitly: fractalsqld's build links -lcrypto
           # for fractalsql_enterprise.c's Ed25519 check, rather than
           # leaning on mariadb-server to pull it in transitively.
-          sudo apt-get install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential
+          sudo apt-get -o Acquire::Retries=5 install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential pkg-config
 
       - name: build_test.sh --coverage
         run: |
@@ -517,3 +515,48 @@ jobs:
           path: coverage_html/
           retention-days: 30
           if-no-files-found: warn
+
+  # Standalone Linux build + DB-less smoke of the MCP server. Mirrors the
+  # dependency set the MCP gate needs (mcp/Makefile: C++17, mariadb_config
+  # from libmariadb-dev, pkg-config openssl, -lpthread), kept as its own
+  # job so the gate matrix's instrumented rebuilds don't have to carry the
+  # C++ build to prove the server compiles and its one-shot paths hold.
+  # --version and --list-tools run before any database connection, so no
+  # MariaDB server is needed here; the stdio/http/database round trips run
+  # in the gate matrix and locally via build_test.sh.
+  mcp-build-smoke:
+    name: MCP server build + DB-less smoke (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install toolchain (g++/make, pkg-config, libmariadb-dev, libssl-dev, python3)
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -qq -y build-essential pkg-config libmariadb-dev libssl-dev python3
+
+      - name: Build mcp (mcp/Makefile)
+        run: |
+          set -euo pipefail
+          make -C mcp -j2
+
+      - name: Verify --version and --list-tools
+        run: |
+          set -euo pipefail
+          WANT_VER="$(sed -n 's/^#define FSQL_MCP_VERSION *"\(.*\)"/\1/p' mcp/src/version.h)"
+          V="$(./mcp/fractalsql-mariadb-mcp --version)"
+          echo "version: ${V} (version.h: ${WANT_VER})"
+          test -n "${WANT_VER}" && test "${V}" = "${WANT_VER}"
+          LINES="$(./mcp/fractalsql-mariadb-mcp --list-tools | wc -l)"
+          WANT="$(python3 -c "import json; print(len(json.load(open('mcp/manifest.json'))['tools']))")"
+          LOCK="$(wc -l < mcp/.mcp-safety-annotations-lock)"
+          echo "tool-catalog lines: ${LINES} (manifest: ${WANT}, safety lock: ${LOCK})"
+          test "${LINES}" = "${WANT}" && test "${LINES}" = "${LOCK}"
+
+      - name: One-shot paths run without a database
+        run: |
+          set -euo pipefail
+          MCP_SERVER_EXE="$PWD/mcp/fractalsql-mariadb-mcp"
+          "${MCP_SERVER_EXE}" --help >/dev/null

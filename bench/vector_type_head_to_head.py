@@ -70,9 +70,13 @@ Usage:
     python3 bench/vector_type_head_to_head.py --host 127.0.0.1
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 import time
+
+from bench_target import check_target
 
 try:
     import mariadb
@@ -187,6 +191,13 @@ def main() -> int:
                          "(default: %(default)s)")
     args = ap.parse_args()
 
+    # The connection target is caller-supplied text that decides where the
+    # benchmark reads from. Pin it to a plain hostname/IP and a plain schema
+    # identifier before connecting, so a malformed --host cannot silently
+    # redirect the run at some other server. See bench/bench_target.py.
+    if not check_target( "vector_type_head_to_head.py", args.host, args.port, args.database ):
+        return 2
+
     conn = mariadb.connect(host=args.host, port=args.port, user=args.user,
                            password=args.password, database=args.database,
                            autocommit=True)
@@ -204,7 +215,12 @@ def main() -> int:
         return 1
     cur.execute("SELECT CHAR_LENGTH(emb_txt) - CHAR_LENGTH(REPLACE(emb_txt, ',', '')) + 1 "
                "FROM bench_vectors LIMIT 1")
-    dim = cur.fetchone()[0]
+    # `dim` reaches SQL text below (VECTOR(dim), the copy-table DDL), so it
+    # is re-cast to int at the point of use rather than trusted as whatever
+    # the driver handed back. It is derived from a CHAR_LENGTH() over the
+    # stored vector text, so it is an integer in practice -- but the value
+    # that ends up inside a DDL string should not depend on that.
+    dim = int(cur.fetchone()[0])
     print(f"vector_type_head_to_head: {n_total} rows, dim={dim}, "
           f"native VECTOR(n)={'yes' if has_native else 'no'}")
 

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../../FractalSQLforMariaDB.jpg" alt="FractalSQL for MariaDB" width="720">
+</p>
+
 # FSQ wire protocol, version 2
 
 This document specifies the wire protocol between a database-side client and

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
  *
- * fractalsql-mariadb v2.0.10: Stochastic Fractal Search for MariaDB (UDF).
+ * fractalsql-mariadb v2.0.11: Stochastic Fractal Search for MariaDB (UDF).
  *
  * Compatible with MariaDB 10.6, 10.11, 11.4 LTS, and 12.3 LTS.
  * The UDF ABI has been stable across these majors.
@@ -49,6 +49,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -65,6 +66,25 @@
 #include "fractalsql_parse.h"   /* parse_vector_csv prototype (shared with fractalsql_vector.c) */
 #include "fractalsql_enterprise.h" /* fractal_enterprise_lib_loaded/fractal_ledger_write_kind2/_sha256 */
 
+/* A SQL integer argument narrowed to int for a range check. Clamped, not
+ * cast: a value past int range must stay out of range for the check that
+ * follows, not wrap into it (4294967297 became 1 and passed). */
+static int
+clamp_to_int(long long v)
+{
+    return v > INT_MAX ? INT_MAX : (v < INT_MIN ? INT_MIN : (int) v);
+}
+
+/* Work bounds, the same as the core's. A single call cannot be interrupted,
+ * and each cost is a product no individual limit controls:
+ *   search:      iterations x population_size x diffusion_factor x dim (about
+ *                30 ns a unit, so 2^31 is roughly a minute);
+ *   subset:      items x k (about 3 us a unit, 2^24 is roughly a minute);
+ *   periodogram: series length, an FFT (2^20 is a few seconds). */
+#define SEARCH_MAX_WORK         (2147483648ULL)
+#define SUBSET_MAX_WORK         (16777216ULL)
+#define PERIODOGRAM_MAX_SAMPLES ((size_t) 1048576)
+
 #if defined(_WIN32) || defined(__CYGWIN__)
 #  define FRACTAL_EXPORT __declspec(dllexport)
 #else
@@ -76,7 +96,7 @@
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
  * metadata's version silently drifting apart. */
-#define FSQL_VERSION "2.0.10"
+#define FSQL_VERSION "2.0.11"
 
 /* strncasecmp is POSIX (<strings.h>), not standard C. MSVC has no
  * <strings.h> at all, only the underscore-prefixed _strnicmp. Used by
@@ -157,8 +177,7 @@ sfs_copy_result(sfs_ctx *c, const char *json, size_t len, char *error)
 /* parse_vector_csv / parse_corpus / parse_index_csv moved to
  * fractalsql_parse.c (declared in fractalsql_parse.h, included above):
  * a standalone TU with no <mysql.h> dependency, so tests/fuzz's
- * libFuzzer drivers can link them without a MariaDB dev package (see
- * build_test.sh's gate 21). */
+ * libFuzzer drivers can link them without a MariaDB dev package. */
 
 /* ------------------------------------------------------------------ */
 /* Growable output buffer, shared by every Analytics/Portfolio UDF     */
@@ -184,11 +203,76 @@ json_out_ensure(json_out_ctx *jo, size_t need)
     char  *nb;
     if (need <= jo->cap) return true;
     ncap = jo->cap ? jo->cap : 256;
-    while (ncap < need) ncap *= 2;
+    while (ncap < need)
+    {
+        /* The doubling has to be able to stop: past SIZE_MAX/2 the next
+         * doubling wraps to 0, and "0 < need" is then true for ever --
+         * an infinite loop inside a statement, with the connection
+         * held. Sizing straight to the requirement is the honest
+         * answer: if that cannot be allocated either, the realloc
+         * below says so. */
+        if (ncap > SIZE_MAX / 2) { ncap = need; break; }
+        ncap *= 2;
+    }
     nb = realloc(jo->buf, ncap);
     if (nb == NULL) return false;
     jo->buf = nb; jo->cap = ncap;
     return true;
+}
+
+/* The worst-case size of a stack buffer that holds one JSON number
+ * formatted as "%.10f", plus the separator that precedes it in an
+ * array. A double's %.10f form is never exponential: the largest
+ * finite double (1.7976931348623157e308) prints as 309 integer digits,
+ * a '.', and 10 fractional digits -- 320 characters -- and a negative
+ * value adds a sign. One more byte covers the ',' that separates two
+ * entries.
+ *
+ * WHY A NAMED CONSTANT AND NOT A HAND-PICKED NUMBER: every emitter
+ * here treats a truncated snprintf as a hard UDF error (the check is
+ * "did it fit?"), so a buffer sized for "a typical number" (40 bytes,
+ * say) turns a large-but-legal value into a failed call instead of
+ * returning that value. The 356 the file's "provably safe regardless
+ * of magnitude" comments have always claimed is 1 (separator) + 321
+ * (sign + 309 digits + '.' + 10 digits), with room to spare. */
+#define FSQL_FIELD_MAX 356
+
+/* The output-count cap for a caller-supplied "how many results do you
+ * want" argument, and the size of the buffer that goes with it.
+ *
+ * WHY THIS EXISTS: the count arrives straight from SQL as a 64-bit
+ * integer, and the count was multiplied by the element size to size
+ * the buffer the core writes into -- with no upper bound on the
+ * count. `max_points = 2^61` made `(size_t)max_points * sizeof(size_t)`
+ * wrap to 0, so malloc() returned a zero-length block (which is not
+ * NULL, so the OOM check passed) and the core then wrote real output
+ * into it: a heap overflow inside mariadbd, reachable by any account
+ * with EXECUTE on the UDF.
+ *
+ * The fix has two halves, and both are needed:
+ *   - the allocation and the cap handed to the core are the SAME
+ *     number, so the core can never be asked for more elements than
+ *     the buffer holds (the core's own contract is that it writes at
+ *     most the cap it was given);
+ *   - the cap is clamped to `hard_max`, the most results the core
+ *     could possibly produce from this input, so the clamp does not
+ *     change any result. The multiplication is checked regardless.
+ *
+ * Returns the element count to use, or 0 when there is nothing to
+ * allocate (a count of 0, or a size that would overflow). */
+static size_t
+fsq_out_cap(long long requested, size_t hard_max, size_t elem_size, size_t *bytes_out)
+{
+    size_t cap;
+
+    if (requested <= 0 || hard_max == 0) return 0;
+    cap = ((unsigned long long) requested < (unsigned long long) hard_max)
+              ? (size_t) requested
+              : hard_max;
+    if (cap == 0) return 0;
+    if (cap > SIZE_MAX / elem_size) return 0;
+    if (bytes_out) *bytes_out = cap * elem_size;
+    return cap;
 }
 
 static bool
@@ -231,66 +315,206 @@ parse_diffusion_mode(const char *mode, int *out, char *errmsg)
 /* Minimal JSON-ish key lookup for the params object                  */
 /* ------------------------------------------------------------------ */
 
+/* Finds `key` in the params object and returns the position of its
+ * VALUE.
+ *
+ * THE SCAN IS STRING-AWARE, and it has to be: the old scan looked for
+ * the first '"key":' ANYWHERE in the buffer, so a params object whose
+ * VALUE mentioned the key -- {"note":"\"iterations\":99","iterations":3}
+ * -- resolved to the text inside the string, and a key nested in a
+ * sub-object was found before the top-level one. This scan walks the
+ * document's string tokens properly (a backslash-escaped quote does
+ * not end the token), tells a key from a value by what follows it (a
+ * key is followed by ':'), and only considers a key at the object's own
+ * depth -- a key inside a nested object is not this object's key. */
 static bool
 json_find_key(const char *s, size_t slen, const char *key, size_t *out_pos)
 {
     size_t klen = strlen(key);
-    for (size_t i = 0; i + klen + 2 < slen; i++) {
-        if (s[i] != '"') continue;
-        if (strncmp(s + i + 1, key, klen) != 0) continue;
-        if (s[i + 1 + klen] != '"') continue;
-        size_t j = i + 2 + klen;
-        while (j < slen && (s[j] == ' ' || s[j] == '\t' ||
-                            s[j] == '\n' || s[j] == '\r')) j++;
-        if (j < slen && s[j] == ':') {
-            j++;
-            while (j < slen && (s[j] == ' ' || s[j] == '\t' ||
-                                s[j] == '\n' || s[j] == '\r')) j++;
-            *out_pos = j;
-            return true;
+    size_t i = 0;
+    int    depth = 0;   /* brace/bracket nesting outside strings */
+
+    while (i < slen)
+    {
+        if (s[i] == '"')
+        {
+            /* A string token: find its end, honouring backslash
+             * escapes (an escaped quote does not close it). */
+            size_t start = i + 1;
+            size_t j = start;
+            while (j < slen) {
+                if (s[j] == '\\') { j += 2; continue; }
+                if (s[j] == '"') break;
+                j++;
+            }
+            if (j >= slen) return false;   /* unterminated string */
+
+            /* A key is followed by ':' (after whitespace). */
+            size_t k = j + 1;
+            while (k < slen && (s[k] == ' ' || s[k] == '\t' ||
+                                s[k] == '\n' || s[k] == '\r')) k++;
+            if (k < slen && s[k] == ':' && depth <= 1)
+            {
+                if (j - start == klen && strncmp(s + start, key, klen) == 0) {
+                    k++;
+                    while (k < slen && (s[k] == ' ' || s[k] == '\t' ||
+                                        s[k] == '\n' || s[k] == '\r')) k++;
+                    *out_pos = k;
+                    return true;
+                }
+                /* A different key at this depth: continue after its
+                 * colon. Its value is skipped by the same rules (a
+                 * string token is skipped whole; a number or a
+                 * literal is skipped by the character scan). */
+                i = k + 1;
+                continue;
+            }
+            /* A string VALUE: skip it whole. */
+            i = j + 1;
+            continue;
         }
+        if (s[i] == '{' || s[i] == '[') { depth++; i++; continue; }
+        if (s[i] == '}' || s[i] == ']') { depth--; i++; continue; }
+        i++;
     }
     return false;
+}
+
+/* The end of the number token at `pos`, or `pos` when there is no
+ * well-formed number there. A JSON number is
+ *   -? ( 0 | [1-9][0-9]* ) ( . [0-9]+ )? ( [eE] [+-]? [0-9]+ )?
+ * The leading '+' is not JSON, but a caller who writes one plainly
+ * means a positive number, so it is accepted. Anything the scanner
+ * cannot make sense of simply ends the token where it stopped making
+ * sense -- the caller's delimiter check then rejects the value. */
+static size_t
+json_number_end(const char *s, size_t slen, size_t pos)
+{
+    size_t j = pos;
+    if (j < slen && (s[j] == '-' || s[j] == '+')) j++;
+    size_t int_digits = j;
+    while (j < slen && isdigit((unsigned char) s[j])) j++;
+    if (j == int_digits) return pos;          /* no integer part */
+    size_t int_end = j;
+    if (j < slen && s[j] == '.') {
+        j++;
+        size_t frac = j;
+        while (j < slen && isdigit((unsigned char) s[j])) j++;
+        if (j == frac) return int_end;        /* a trailing '.' */
+    }
+    if (j < slen && (s[j] == 'e' || s[j] == 'E')) {
+        size_t k = j + 1;
+        if (k < slen && (s[k] == '-' || s[k] == '+')) k++;
+        size_t exp = k;
+        while (k < slen && isdigit((unsigned char) s[k])) k++;
+        if (k > exp) j = k;                    /* a valid exponent */
+    }
+    return j;
+}
+
+/* True when the character at `pos` can follow a JSON value: the end of
+ * the buffer, whitespace, or one of the structural characters. A value
+ * that runs straight into a letter ("30x") is not a number, and the
+ * old readers accepted it as one. */
+static bool
+json_value_delim(const char *s, size_t slen, size_t pos)
+{
+    if (pos >= slen) return true;
+    char c = s[pos];
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == ',' || c == '}' || c == ']';
 }
 
 static int
 json_get_int(const char *s, size_t slen, const char *key, int fallback)
 {
-    size_t pos; char buf[32]; size_t n = 0;
+    size_t pos;
     if (!json_find_key(s, slen, key, &pos)) return fallback;
-    while (pos < slen && n < sizeof(buf) - 1 &&
-           (isdigit((unsigned char) s[pos]) || s[pos] == '-' || s[pos] == '+'))
-        buf[n++] = s[pos++];
+
+    size_t end = json_number_end(s, slen, pos);
+    if (end == pos) return fallback;                 /* not a number */
+    if (!json_value_delim(s, slen, end)) return fallback;   /* "30x" */
+
+    char buf[32];
+    size_t n = end - pos;
+    if (n >= sizeof buf) return fallback;            /* absurdly long */
+    memcpy(buf, s + pos, n);
     buf[n] = '\0';
-    return n == 0 ? fallback : atoi(buf);
+
+    /* A value that does not fit an int is not a value this knob can
+     * use: the fallback (the default) is the safe answer, and it keeps
+     * the old atoi()'s undefined behaviour on overflow out of the
+     * path entirely.
+     *
+     * The bounds are spelled INT_MAX/INT_MIN rather than as the
+     * literals 2147483647L / -2147483648L: 2147483648 does not fit in
+     * a 32-bit long, so on a compiler that types an out-of-range
+     * decimal constant with an L suffix as unsigned long (MSVC), the
+     * negated literal is 2147483648UL and the comparison below runs in
+     * unsigned arithmetic -- where every non-negative value is
+     * "less than" it, and every parsed number was thrown away in favour
+     * of the default. */
+    errno = 0;
+    long v = strtol(buf, NULL, 10);
+    if (errno == ERANGE || v > (long) INT_MAX || v < (long) INT_MIN)
+        return fallback;
+    return (int) v;
 }
 
 /* Unsigned 64-bit variant, for session_id (the caller's own
  * CONNECTION_ID() by convention: see fractal_search's "session_id"
  * params key and fractal_diversify_*'s explicit session_id argument).
- * No sign handling, since a session key is never negative. */
+ * No sign handling, since a session key is never negative, and no
+ * fraction or exponent either: a session key is a plain integer. */
 static unsigned long long
 json_get_u64(const char *s, size_t slen, const char *key, unsigned long long fallback)
 {
-    size_t pos; char buf[32]; size_t n = 0;
+    size_t pos;
     if (!json_find_key(s, slen, key, &pos)) return fallback;
-    while (pos < slen && n < sizeof(buf) - 1 && isdigit((unsigned char) s[pos]))
-        buf[n++] = s[pos++];
+
+    size_t j = pos;
+    while (j < slen && isdigit((unsigned char) s[j])) j++;
+    if (j == pos) return fallback;                   /* not a number */
+    if (!json_value_delim(s, slen, j)) return fallback;
+
+    char buf[32];
+    size_t n = j - pos;
+    if (n >= sizeof buf) return fallback;
+    memcpy(buf, s + pos, n);
     buf[n] = '\0';
-    return n == 0 ? fallback : strtoull(buf, NULL, 10);
+
+    errno = 0;
+    unsigned long long v = strtoull(buf, NULL, 10);
+    if (errno == ERANGE) return fallback;
+    return v;
 }
 
 static double
 json_get_double(const char *s, size_t slen, const char *key, double fallback)
 {
-    size_t pos; char buf[64]; size_t n = 0;
+    size_t pos;
     if (!json_find_key(s, slen, key, &pos)) return fallback;
-    while (pos < slen && n < sizeof(buf) - 1 &&
-           (isdigit((unsigned char) s[pos]) || s[pos] == '-' || s[pos] == '+' ||
-            s[pos] == '.' || s[pos] == 'e' || s[pos] == 'E'))
-        buf[n++] = s[pos++];
+
+    size_t end = json_number_end(s, slen, pos);
+    if (end == pos) return fallback;
+    if (!json_value_delim(s, slen, end)) return fallback;
+
+    char buf[64];
+    size_t n = end - pos;
+    if (n >= sizeof buf) return fallback;
+    memcpy(buf, s + pos, n);
     buf[n] = '\0';
-    return n == 0 ? fallback : strtod(buf, NULL);
+
+    errno = 0;
+    double v = strtod(buf, NULL);
+    if (errno == ERANGE) return fallback;
+    /* An overflow (1e999) parses to an infinity, and a value that is
+     * not a number at all parses to a NaN: neither is a number the
+     * caller can have meant, and both would sail through the range
+     * checks the callers apply ("is it positive?"). The default
+     * stands instead. */
+    if (!isfinite(v)) return fallback;
+    return v;
 }
 
 static bool
@@ -301,6 +525,18 @@ json_get_bool(const char *s, size_t slen, const char *key, bool fallback)
     if (pos + 4 <= slen && strncmp(s + pos, "true",  4) == 0) return true;
     if (pos + 5 <= slen && strncmp(s + pos, "false", 5) == 0) return false;
     return fallback;
+}
+
+/* True when the params object carries the key at all. Used for the
+ * core's "seed", where "absent" and "present but zero" mean different
+ * things: an absent seed leaves the core's own non-deterministic
+ * default in place, while a present one (even 0) is a value the core
+ * is told about explicitly. */
+static bool
+json_has_key(const char *s, size_t slen, const char *key)
+{
+    size_t pos;
+    return json_find_key(s, slen, key, &pos);
 }
 
 /* Extract a quoted string value ("key":"value") into a caller-owned
@@ -337,12 +573,20 @@ fractal_search_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
         return true;
     }
 
+    /* The type of k as the caller wrote it, taken before it is forced to
+     * INT_RESULT below: forcing the type does not convert a constant's
+     * value, so a constant k written as a string ('5') or a decimal is
+     * still that many bytes of text here, not an 8-byte integer. */
+    const int k_is_int = (args->arg_type[2] == INT_RESULT);
+
     args->arg_type[0] = STRING_RESULT;
     args->arg_type[1] = STRING_RESULT;
     args->arg_type[2] = INT_RESULT;
     args->arg_type[3] = STRING_RESULT;
 
-    if (args->args[2] != NULL) {
+    /* Only an integer constant can be checked here; any other k is
+     * coerced after init and checked again in fractal_search itself. */
+    if (k_is_int && args->args[2] != NULL) {
         long long kv = *(long long *) args->args[2];
         if (kv < 1 || kv > 1000000) {
             SFS_INIT_ERROR(message, "fractal_search: k must be 1..1000000");
@@ -443,10 +687,11 @@ fractal_search(UDF_INIT *initid, UDF_ARGS *args, char *result,
     k = (int) kv;
     if (n_corpus > 0 && (size_t) k > n_corpus) k = (int) n_corpus;
 
-    /* Translate UDF param spelling → core's params_json keys.
-     * UDF: iterations / population_size / diffusion_factor / walk / debug
-     * Core: max_generation / population_size / maximum_diffusion / walk / debug
-     * Names differ for historical reasons; values are identical. */
+    /* Translate UDF param spelling → core's params_json keys. The core's
+     * own spelling is used verbatim: "iterations", "population_size",
+     * "diffusion_factor", "walk", "debug" (and "seed"). An unrecognised
+     * key is silently ignored by the core, so a translated name would
+     * tune nothing at all. */
     const char *params_s = (args->args[3] != NULL) ? args->args[3] : "{}";
     size_t      params_len = (args->args[3] != NULL) ? args->lengths[3] : 2;
 
@@ -486,22 +731,47 @@ fractal_search(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
 
     /* Bounds so an adversarial params JSON can't drive a vastly
-     * oversized SFS allocation. */
+     * oversized SFS allocation. The population bound is the CORE's
+     * own (2..10000): a larger one is rejected by the core with a
+     * generic "params out of range", so the same value is refused
+     * here, with a reason, instead of travelling that far to fail. */
     if (iterations < 1 || iterations > 10000   ||
-        pop_size   < 2 || pop_size   > 100000  ||
+        pop_size   < 2 || pop_size   > 10000   ||
         diff_factor < 1 || diff_factor > 32) {
         free(query); free(corpus);
         if (use_session) fractal_session_release_exclusive(session_id);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_search: params out of range (iterations %d..10000, "
+            "population_size %d..10000, diffusion_factor %d..32)",
+            iterations, pop_size, diff_factor);
+        *error = 1; return NULL;
+    }
+    /* Each factor is in range, but the cost is their product. */
+    if ((unsigned long long) iterations * (unsigned long long) pop_size *
+        (unsigned long long) diff_factor * (unsigned long long) dim > SEARCH_MAX_WORK) {
+        free(query); free(corpus);
+        if (use_session) fractal_session_release_exclusive(session_id);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_search: search too large (iterations x population_size x "
+            "diffusion_factor x dim exceeds %llu)", SEARCH_MAX_WORK);
         *error = 1; return NULL;
     }
 
-    char core_params[256];
+    char core_params[320];
+    /* The core's "seed" is its only determinism control: a non-zero
+     * seed makes the walk byte-stable across calls (see the vendored
+     * header). An absent seed leaves the core's own non-deterministic
+     * default in place, so the key is forwarded only when the caller
+     * supplied one. */
+    bool has_seed = json_has_key(params_s, params_len, "seed");
+    unsigned long long seed = json_get_u64(params_s, params_len, "seed", 0);
     snprintf(core_params, sizeof core_params,
-        "{\"max_generation\":%d,\"population_size\":%d,"
-        "\"maximum_diffusion\":%d,\"walk\":%.6g,"
-        "\"bound_clipping\":true,\"debug\":%s}",
+        "{\"iterations\":%d,\"population_size\":%d,"
+        "\"diffusion_factor\":%d,\"walk\":%.6g,"
+        "\"debug\":%s%s%llu}",
         iterations, pop_size, diff_factor, walk,
-        debug_mode ? "true" : "false");
+        debug_mode ? "true" : "false",
+        has_seed ? ",\"seed\":" : "", has_seed ? seed : 0ULL);
 
     /* When n_corpus == 0 we still need a corpus pointer for the
      * core; pass query as a 1-row dummy corpus so best_point/best_fit
@@ -552,6 +822,179 @@ fractal_search(UDF_INIT *initid, UDF_ARGS *args, char *result,
      * pointer to stay valid until the next call on the same initid,
      * matching that lifetime exactly, so we return the pointer
      * directly. */
+    *length  = (unsigned long) result_len;
+    *is_null = 0;
+    return (char *) result_json;
+}
+
+/* ------------------------------------------------------------------ */
+/* UDF triad: fractal_search_debug                                     */
+/*   fractal_search_debug(query_csv [, iterations [, population_size  */
+/*                              [, diffusion_factor [, seed]]]])        */
+/*     -> JSON STRING                                                  */
+/*                                                                    */
+/* The convergence view of the Stochastic Fractal Search: no corpus, */
+/* no top-k -- just the walk's own trace on one query point, so an   */
+/* operator can see where the search landed and how well it fit.     */
+/*                                                                    */
+/* The core's "no_corpus" mode is what makes this a pure convergence */
+/* run: the search has no stored vectors to match against, so it    */
+/* optimises the single query point and reports best_point/best_fit  */
+/* plus the debug trace. Without it the call would degenerate into  */
+/* the ordinary one-row-corpus search (a trivial top_k of the query */
+/* itself) and carry no trace at all.                                */
+/*                                                                    */
+/* "seed" is optional: left out, the core's own non-deterministic    */
+/* default applies (two calls may differ). Pin it for a             */
+/* byte-stable, reproducible trace.                                  */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_search_debug_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    unsigned int i;
+    if (args->arg_count < 1 || args->arg_count > 5) {
+        SFS_INIT_ERROR(message,
+            "fractal_search_debug(query_csv [, iterations [, population_size "
+            "[, diffusion_factor [, seed]]]]): expected 1 to 5 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+
+    args->arg_type[0] = STRING_RESULT;
+    for (i = 1; i < args->arg_count; i++) args->arg_type[i] = INT_RESULT;
+
+    sfs_ctx *c = calloc(1, sizeof(*c));
+    if (c == NULL) {
+        SFS_INIT_ERROR(message, "fractalsql: out of memory");
+        return true;
+    }
+    c->ctx = fsql_new_minimal();
+    if (c->ctx == NULL) {
+        free(c);
+        SFS_INIT_ERROR(message, "fractalsql: fsql_new_minimal failed");
+        return true;
+    }
+
+    initid->ptr        = (char *) c;
+    initid->maybe_null = 1;
+    initid->max_length = 64 * 1024 * 1024;
+    return false;
+}
+
+FRACTAL_EXPORT void
+fractal_search_debug_deinit(UDF_INIT *initid)
+{
+    sfs_ctx *c = (sfs_ctx *) initid->ptr;
+    if (c == NULL) return;
+    if (c->ctx) fsql_free(c->ctx);
+    free(c->result_buf);
+    free(c);
+    initid->ptr = NULL;
+}
+
+FRACTAL_EXPORT char *
+fractal_search_debug(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                     unsigned long *length, char *is_null, char *error)
+{
+    sfs_ctx *c = (sfs_ctx *) initid->ptr;
+    char     errbuf[MYSQL_ERRMSG_SIZE];
+
+    double *query = NULL;
+    size_t  dim = 0;
+    int     iterations = 60;
+    int     pop_size = 50;
+    int     diff_factor = 2;
+    bool    has_seed = false;
+    unsigned long long seed = 0;
+
+    (void) result;
+
+    if (args->args[0] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > MAX_QUERY_BYTES) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0],
+                          &query, &dim, errbuf)) {
+        *error = 1; return NULL;
+    }
+    if (dim == 0 || dim > MAX_QUERY_DIM) {
+        free(query); *error = 1; return NULL;
+    }
+
+    /* Optional trailing tuning arguments. A SQL NULL in one of them
+     * falls back to the default rather than failing the call, so a
+     * caller can pass a nullable column through. */
+    if (args->arg_count > 1 && args->args[1] != NULL)
+        iterations = clamp_to_int(*(long long *) args->args[1]);
+    if (args->arg_count > 2 && args->args[2] != NULL)
+        pop_size = clamp_to_int(*(long long *) args->args[2]);
+    if (args->arg_count > 3 && args->args[3] != NULL)
+        diff_factor = clamp_to_int(*(long long *) args->args[3]);
+    if (args->arg_count > 4 && args->args[4] != NULL) {
+        /* Clamp instead of casting: the core's seed is a uint64_t, so a
+         * plain cast of a negative argument turned -1 into
+         * 18446744073709551615 -- a value the caller never asked for,
+         * and a different one on every call that used a different
+         * negative. A negative seed is not a seed the core documents,
+         * so it falls back to the default instead. */
+        long long s = *(long long *) args->args[4];
+        seed = (s < 0) ? 0ULL : (unsigned long long) s;
+        has_seed = true;
+    }
+
+    /* Same bounds fractal_search applies, so an adversarial argument
+     * cannot drive a vastly oversized SFS allocation. The population
+     * bound is the CORE's own (2..10000): a larger one is rejected by
+     * the core with a generic "params out of range", so the same value
+     * is refused here, with a reason, instead of travelling that far to
+     * fail. */
+    if (iterations < 1 || iterations > 10000   ||
+        pop_size   < 2 || pop_size   > 10000   ||
+        diff_factor < 1 || diff_factor > 32) {
+        free(query);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_search_debug: params out of range (iterations %d..10000, "
+            "population_size %d..10000, diffusion_factor %d..32)",
+            iterations, pop_size, diff_factor);
+        *error = 1; return NULL;
+    }
+    /* Each factor is in range, but the cost is their product. */
+    if ((unsigned long long) iterations * (unsigned long long) pop_size *
+        (unsigned long long) diff_factor * (unsigned long long) dim > SEARCH_MAX_WORK) {
+        free(query);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_search_debug: search too large (iterations x population_size x "
+            "diffusion_factor x dim exceeds %llu)", SEARCH_MAX_WORK);
+        *error = 1; return NULL;
+    }
+
+    char core_params[320];
+    snprintf(core_params, sizeof core_params,
+        "{\"iterations\":%d,\"population_size\":%d,"
+        "\"diffusion_factor\":%d,\"walk\":0.5,"
+        "\"no_corpus\":true,\"debug\":true%s%llu}",
+        iterations, pop_size, diff_factor,
+        has_seed ? ",\"seed\":" : "", has_seed ? seed : 0ULL);
+
+    const char *result_json = NULL;
+    size_t      result_len  = 0;
+    /* n_rows = 0 with "no_corpus": the core has no corpus to match
+     * against, and optimises the query point on its own. */
+    int rc = fsql_search_ptr(c->ctx,
+                             query, 0, dim,
+                             query, dim,
+                             /*k*/ 1,
+                             core_params, strlen(core_params),
+                             &result_json, &result_len);
+
+    free(query);
+
+    if (rc != 0) { *error = 1; return NULL; }
+
+    /* result_json is owned by this initid's own ctx and stays valid
+     * until the next fsql_search* on that ctx, which is exactly the
+     * UDF protocol's "valid until the next call on the same initid"
+     * lifetime. */
     *length  = (unsigned long) result_len;
     *is_null = 0;
     return (char *) result_json;
@@ -692,20 +1135,35 @@ fractal_search_explore(UDF_INIT *initid, UDF_ARGS *args, char *result,
          * the ordinary per-call ctx, per the convention above. */
     }
 
+    /* Same bounds fractal_search applies, and the same CORE population
+     * cap (2..10000): a larger one is rejected by the core with a
+     * generic "params out of range", so the same value is refused here,
+     * with a reason, instead of travelling that far to fail. */
     if (iterations < 1 || iterations > 10000   ||
-        pop_size   < 2 || pop_size   > 100000  ||
+        pop_size   < 2 || pop_size   > 10000   ||
         diff_factor < 1 || diff_factor > 32) {
         free(query); free(corpus);
         if (use_session) fractal_session_release_exclusive(session_id);
+        SFS_INIT_ERROR(errbuf,
+            "fractal_search_explore: params out of range (iterations %d..10000, "
+            "population_size %d..10000, diffusion_factor %d..32)",
+            iterations, pop_size, diff_factor);
         *error = 1; return NULL;
     }
 
-    char core_params[256];
+    char core_params[320];
+    /* "seed" is forwarded for the same reason as in fractal_search: an
+     * absent seed leaves the core's own non-deterministic default in
+     * place, and a pinned seed makes the scout population byte-stable
+     * across calls. */
+    bool has_seed = json_has_key(params_s, params_len, "seed");
+    unsigned long long seed = json_get_u64(params_s, params_len, "seed", 0);
     snprintf(core_params, sizeof core_params,
-        "{\"max_generation\":%d,\"population_size\":%d,"
-        "\"maximum_diffusion\":%d,\"walk\":%.6g,"
-        "\"return_population\":true,\"bound_clipping\":true}",
-        iterations, pop_size, diff_factor, walk);
+        "{\"iterations\":%d,\"population_size\":%d,"
+        "\"diffusion_factor\":%d,\"walk\":%.6g,"
+        "\"return_population\":true%s%llu}",
+        iterations, pop_size, diff_factor, walk,
+        has_seed ? ",\"seed\":" : "", has_seed ? seed : 0ULL);
 
     const char *result_json = NULL;
     size_t      result_len  = 0;
@@ -726,7 +1184,7 @@ fractal_search_explore(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     if (use_session) {
         /* Copy out while the entry is still pinned: same lifetime
-         * reasoning as fractal_search's session path — the registry's
+         * reasoning as fractal_search's session path: the registry's
          * long-lived ctx (and the result buffer it owns) can be freed
          * or overwritten independently of this initid, so return this
          * UDF instance's own copy. */
@@ -870,7 +1328,7 @@ fractal_dimension_boxcount(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char
 
     rc = fsql_dimension_boxcount(points, flat_n / (size_t) dim, (size_t) dim, &dimension);
     free(points);
-    if (rc != FSQL_OK) { *error = 1; return 0.0; }  /* need >= 8 pts, non-degenerate bbox */
+    if (rc != FSQL_OK) { *error = 1; return 0.0; }  /* need >= 8 finite pts, non-degenerate bbox, points x dim <= 2^22 */
 
     *is_null = 0;
     return dimension;
@@ -961,7 +1419,7 @@ fractal_dimension_drift(UDF_INIT *initid, UDF_ARGS *args, char *result,
  * must keep working regardless. */
 static void
 portfolio_audit_log_best_effort(const double *mu, const double *cov,
-                                size_t n_assets, size_t k, long long seed,
+                                size_t n_assets, size_t k, unsigned long long seed,
                                 double sharpe, const double *weights)
 {
     if (!fractal_enterprise_lib_loaded())
@@ -982,28 +1440,56 @@ portfolio_audit_log_best_effort(const double *mu, const double *cov,
     for (int i = 0; i < 32; i++)
         snprintf(hash_hex + i * 2, 3, "%02x", hash[i]);
 
-    size_t cap = 256 + n_assets * 24;
-    char  *js  = (char *) malloc(cap);
-    if (js == NULL) return;
-
-    int pos = snprintf(js, cap,
+    /* The record's head: everything up to (and including) the opening
+     * bracket of the weights array. 1024 bytes covers it with room to
+     * spare -- the widest field is the Sharpe ratio's "%.10f" (321
+     * characters at the extreme), and the rest is a decimal integer, a
+     * size, a size and the 64-character hash. */
+    char head[1024];
+    int  hn = snprintf(head, sizeof head,
         "{\"type\":\"portfolio_optimize\",\"entry\":{"
-        "\"seed\":%lld,\"n_assets\":%zu,\"k\":%zu,\"sharpe\":%.10f,"
+        "\"seed\":%llu,\"n_assets\":%zu,\"k\":%zu,\"sharpe\":%.10f,"
         "\"inputs_hash\":\"%s\",\"weights\":[",
         seed, n_assets, k, sharpe, hash_hex);
-    if (pos < 0 || (size_t) pos >= cap) { free(js); return; }
+    if (hn < 0 || (size_t) hn >= sizeof head) return;
 
+    /* The exact record length, computed rather than ESTIMATED. The old
+     * budget was 24 bytes per asset plus a fixed 256 -- but one legal
+     * weight is a "%.10f" of up to 321 characters, and the Sharpe
+     * ratio is one too, so the snprintf truncated and the whole audit
+     * record was SILENTLY DROPPED for any portfolio whose weights or
+     * Sharpe ratio were above roughly 1e10: the decision's provenance
+     * went missing exactly when the numbers got interesting. Every
+     * weight is now formatted into a worst-case-sized buffer first, so
+     * its length is known before anything is allocated, and the record
+     * is assembled into a buffer that provably fits. */
+    size_t cap = (size_t) hn + 5;   /* head + "]}}" + the NUL */
     for (size_t i = 0; i < n_assets; i++)
     {
-        int n = snprintf(js + pos, cap - (size_t) pos, "%s%.10f", i > 0 ? "," : "", weights[i]);
-        if (n < 0 || (size_t)(pos + n) >= cap) { free(js); return; }
-        pos += n;
+        char w[FSQL_FIELD_MAX];
+        int  wn = snprintf(w, sizeof w, "%s%.10f", i > 0 ? "," : "", weights[i]);
+        if (wn < 0 || (size_t) wn >= sizeof w) return;
+        if (cap > SIZE_MAX - (size_t) wn) return;
+        cap += (size_t) wn;
     }
-    int tail = snprintf(js + pos, cap - (size_t) pos, "]}}");
-    if (tail < 0 || (size_t)(pos + tail) >= cap) { free(js); return; }
-    pos += tail;
 
-    (void) fractal_ledger_write_kind2(js, (size_t) pos);
+    char *js = (char *) malloc(cap);
+    if (js == NULL) return;
+
+    memcpy(js, head, (size_t) hn);
+    size_t pos = (size_t) hn;
+    for (size_t i = 0; i < n_assets; i++)
+    {
+        char w[FSQL_FIELD_MAX];
+        int  wn = snprintf(w, sizeof w, "%s%.10f", i > 0 ? "," : "", weights[i]);
+        if (wn < 0 || (size_t) wn >= sizeof w) { free(js); return; }
+        memcpy(js + pos, w, (size_t) wn);
+        pos += (size_t) wn;
+    }
+    memcpy(js + pos, "]}}", 4);   /* includes the NUL */
+    pos += 3;
+
+    (void) fractal_ledger_write_kind2(js, pos);
     free(js);
 }
 
@@ -1058,7 +1544,7 @@ fractal_optimize_portfolio(UDF_INIT *initid, UDF_ARGS *args, char *result,
     size_t    n_assets = 0, cov_n = 0;
     long long k;
     const char *params_s; size_t params_len;
-    long long   seed;
+    unsigned long long seed;
     bool        use_obl;
     char        mode_buf[16];
     int         diffusion_mode = 0;
@@ -1092,7 +1578,14 @@ fractal_optimize_portfolio(UDF_INIT *initid, UDF_ARGS *args, char *result,
     params_s   = (args->args[3] != NULL) ? args->args[3] : "{}";
     params_len = (args->args[3] != NULL) ? args->lengths[3] : 2;
 
-    seed    = (long long) json_get_int(params_s, params_len, "seed", 0);
+    /* The seed is read as UNSIGNED, like every other params-JSON seed in
+     * this file (fractal_search, fractal_search_explore). The core's
+     * seed is a uint64_t, and json_get_int accepts a leading '-', so a
+     * signed read turned {"seed":-1} into 18446744073709551615 -- a
+     * silently widened value the caller never asked for. json_get_u64
+     * rejects the sign outright and falls back to the documented
+     * default (0), which is what an absent or unusable seed means. */
+    seed    = json_get_u64(params_s, params_len, "seed", 0);
     use_obl = json_get_bool(params_s, params_len, "use_obl", false);
     if (json_get_str(params_s, params_len, "diffusion_mode", mode_buf, sizeof mode_buf) &&
         !parse_diffusion_mode(mode_buf, &diffusion_mode, errbuf)) {
@@ -1121,13 +1614,16 @@ fractal_optimize_portfolio(UDF_INIT *initid, UDF_ARGS *args, char *result,
      * (n_assets * small-constant), this can't be defeated by either an
      * unexpectedly large n_assets or an unexpectedly large |weight[i]|.
      */
-    if (!json_out_ensure(jo, 64)) { free(weights); *error = 1; return NULL; }
+    /* The head's own room: "{\"sharpe\":" + a "%.10f" of up to 321
+     * characters + ",\"weights\":[". A fixed 64 bytes would not be enough for
+     * a Sharpe ratio above roughly 1e240, and a truncated snprintf is a hard
+     * error here, so the head is sized for the worst case. */
+    if (!json_out_ensure(jo, FSQL_FIELD_MAX + 64)) { free(weights); *error = 1; return NULL; }
     /* Truncation check, same contract as every other emitter here: a
      * truncated snprintf's return value is the length it WANTED, not the
      * length it wrote -- using it as a write offset without this check
      * leaves the tail of the buffer never-written and ships uninitialized
-     * heap bytes to the client (reachable with sharpe ~1e308, whose
-     * %.10f form overruns the first ensure). */
+     * heap bytes to the client. */
     {
         int hlen = snprintf(jo->buf, jo->cap,
                             "{\"sharpe\":%.10f,\"weights\":[", sharpe);
@@ -1137,7 +1633,7 @@ fractal_optimize_portfolio(UDF_INIT *initid, UDF_ARGS *args, char *result,
         pos = (size_t) hlen;
     }
     for (i = 0; i < n_assets; i++) {
-        char field[356];
+        char field[FSQL_FIELD_MAX];
         if (fractalsql_interrupt_poll()) {  /* cancel boundary, per asset */
             SFS_INIT_ERROR(errbuf, "fractalsql: interrupted");
             free(weights); *error = 1; return NULL;
@@ -1344,7 +1840,7 @@ fractal_cortical_folding(UDF_INIT *initid, UDF_ARGS *args, char *result,
     rc = fsql_cortical_folding(vertices, v_n / 3, faces, f_n / 3,
                                &mesh_area, &hull_area, &gi);
     free(vertices); free(faces);
-    if (rc != FSQL_OK) { *error = 1; return NULL; }  /* need >= 4 non-coplanar vertices */
+    if (rc != FSQL_OK) { *error = 1; return NULL; }  /* need >= 4 finite, non-coplanar vertices, at most 2^22 */
 
     /* 1200 bytes: see fractal_dimension_drift's identically-reasoned
      * comment on this bound. */
@@ -1516,7 +2012,7 @@ fractal_morphological_complexity(UDF_INIT *initid, UDF_ARGS *args, char *result,
     rc = fsql_morphological_complexity(points, p_n / (size_t) dim, (size_t) dim,
                                        &dimension, &lacunarity);
     free(points);
-    if (rc != FSQL_OK) { *error = 1; return NULL; }  /* need >= 8 pts, non-degenerate bbox */
+    if (rc != FSQL_OK) { *error = 1; return NULL; }  /* need >= 8 finite pts, non-degenerate bbox, points x dim <= 2^22 */
 
     /* 900 bytes: 2 %.10f fields, same worst-case reasoning as
      * fractal_dimension_drift's comment. */
@@ -1644,6 +2140,7 @@ fractal_diversify_enable(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *
     fsql_ctx *ctx = fractal_session_acquire(sid);
     if (ctx == NULL) { *error = 1; return 0; }
     int rc = fsql_diversify_enable(ctx);
+    if (rc == FSQL_OK) fractal_session_set_diversify_enabled(sid, true);
     fractal_session_release(sid);
     if (rc != FSQL_OK) { *error = 1; return 0; }
     *is_null = 0;
@@ -1676,6 +2173,7 @@ fractal_diversify_disable(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char 
     fsql_ctx *ctx = fractal_session_acquire(sid);
     if (ctx == NULL) { *error = 1; return 0; }
     int rc = fsql_diversify_disable(ctx);
+    if (rc == FSQL_OK) fractal_session_set_diversify_enabled(sid, false);
     fractal_session_release(sid);
     if (rc != FSQL_OK) { *error = 1; return 0; }
     *is_null = 0;
@@ -1832,8 +2330,14 @@ fractal_explain_result(UDF_INIT *initid, UDF_ARGS *args, char *result,
     fsql_ctx *ctx = fractal_session_acquire(sid);
     if (ctx == NULL) { *error = 1; return NULL; }
 
-    fsql_diversify_params_t p;
-    bool   enabled  = (fsql_diversify_get_params(ctx, &p) == FSQL_OK);
+    /* The monitor's state comes from the session registry, not from
+     * fsql_diversify_get_params: the core's get_params returns the
+     * tunables whether or not the monitor is running, so deriving
+     * "enabled" from it reported true for a session that never called
+     * fractal_diversify_enable -- the field was never able to say
+     * "off". The registry knows, because it is where the enable and
+     * disable calls land. */
+    bool   enabled  = fractal_session_get_diversify_enabled(sid);
     double dq       = fsql_diversify_current_dq(ctx);
     double overhead = fsql_diversify_overhead_p99_us(ctx);
     fractal_session_release(sid);
@@ -1876,7 +2380,12 @@ fractal_session_close_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
         return true;
     }
     args->arg_type[0] = INT_RESULT;
-    initid->maybe_null = 0;
+    /* NULLABLE: the body answers NULL when the session_id argument is
+     * NULL, so telling the server "this is never NULL" makes its
+     * nullability model for the expression wrong (a NOT NULL
+     * comparison on the result is then unsound). Every other UDF in
+     * this file that can answer NULL says so here. */
+    initid->maybe_null = 1;
     return false;
 }
 
@@ -1898,6 +2407,84 @@ fractal_session_close(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *err
     fractal_session_registry_close(sid);
     *is_null = 0;
     return 0;
+}
+
+/* fractal_agent_partial_fail: per-session opt-in for the
+ * partial-result mode (sql/install_udf.sql documents the
+ * call). mode is 'on'/'off', case-insensitive; the UDF returns the
+ * applied state. Off (the documented default) leaves every agent
+ * procedure's behavior bit-for-bit unchanged, so the flag is strictly
+ * additive: nothing reads it except fractal_reason's endpoint-failure
+ * paths (src/fractalsql_cognition.c) and the agents' own sentinel
+ * handling (sql/install_agents.sql). Session-scoped through the same
+ * registry the Diversify triad above uses, for the same reason. */
+FRACTAL_EXPORT bool
+fractal_agent_partial_fail_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 2) {
+        SFS_INIT_ERROR(message,
+            "fractal_agent_partial_fail(session_id, mode): expected 2 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = INT_RESULT;
+    args->arg_type[1] = STRING_RESULT;
+    /* args->args[1] holds the literal mode value here (NULL for a
+     * non-constant expression, which the body's silent NULL covers) --
+     * the one chance the UDF ABI offers to reject a bad mode with
+     * real error text instead of *error = 1's silent NULL. */
+    if (args->args[1] != NULL && !(
+            (args->lengths[1] == 2 && strncasecmp(args->args[1], "on", 2) == 0) ||
+            (args->lengths[1] == 3 && strncasecmp(args->args[1], "off", 3) == 0))) {
+        SFS_INIT_ERROR(message,
+            "fractal_agent_partial_fail(session_id, mode): mode must be 'on' or 'off'");
+        return true;
+    }
+    /* NULLABLE: the body answers NULL when either argument is NULL
+     * (the init-time check above deliberately lets a NULL mode
+     * through, because the mode may be a non-constant expression), so
+     * the server must be told the result can be NULL. */
+    initid->maybe_null = 1;
+    initid->max_length = 4; /* 'off\0' at most */
+    return false;
+}
+
+FRACTAL_EXPORT void
+fractal_agent_partial_fail_deinit(UDF_INIT *initid) { (void) initid; }
+
+FRACTAL_EXPORT char *
+fractal_agent_partial_fail(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                           unsigned long *length, char *is_null, char *error)
+{
+    (void) initid; (void) error;
+    if (args->args[0] == NULL || args->args[1] == NULL) { *is_null = 1; return NULL; }
+    char errbuf[MYSQL_ERRMSG_SIZE];
+    unsigned long long sid = (unsigned long long) *(long long *) args->args[0];
+    bool on;
+    if (args->lengths[1] == 2 && strncasecmp(args->args[1], "on", 2) == 0) {
+        on = true;
+    } else if (args->lengths[1] == 3 && strncasecmp(args->args[1], "off", 3) == 0) {
+        on = false;
+    } else {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_agent_partial_fail(session_id, mode): mode must be 'on' or 'off'");
+        *error = 1; return NULL;
+    }
+    fractal_session_set_agent_partial(sid, on);
+    *is_null = 0;
+    /* The result buffer is initid->max_length bytes (4: 'off' plus the
+     * NUL). MariaDB's UDF ABI does not require a terminator, but every
+     * other string-returning UDF in this repo hands back a C string,
+     * and a caller that reads the buffer as one would otherwise run
+     * past the 'off' into whatever the buffer held before. The write
+     * fits exactly: 3 characters plus the NUL in a 4-byte buffer. */
+    const char *state = on ? "on" : "off";
+    size_t n = strlen(state);
+    if (n + 1 > 4) { *error = 1; return NULL; }   /* unreachable */
+    memcpy(result, state, n);
+    result[n] = '\0';
+    *length = (unsigned long) n;
+    return result;
 }
 
 /* fractal_feedback_report / fractal_isolate_background: both ship
@@ -2058,6 +2645,7 @@ fractal_change_point_detect(UDF_INIT *initid, UDF_ARGS *args, char *result,
     double  *series = NULL;
     size_t  *idx = NULL;
     size_t   n = 0, n_found = 0, pos;
+    size_t   idx_cap = 0, idx_bytes = 0;
     long long window, max_points;
     double   threshold;
     int      rc;
@@ -2075,11 +2663,16 @@ fractal_change_point_detect(UDF_INIT *initid, UDF_ARGS *args, char *result,
     if (!parse_vector_csv(args->args[0], args->lengths[0], &series, &n, errbuf)) {
         *error = 1; return NULL;
     }
-    idx = malloc((size_t) max_points * sizeof(size_t));
+    /* The core writes at most one boundary index per sample, so n is
+     * the most it can produce; the cap and the allocation agree from
+     * here on. */
+    idx_cap = fsq_out_cap(max_points, n, sizeof(size_t), &idx_bytes);
+    if (idx_cap == 0) { free(series); *error = 1; return NULL; }
+    idx = malloc(idx_bytes);
     if (idx == NULL) { free(series); *error = 1; return NULL; }
 
     rc = fsql_change_point_detect(series, n, (size_t) window, threshold,
-                                  idx, (size_t) max_points, &n_found);
+                                  idx, idx_cap, &n_found);
     free(series);
     if (rc != FSQL_OK) { free(idx); *error = 1; return NULL; }  /* n >= 2*window required */
 
@@ -2141,6 +2734,7 @@ fractal_periodogram(UDF_INIT *initid, UDF_ARGS *args, char *result,
     double  *series = NULL;
     double  *freqs = NULL, *power = NULL;
     size_t   n = 0, n_peaks = 0, pos;
+    size_t   peaks_cap = 0, peaks_bytes = 0;
     long long max_peaks;
     int      rc;
     (void) result;
@@ -2154,20 +2748,26 @@ fractal_periodogram(UDF_INIT *initid, UDF_ARGS *args, char *result,
     if (!parse_vector_csv(args->args[0], args->lengths[0], &series, &n, errbuf)) {
         *error = 1; return NULL;
     }
-    freqs = malloc((size_t) max_peaks * sizeof(double));
-    power = malloc((size_t) max_peaks * sizeof(double));
+    if (n > PERIODOGRAM_MAX_SAMPLES) { free(series); *error = 1; return NULL; }
+    /* The core's own bound: *out_n_peaks = min(max_peaks, floor(n/2)),
+     * so clamping the cap to n/2 changes no result. The allocation and
+     * the cap the core is given are the same number. */
+    peaks_cap = fsq_out_cap(max_peaks, n / 2, sizeof(double), &peaks_bytes);
+    if (peaks_cap == 0) { free(series); *error = 1; return NULL; }
+    freqs = malloc(peaks_bytes);
+    power = malloc(peaks_bytes);
     if (freqs == NULL || power == NULL) {
         free(series); free(freqs); free(power); *error = 1; return NULL;
     }
 
-    rc = fsql_periodogram(series, n, freqs, power, (size_t) max_peaks, &n_peaks);
+    rc = fsql_periodogram(series, n, freqs, power, peaks_cap, &n_peaks);
     free(series);
     if (rc != FSQL_OK) { free(freqs); free(power); *error = 1; return NULL; }  /* n >= 4 */
 
     if (!json_out_ensure(jo, 16)) { free(freqs); free(power); *error = 1; return NULL; }
     pos = (size_t) snprintf(jo->buf, jo->cap, "{\"freqs\":[");
     for (size_t i = 0; i < n_peaks; i++) {
-        char field[40];
+        char field[FSQL_FIELD_MAX];
         if (fractalsql_interrupt_poll()) {  /* cancel boundary, per bin */
             SFS_INIT_ERROR(errbuf, "fractalsql: interrupted");
             free(freqs); free(power); *error = 1; return NULL;
@@ -2185,7 +2785,7 @@ fractal_periodogram(UDF_INIT *initid, UDF_ARGS *args, char *result,
     if (!json_out_ensure(jo, pos + 16)) { free(freqs); free(power); *error = 1; return NULL; }
     pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos, "],\"power\":[");
     for (size_t i = 0; i < n_peaks; i++) {
-        char field[40];
+        char field[FSQL_FIELD_MAX];
         if (fractalsql_interrupt_poll()) {  /* cancel boundary, per bin */
             SFS_INIT_ERROR(errbuf, "fractalsql: interrupted");
             free(freqs); free(power); *error = 1; return NULL;
@@ -2210,6 +2810,102 @@ fractal_periodogram(UDF_INIT *initid, UDF_ARGS *args, char *result,
 }
 
 /* ------------------------------------------------------------------ */
+/* UDF triad: fractal_spectrogram_entropy                             */
+/*                                                                    */
+/* fractal_spectrogram_entropy(series_csv [, window [, hop            */
+/* [, max_frames]]]) -> bare JSON array of per-frame normalized       */
+/* spectral entropy in [0,1] (mean removed, Hann tapered, direct DFT).*/
+/* Defaults: window 64, hop 32, max_frames 4096. A bare array, not an */
+/* object, so it can be fed to fractal_change_point_detect as-is.     */
+/* Requires window in [8,512], hop >= 1, max_frames in [1,4096],      */
+/* n >= window. A constant frame reports 0.0, never NaN.              */
+/* ------------------------------------------------------------------ */
+
+FRACTAL_EXPORT bool
+fractal_spectrogram_entropy_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    unsigned int i;
+    if (args->arg_count < 1 || args->arg_count > 4) {
+        SFS_INIT_ERROR(message,
+            "fractal_spectrogram_entropy(series_csv [, window [, hop "
+            "[, max_frames]]]): expected 1 to 4 arguments, got %u",
+            args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = STRING_RESULT;
+    for (i = 1; i < args->arg_count; i++) args->arg_type[i] = INT_RESULT;
+    return json_out_generic_init(initid, message);
+}
+
+FRACTAL_EXPORT void
+fractal_spectrogram_entropy_deinit(UDF_INIT *initid) { json_out_generic_deinit(initid); }
+
+FRACTAL_EXPORT char *
+fractal_spectrogram_entropy(UDF_INIT *initid, UDF_ARGS *args, char *result,
+                            unsigned long *length, char *is_null, char *error)
+{
+    json_out_ctx *jo = (json_out_ctx *) initid->ptr;
+    char      errbuf[MYSQL_ERRMSG_SIZE];
+    double   *series = NULL, *entropy = NULL;
+    size_t    n = 0, n_frames = 0, avail, pos, frames_cap = 0, frames_bytes = 0;
+    long long window = 64, hop = 32, max_frames = 4096;
+    int       rc;
+    (void) result;
+
+    if (args->args[0] == NULL) { *is_null = 1; return NULL; }
+    if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+    if (args->arg_count > 1 && args->args[1] != NULL) window     = *(long long *) args->args[1];
+    if (args->arg_count > 2 && args->args[2] != NULL) hop        = *(long long *) args->args[2];
+    if (args->arg_count > 3 && args->args[3] != NULL) max_frames = *(long long *) args->args[3];
+    if (window < 8 || window > 512 || hop < 1 ||
+        max_frames < 1 || max_frames > 4096) { *error = 1; return NULL; }
+
+    if (!parse_vector_csv(args->args[0], args->lengths[0], &series, &n, errbuf)) {
+        *error = 1; return NULL;
+    }
+    if (n < (size_t) window) { free(series); *error = 1; return NULL; }
+
+    /* The core writes min(available, max_frames) frames, so capping the
+     * allocation at the available frame count changes no result. */
+    avail = (n - (size_t) window) / (size_t) hop + 1;
+    frames_cap = fsq_out_cap(max_frames, avail, sizeof(double), &frames_bytes);
+    if (frames_cap == 0) { free(series); *error = 1; return NULL; }
+    entropy = malloc(frames_bytes);
+    if (entropy == NULL) { free(series); *error = 1; return NULL; }
+
+    rc = fsql_spectrogram_entropy(series, n, (size_t) window, (size_t) hop,
+                                  entropy, frames_cap, &n_frames);
+    free(series);
+    if (rc != FSQL_OK) { free(entropy); *error = 1; return NULL; }
+
+    if (!json_out_ensure(jo, 16)) { free(entropy); *error = 1; return NULL; }
+    pos = (size_t) snprintf(jo->buf, jo->cap, "[");
+    for (size_t i = 0; i < n_frames; i++) {
+        char field[FSQL_FIELD_MAX];
+        int  flen;
+        if (fractalsql_interrupt_poll()) {  /* cancel boundary, per frame */
+            free(entropy); *error = 1; return NULL;
+        }
+        flen = snprintf(field, sizeof field, "%s%.10f", i > 0 ? "," : "", entropy[i]);
+        if (flen < 0 || (size_t) flen >= sizeof field) {
+            free(entropy); *error = 1; return NULL;
+        }
+        if (!json_out_ensure(jo, pos + (size_t) flen + 8)) {
+            free(entropy); *error = 1; return NULL;
+        }
+        memcpy(jo->buf + pos, field, (size_t) flen);
+        pos += (size_t) flen;
+    }
+    free(entropy);
+    if (!json_out_ensure(jo, pos + 4)) { *error = 1; return NULL; }
+    pos += (size_t) snprintf(jo->buf + pos, jo->cap - pos, "]");
+
+    *length  = (unsigned long) pos;
+    *is_null = 0;
+    return jo->buf;
+}
+
+/* ------------------------------------------------------------------ */
 /* UDF triad: fractal_state_fingerprint                               */
 /*                                                                    */
 /* Random-hyperplane SimHash: projects a state vector onto n_bits     */
@@ -2219,6 +2915,17 @@ fractal_periodogram(UDF_INIT *initid, UDF_ARGS *args, char *result,
 /* convention fractal_vector_quantize_binary uses, so a fingerprint   */
 /* can be fed straight into fractal_cycle_detect below.               */
 /* ------------------------------------------------------------------ */
+
+/* The largest fingerprint that can be REPORTED: the result is a JSON
+ * array of the fingerprint's bytes, at most four characters each (three
+ * digits and a separator), and the document has to fit the 16 MiB this
+ * UDF declares as its result length. 32 Mi bits is the ceiling. */
+#define FINGERPRINT_MAX_BYTES ((16u * 1024u * 1024u - 4u) / 4u)
+#define FINGERPRINT_MAX_BITS  ((long long) FINGERPRINT_MAX_BYTES * 8LL)
+/* Most random draws one fingerprint (n_bits x vector length) may cost: about
+ * 4 ns each, so 2^28 is roughly a second, and the loop cannot be interrupted.
+ * The same bound as the core's. */
+#define FINGERPRINT_MAX_WORK  (268435456LL)
 
 FRACTAL_EXPORT bool
 fractal_state_fingerprint_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
@@ -2260,10 +2967,20 @@ fractal_state_fingerprint(UDF_INIT *initid, UDF_ARGS *args, char *result,
     n_bits = *(long long *) args->args[1];
     seed   = *(double *) args->args[2];
     if (n_bits <= 0) { *error = 1; return NULL; }
+    /* The output is a JSON array of the fingerprint's bytes: at most
+     * three digits and a separator each, so four characters per byte,
+     * and the whole document has to fit the 16 MiB this UDF declares as
+     * its result length. n_bits was bounded only from below, so a
+     * caller could ask for a 2^60-bit fingerprint -- a petabyte
+     * allocation, refused only because malloc said no. The largest
+     * fingerprint that can be reported at all is the one whose JSON
+     * fits, and that is the bound applied here. */
+    if (n_bits > (long long) FINGERPRINT_MAX_BITS) { *error = 1; return NULL; }
 
     if (!parse_vector_csv(args->args[0], args->lengths[0], &v, &dim, errbuf)) {
         *error = 1; return NULL;
     }
+    if (dim > 0 && n_bits > FINGERPRINT_MAX_WORK / (long long) dim) { free(v); *error = 1; return NULL; }
     n_bytes = ((size_t) n_bits + 7) / 8;
     out = malloc(n_bytes);
     if (out == NULL) { free(v); *error = 1; return NULL; }
@@ -2473,6 +3190,7 @@ fractal_tda_persistence_diagram(UDF_INIT *initid, UDF_ARGS *args, char *result,
     double          *points = NULL;
     fsql_tda_bar_t  *bars = NULL;
     size_t           flat_n = 0, n_h0_bars = 0, betti1 = 0, pos;
+    size_t           bars_cap = 0, bars_bytes = 0;
     long long        dim, max_dim, max_h0_bars;
     double           max_thresh;
     int              rc;
@@ -2494,12 +3212,16 @@ fractal_tda_persistence_diagram(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
     if (flat_n % (size_t) dim != 0) { free(points); *error = 1; return NULL; }
 
-    bars = malloc((size_t) max_h0_bars * sizeof(fsql_tda_bar_t));
+    /* The H0 barcode of n points has at most n bars, so n_points is the
+     * most the core can produce; the cap and the allocation agree. */
+    bars_cap = fsq_out_cap(max_h0_bars, flat_n / (size_t) dim, sizeof(fsql_tda_bar_t), &bars_bytes);
+    if (bars_cap == 0) { free(points); *error = 1; return NULL; }
+    bars = malloc(bars_bytes);
     if (bars == NULL) { free(points); *error = 1; return NULL; }
 
     rc = fsql_tda_persistence_diagram(points, flat_n / (size_t) dim, (size_t) dim,
                                       (int) max_dim, max_thresh,
-                                      bars, (size_t) max_h0_bars, &n_h0_bars,
+                                      bars, bars_cap, &n_h0_bars,
                                       max_dim == 1 ? &betti1 : NULL);
     free(points);
     if (rc != FSQL_OK) { free(bars); *error = 1; return NULL; }
@@ -2507,7 +3229,11 @@ fractal_tda_persistence_diagram(UDF_INIT *initid, UDF_ARGS *args, char *result,
     if (!json_out_ensure(jo, 32)) { free(bars); *error = 1; return NULL; }
     pos = (size_t) snprintf(jo->buf, jo->cap, "{\"h0_bars\":[");
     for (size_t i = 0; i < n_h0_bars; i++) {
-        char field[128];
+        /* TWO numbers plus their keys: a separator, '{"birth":', the
+         * birth value, ',"death":', the death value and '}'. Two
+         * FSQL_FIELD_MAX-sized numbers with room for the keys between
+         * them. */
+        char field[FSQL_FIELD_MAX * 2];
         int  flen = snprintf(field, sizeof field, "%s{\"birth\":%.10f,\"death\":%.10f}",
                              i > 0 ? "," : "", bars[i].birth, bars[i].death);
         if (flen < 0 || (size_t) flen >= sizeof field) { free(bars); *error = 1; return NULL; }
@@ -2600,7 +3326,7 @@ fractal_optimize_subset(UDF_INIT *initid, UDF_ARGS *args, char *result,
     size_t    n_items = 0, ub_n = 0, pos;
     long long k;
     const char *params_s; size_t params_len;
-    long long   seed;
+    unsigned long long seed;
     double      score;
     subset_value_ctx ctx;
     int         rc;
@@ -2608,6 +3334,14 @@ fractal_optimize_subset(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     if (args->args[0] == NULL || args->args[2] == NULL) { *is_null = 1; return NULL; }
     if (args->lengths[0] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+    /* The upper bounds and the params are bounded like every other
+     * string argument in this file: the bounds CSV reaches the parser
+     * (which grows an array from the text it is handed) and the params
+     * reach the JSON scanner. Neither had a cap of its own here, which
+     * made this the one UDF whose memory use was set by
+     * max_allowed_packet alone. */
+    if (args->args[1] != NULL && args->lengths[1] > MAX_CORPUS_BYTES) { *error = 1; return NULL; }
+    if (args->args[3] != NULL && args->lengths[3] > MAX_QUERY_BYTES) { *error = 1; return NULL; }
 
     k = *(long long *) args->args[2];
     if (k <= 0) { *error = 1; return NULL; }
@@ -2626,10 +3360,17 @@ fractal_optimize_subset(UDF_INIT *initid, UDF_ARGS *args, char *result,
     if ((size_t) k > n_items) {
         free(item_values); free(upper_bounds); *error = 1; return NULL;
     }
+    if ((unsigned long long) n_items * (unsigned long long) k > SUBSET_MAX_WORK) {
+        free(item_values); free(upper_bounds); *error = 1; return NULL;
+    }
 
     params_s   = (args->args[3] != NULL) ? args->args[3] : "{}";
     params_len = (args->args[3] != NULL) ? args->lengths[3] : 2;
-    seed       = (long long) json_get_int(params_s, params_len, "seed", 0);
+    /* Unsigned, for the same reason as the portfolio optimizer's seed
+     * above: the core's seed is a uint64_t, and a signed read turned
+     * {"seed":-1} into 18446744073709551615 instead of the documented
+     * default. */
+    seed       = json_get_u64(params_s, params_len, "seed", 0);
 
     weights = malloc(n_items * sizeof(double));
     if (weights == NULL) {
@@ -2647,14 +3388,18 @@ fractal_optimize_subset(UDF_INIT *initid, UDF_ARGS *args, char *result,
     /* score is -sum(weight*value) per subset_value_objective's sign
      * convention (fsql_optimize_subset always minimizes); negate back
      * to report the actual maximized value-weighted allocation. */
-    if (!json_out_ensure(jo, 64)) { free(weights); *error = 1; return NULL; }
+    /* The head's own room: "{\"score\":" + a "%.10f" of up to 321
+     * characters + ",\"weights\":[". A fixed 64 bytes would not be enough for
+     * a score above roughly 1e240, and a truncated snprintf is a hard
+     * error here, so the head is sized for the worst case. */
+    if (!json_out_ensure(jo, FSQL_FIELD_MAX + 64)) { free(weights); *error = 1; return NULL; }
     {
         int hlen = snprintf(jo->buf, jo->cap, "{\"score\":%.10f,\"weights\":[", -score);
         if (hlen < 0 || (size_t) hlen >= jo->cap) { free(weights); *error = 1; return NULL; }
         pos = (size_t) hlen;
     }
     for (size_t i = 0; i < n_items; i++) {
-        char field[356];
+        char field[FSQL_FIELD_MAX];
         int  flen = snprintf(field, sizeof field, "%s%.10f",
                              i > 0 ? "," : "", weights[i]);
         if (flen < 0 || (size_t) flen >= sizeof field) { free(weights); *error = 1; return NULL; }

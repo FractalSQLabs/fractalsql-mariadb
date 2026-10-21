@@ -56,6 +56,19 @@ typedef struct fsql_session_entry {
     fsql_ctx                   *review_ctx;
     bool                         review_loaded;
     int                          refcount;
+    /* agent_partial_reasoning_fail, per session (default off):
+     * when set, a reasoning-endpoint failure in the agent helpers'
+     * compose step leaves the computed data half with the plugin's
+     * detail attached instead of discarding it. Set/consulted through
+     * fractal_agent_partial_fail()'s UDF and the dispatcher, never the
+     * ctx itself. */
+    bool                         agent_partial_fail;
+    /* Whether the Diversify monitor is enabled on this session's ctx
+     * (the UDF fractal_diversify_enable / _disable pair). Tracked here
+     * because the core's ABI cannot be asked: fsql_diversify_get_params
+     * returns the tunables whether or not the monitor is running, so
+     * deriving the state from it always said "enabled". */
+    bool                         diversify_enabled;
     /* Exclusive-use pin for the main `ctx` slot (see
      * fractal_session_acquire_exclusive). The core's fsql_search_ptr is
      * not safe for concurrent searches on the SAME ctx, so an entry
@@ -63,6 +76,13 @@ typedef struct fsql_session_entry {
      * a second exclusive acquire of that id then fails fast instead of
      * racing the core. Checked alongside refcount by every destroy path. */
     int                          busy;
+    /* How many PLAIN (non-exclusive) holders this entry has right now:
+     * the diversify tuning/diagnostic calls and the ledger calls, all
+     * of which run against the same ctx an exclusive holder would.
+     * The exclusion is two-way (see the header): the plain acquire
+     * refuses while `busy` is set, and the exclusive acquire refuses
+     * while this is non-zero. */
+    int                          shared;
     time_t                       last_used;
     struct fsql_session_entry  *bucket_next;
     struct fsql_session_entry  *lru_prev;  /* toward most-recently-used */
@@ -300,6 +320,7 @@ fractal_session_acquire(unsigned long long session_id)
     }
 
     fsql_ctx *ctx = e->ctx;
+    e->shared++;   /* a plain holder: an exclusive acquire must refuse */
     session_unlock();
     return ctx;
 }
@@ -401,6 +422,18 @@ fractal_session_acquire_exclusive(unsigned long long session_id, bool *out_busy)
         session_unlock();
         return NULL;
     }
+    /* The other direction of the exclusion: a PLAIN holder (a diversify
+     * tuning or diagnostic call, a ledger call) is using the same ctx
+     * this acquire is about to hand out, and the core's search entry
+     * point is not safe for concurrent use on one ctx. The plain
+     * acquire refuses while `busy` is set; without this half, the
+     * exclusion was one-way and a search could start on top of a
+     * running diversify call. */
+    if (e != NULL && e->shared > 0) {
+        if (out_busy) *out_busy = true;
+        session_unlock();
+        return NULL;
+    }
 
     e = find_or_create_entry_locked(session_id);
     if (e == NULL) { session_unlock(); return NULL; }
@@ -436,6 +469,97 @@ fractal_session_release_exclusive(unsigned long long session_id)
         if (e->refcount > 0) e->refcount--;
     }
     session_unlock();
+}
+
+/* Per-session partial-result opt-in (see fractalsql_session.h). set() creates
+ * the entry if needed so a mode call before any agent call still lands;
+ * get() is deliberately read-only over existing entries -- checking the
+ * flag must not grow the registry. */
+void
+fractal_session_set_agent_partial(unsigned long long session_id, bool on)
+{
+    session_lock();
+    fsql_session_entry *e = find_entry(session_id);
+    if (e == NULL) {
+        /* find_or_create_entry_locked bumps refcount and pins LRU; the
+         * caller holds no reference, so drop it right back. */
+        e = find_or_create_entry_locked(session_id);
+        if (e != NULL && e->refcount > 0) e->refcount--;
+    }
+    if (e != NULL) e->agent_partial_fail = on;
+    session_unlock();
+}
+
+bool
+fractal_session_get_agent_partial(unsigned long long session_id)
+{
+    session_lock();
+    fsql_session_entry *e = find_entry(session_id);
+    bool on = (e != NULL) ? e->agent_partial_fail : false;
+    session_unlock();
+    return on;
+}
+
+/* The Diversify monitor's state for one session. See the header's
+ * comment for why the core cannot be asked. set() creates the entry
+ * when it is missing, so an enable/disable that lands on a session
+ * with no entry yet still records the state (the ctx it describes is
+ * created by the same UDF call, in the same registry). */
+void
+fractal_session_set_diversify_enabled(unsigned long long session_id, bool on)
+{
+    session_lock();
+    fsql_session_entry *e = find_entry(session_id);
+    if (e == NULL) {
+        e = find_or_create_entry_locked(session_id);
+        if (e != NULL && e->refcount > 0) e->refcount--;
+    }
+    if (e != NULL) e->diversify_enabled = on;
+    session_unlock();
+}
+
+bool
+fractal_session_get_diversify_enabled(unsigned long long session_id)
+{
+    session_lock();
+    fsql_session_entry *e = find_entry(session_id);
+    bool on = (e != NULL) ? e->diversify_enabled : false;
+    session_unlock();
+    return on;
+}
+
+/* Destructive-ledger latch (see fractalsql_session.h). A ring of the locked
+ * session ids: connection ids only grow, so when the ring is full the oldest
+ * entry belongs to a long-dead connection and is the one to overwrite. */
+#define FSQL_LOCKED_RING 16384u
+static unsigned long long g_locked_ids[FSQL_LOCKED_RING];
+static size_t             g_locked_n;      /* entries in use, <= FSQL_LOCKED_RING */
+static size_t             g_locked_head;   /* next slot to write */
+
+void
+fractal_session_lock_destructive(unsigned long long session_id)
+{
+    session_lock();
+    bool present = false;
+    for (size_t i = 0; i < g_locked_n; i++)
+        if (g_locked_ids[i] == session_id) { present = true; break; }
+    if (!present) {
+        g_locked_ids[g_locked_head] = session_id;
+        g_locked_head = (g_locked_head + 1u) % FSQL_LOCKED_RING;
+        if (g_locked_n < FSQL_LOCKED_RING) g_locked_n++;
+    }
+    session_unlock();
+}
+
+bool
+fractal_session_destructive_locked(unsigned long long session_id)
+{
+    session_lock();
+    bool locked = false;
+    for (size_t i = 0; i < g_locked_n; i++)
+        if (g_locked_ids[i] == session_id) { locked = true; break; }
+    session_unlock();
+    return locked;
 }
 
 /* Same as fractal_session_acquire_reason but for fractal_embed()'s
@@ -540,8 +664,25 @@ fractal_session_release(unsigned long long session_id)
 {
     session_lock();
     fsql_session_entry *e = find_entry(session_id);
-    if (e && e->refcount > 0) e->refcount--;
+    if (e) {
+        /* This is the plain holder's release: give back the shared
+         * count the plain acquire took, so an exclusive acquire is no
+         * longer blocked by a holder that has already finished. */
+        if (e->shared > 0) e->shared--;
+        if (e->refcount > 0) e->refcount--;
+    }
     session_unlock();
+}
+
+void
+fractal_session_release_tier(void)
+{
+    /* The per-tier ctx is a process-wide singleton: no release ever
+     * frees it, and the tier acquire took no reference on the
+     * per-session entry. There is nothing to give back, and
+     * decrementing the session's own refcount here would let another
+     * connection's ctx be freed while it was still in use. See fractal_session_release_tier in
+     * fractalsql_session.h. */
 }
 
 void

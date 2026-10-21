@@ -104,11 +104,10 @@
  *   FRACTALSQL_ENTERPRISE_LEDGER_KEY (optional): HMAC-SHA256 key for
  *     MAC-authenticated tamper evidence; unset means structural-only
  *     (entry_hash chain) validation. Swaps live like the ledger path.
- *   FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE (optional): when set to a
- *     non-empty, non-"0" value, refuses to load an enterprise .so with
- *     no sibling <path>.sig file (an INVALID signature is always fatal
- *     regardless of this setting). Default off: an unsigned .so still
- *     loads (logged to stderr).
+ *   FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE (optional): refuses to load an
+ *     enterprise .so with no sibling <path>.sig file (an INVALID signature
+ *     is always fatal regardless of this setting). Default ON; set it to
+ *     "0" to let an unsigned .so load (logged to stderr).
  *   One shared daemon process serves every connection's forwarded
  *   calls, so the dlopen attempt/result is cached process-wide, not
  *   per session.
@@ -127,11 +126,17 @@
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #  include <Windows.h>
+#  include <fcntl.h>             /* _sopen_s/_O_BINARY: owner-only file opens */
 #  include <io.h>                /* _commit: flush the ledger write through to disk */
+#  include <share.h>             /* _SH_DENYNO: the sharing mode for _sopen_s */
+#  include <sys/stat.h>          /* _chmod: tighten an existing file's permissions */
 #  define FRACTAL_EXPORT __declspec(dllexport)
 #else
 #  include <dlfcn.h>
+#  include <fcntl.h>             /* open/O_*: owner-only file opens */
 #  include <pthread.h>
+#  include <sys/stat.h>          /* fchmod: the temp library copy needs the execute bit */
+#  include <syslog.h>            /* syslog: the off-host anchor log sink */
 #  include <unistd.h>            /* fsync: flush the ledger write through to disk */
 #  define FRACTAL_EXPORT
 #endif
@@ -144,6 +149,7 @@
 #include "fractalsql_hmac.h"     /* fsql_sha256/fsql_hmac_sha256: vendored, public-domain SHA-256 + HMAC-SHA256 */
 #include "fractalsql_msvc_compat.h"  /* strdup -> _strdup rename on MSVC/clang-cl */
 #include "fractalsql_parse.h"    /* parse_vector_csv, shared with fractalsql.c/fractalsql_vector.c */
+#include "fsql_audit_redact.h"   /* FSQL_AUDIT_REDACT: fingerprint the audit trail's free text */
 
 #if defined(__linux__)
 #include <sys/syscall.h>         /* memfd_create, see ent_dlopen_verified_copy */
@@ -257,7 +263,12 @@ ent_env_capture_locked(void)
     (void) ent_dup_or(getenv("FRACTALSQL_ENTERPRISE_LIB"), &g_ent_env_lib);
     (void) ent_dup_or(getenv("FRACTALSQL_ENTERPRISE_LEDGER_PATH"), &g_ent_env_ledger_path);
     (void) ent_dup_or(getenv("FRACTALSQL_ENTERPRISE_LEDGER_KEY"), &g_ent_env_ledger_key);
-    g_ent_env_require_sig = ent_env_flag("FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE");
+    /* Default ON: an unset variable now requires a signature; only an
+     * explicit "0" (operator opt-out) lets an unsigned library load. */
+    {
+        const char *rq = getenv("FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE");
+        g_ent_env_require_sig = (rq == NULL || rq[0] == '\0') ? true : (rq[0] != '0');
+    }
     /* Effective values start as owned copies of the snapshot, so apply's
      * free-and-replace never frees a snapshot string (see free_cfg's
      * aliasing note in fractalsql_cognition.c). On OOM these stay NULL,
@@ -421,6 +432,19 @@ ent_dlopen_verified_copy(const char *orig_path,
         {
             int fd = mkstemp(tmp_path);   /* exclusive create, mode 0600 */
             if (fd < 0) return NULL;
+            /* The execute bit, before anything is written to the file.
+             * mkstemp creates with mode 0600 (no execute permission),
+             * and a shared library that is not executable cannot be
+             * mapped for execution: on macOS (and the BSDs) dlopen
+             * fails outright on a file without the execute bit, so a
+             * VERIFIED library would fail to load there for no reason
+             * other than the temp file's permissions. 0700 keeps the
+             * file private to its owner and adds exactly the one bit
+             * the loader needs. */
+            if (fchmod(fd, S_IRUSR | S_IWUSR | S_IXUSR) != 0)
+            {
+                close(fd); remove(tmp_path); return NULL;
+            }
             f = fdopen(fd, "wb");
             if (f == NULL) { close(fd); remove(tmp_path); return NULL; }
         }
@@ -572,10 +596,77 @@ ent_verify_signature(const char *so_path,
     return result;
 }
 
+static int
+ent_hexval(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+bool
+fractal_plugin_verify(const char *path, char *err, size_t errsz)
+{
+    const char *allow = getenv("FRACTALSQL_REASONING_ALLOW_UNVERIFIED");
+    if (allow != NULL && allow[0] != '\0')
+        return true;                       /* operator opt-out */
+    if (path == NULL || path[0] == '\0')
+    {
+        snprintf(err, errsz, "no reasoning plugin path configured");
+        return false;
+    }
+
+    const char *pin = getenv("FRACTALSQL_REASONING_PLUGIN_SHA256");
+    if (pin != NULL && pin[0] != '\0')
+    {
+        unsigned char want[32], got[EVP_MAX_MD_SIZE];
+        unsigned int  glen = 0;
+        bool          ok = (strlen(pin) == 64);
+        for (int i = 0; ok && i < 32; i++)
+        {
+            int hi = ent_hexval(pin[i * 2]), lo = ent_hexval(pin[i * 2 + 1]);
+            if (hi < 0 || lo < 0) ok = false; else want[i] = (unsigned char) ((hi << 4) | lo);
+        }
+        if (!ok) { snprintf(err, errsz, "FRACTALSQL_REASONING_PLUGIN_SHA256 must be 64 hex digits"); return false; }
+
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) { snprintf(err, errsz, "reasoning plugin \"%s\" cannot be read for verification", path); return false; }
+        EVP_MD_CTX *md = EVP_MD_CTX_new();
+        unsigned char buf[8192];
+        size_t n;
+        bool hashed = (md != NULL && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1);
+        while (hashed && (n = fread(buf, 1, sizeof buf, f)) > 0)
+            if (EVP_DigestUpdate(md, buf, n) != 1) hashed = false;
+        fclose(f);
+        if (hashed) hashed = (EVP_DigestFinal_ex(md, got, &glen) == 1 && glen == 32);
+        if (md != NULL) EVP_MD_CTX_free(md);
+        if (!hashed || CRYPTO_memcmp(want, got, 32) != 0)
+        {
+            snprintf(err, errsz, "reasoning plugin \"%s\" does not match FRACTALSQL_REASONING_PLUGIN_SHA256 -- refusing to load", path);
+            return false;
+        }
+        return true;
+    }
+
+    ent_sig_result_t sig = ent_verify_signature(path, NULL, NULL);
+    if (sig == ENT_SIG_OK) return true;
+    if (sig == ENT_SIG_MISSING)
+        snprintf(err, errsz,
+                 "reasoning plugin \"%s\" has no .sig and no FRACTALSQL_REASONING_PLUGIN_SHA256 pin -- refusing to load "
+                 "native code that is not verified (set FRACTALSQL_REASONING_ALLOW_UNVERIFIED to opt out)", path);
+    else
+        snprintf(err, errsz,
+                 "reasoning plugin \"%s\" failed signature verification -- refusing to load (the file or its .sig "
+                 "does not match the FractalSQLabs signing key)", path);
+    return false;
+}
+
 /* FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=1 (or enterprise_require_signature
  * in fractalsqld.conf) makes a MISSING .sig fatal (an INVALID .sig is
- * always fatal regardless). Default off: backward compatible with an
- * enterprise .so shipped without a .sig. */
+ * always fatal regardless). Default ON: a library without a .sig is
+ * refused unless the operator sets FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0
+ * (or enterprise_require_signature=false in fractalsqld.conf). */
 static bool
 ent_require_signature(void)
 {
@@ -583,43 +674,39 @@ ent_require_signature(void)
     return g_ent_require_sig;
 }
 
-/* Loads FRACTALSQL_ENTERPRISE_LIB (if set) and resolves the 8 required
- * symbols, exactly once per process. Thread-safe: every read and write
- * of the load-state flags happens under the process-wide lock
- * (g_ent_loaded is a plain bool, so there is deliberately no
- * unsynchronized fast path -- a stale read would be exactly the race
- * this lock exists to prevent, and the lock is uncontended after the
- * first load anyway). MariaDB is one shared multithreaded process, so
- * this must guard against two connection threads racing their first
- * enterprise call simultaneously. Returns true iff every required
- * symbol resolved. */
+/* The signature gate: verifies the detached signature over the
+ * library's exact bytes and applies the require_signature policy.
+ *
+ * Returns true iff the library may be loaded at all. An INVALID .sig
+ * always refuses (a tampered/corrupt file, regardless of
+ * require_signature); a MISSING .sig refuses only when
+ * FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE is set. Everything else
+ * loads, unverified, and says so.
+ *
+ * On the verified path the exact bytes that were signed are handed
+ * back through out_bytes/out_len (ownership transfers to the caller,
+ * who frees them) and *out_verified is set, so the load can use those
+ * bytes rather than re-reading a path that may no longer hold what
+ * was verified. On every other path *out_verified is false and the
+ * out parameters are left untouched.
+ *
+ * The diagnostics go to stderr, the daemon's error log destination:
+ * there is no SQL-visible WARNING channel reachable from here, since
+ * this runs lazily from whichever UDF call happens to be first, not
+ * from a context with a message buffer. */
 static bool
-ensure_enterprise_lib(void)
+ent_signature_gate(const char *path,
+                   unsigned char **out_bytes,
+                   size_t *out_len,
+                   bool *out_verified)
 {
-    const char *path;
-    void       *h;
-    unsigned char    *verified_bytes = NULL;
-    size_t            verified_len   = 0;
-    ent_sig_result_t  sig;
+    ent_sig_result_t sig;
 
-    ent_lock();
-    if (g_ent_loaded) { ent_unlock(); return true; }
-    if (g_ent_attempted) { ent_unlock(); return false; }
-    g_ent_attempted = true;
-    ent_env_capture_locked();
+    if (out_verified)
+        *out_verified = false;
 
-    path = g_ent_lib;
-    if (path == NULL || path[0] == '\0') { ent_unlock(); return false; }
+    sig = ent_verify_signature(path, out_bytes, out_len);
 
-    /* Signature check before loading: an INVALID .sig always refuses (a
-     * tampered/corrupt file, regardless of require_signature). A
-     * MISSING .sig refuses only when FRACTALSQL_ENTERPRISE_REQUIRE_
-     * SIGNATURE is set; otherwise this loads unverified (logged to
-     * stderr, the daemon's error log destination: there is no SQL-visible
-     * WARNING channel reachable from here, since this runs lazily from
-     * whichever UDF call happens to be first, not from a context with a
-     * message buffer). */
-    sig = ent_verify_signature(path, &verified_bytes, &verified_len);
     if (sig == ENT_SIG_INVALID)
     {
         fprintf(stderr,
@@ -627,7 +714,6 @@ ensure_enterprise_lib(void)
                "verification -- refusing to load (the .so or its .sig "
                "does not match the expected FractalSQLabs signing key; "
                "the file may be corrupt or tampered)\n", path);
-        ent_unlock();
         return false;
     }
     if (sig == ENT_SIG_MISSING && ent_require_signature())
@@ -636,44 +722,62 @@ ensure_enterprise_lib(void)
                "fractalsql: no signature found for enterprise library "
                "\"%s\" (expected \"%s.sig\") and "
                "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE is set\n", path, path);
-        ent_unlock();
         return false;
     }
     if (sig == ENT_SIG_MISSING)
+    {
         fprintf(stderr,
                "fractalsql: no signature found for enterprise library "
                "\"%s\" -- loading unverified (set "
                "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=1 to refuse "
                "unsigned enterprise libraries)\n", path);
-
-    /* Load the exact bytes the signature was verified over (via a
-     * private temp copy), not the on-disk path, which could have been
-     * swapped between the verification read and the load. Unverified
-     * (missing-signature, soft-allowed) loads keep the previous
-     * behavior of loading the path directly: there is no verification
-     * claim for a swap to violate. */
-    if (sig == ENT_SIG_OK)
-    {
-        h = ent_dlopen_verified_copy(path, verified_bytes, verified_len);
-        free(verified_bytes);
+        return true;
     }
-    else
-        h = ent_dlopen(path);
-    if (h == NULL)
+    if (sig == ENT_SIG_IOERROR)
     {
+        /* The library (or its .sig) could not be read, so no signature
+         * could be checked over it and nothing was verified.
+         *
+         * With the signature REQUIRED, this is a refusal, exactly like
+         * a missing signature: the operator asked for "only a signed
+         * library", and an unreadable file is not a signed library.
+         * The old behaviour loaded it unverified anyway, which made
+         * the requirement a no-op for the one case where the check
+         * could not run -- a .so that is readable but whose .sig is
+         * not (an unreadable .sig, a permissions problem, a race with
+         * the operator re-signing the library) was enough to get an
+         * UNVERIFIED library loaded into a daemon whose operator had
+         * explicitly asked for verification.
+         *
+         * Without the requirement, the load is attempted anyway -- it
+         * may succeed where the read failed -- and it says so rather
+         * than passing for a verified one. */
+        if (ent_require_signature())
+        {
+            fprintf(stderr,
+                   "fractalsql: enterprise library \"%s\" could not be read "
+                   "for signature verification and the signature is "
+                   "required -- refusing to load it unverified\n", path);
+            return false;
+        }
         fprintf(stderr,
-               "fractalsql: enterprise library \"%s\" passed signature "
-               "verification but could not be loaded (dlopen failed: %s)\n",
-               path,
-#if defined(_WIN32)
-               "see GetLastError()");
-#else
-               dlerror());
-#endif
-        ent_unlock();
-        return false;
+               "fractalsql: enterprise library \"%s\" could not be read "
+               "for signature verification -- loading unverified\n", path);
+        return true;
     }
 
+    if (out_verified)
+        *out_verified = true;
+    return true;
+}
+
+/* Resolves the enterprise symbol surface: the 8 required symbols (the
+ * ledger and audit functions) and the 3 optional portfolio ones.
+ * Returns true iff every required symbol resolved; a partial library
+ * is not usable and the caller discards the handle. */
+static bool
+ent_resolve_symbols(void *h)
+{
     g_ent_ledger_flush        = (ent_ledger_void_fn)  ent_dlsym(h, "fsql_ledger_flush");
     g_ent_ledger_load         = (ent_ledger_void_fn)  ent_dlsym(h, "fsql_ledger_load");
     g_ent_ledger_compact      = (ent_ledger_void_fn)  ent_dlsym(h, "fsql_ledger_compact");
@@ -692,10 +796,91 @@ ensure_enterprise_lib(void)
     g_ent_portfolio_multimodal_pareto = (ent_portfolio_multimodal_pareto_fn)
         ent_dlsym(h, "fsql_optimize_portfolio_multimodal_pareto");
 
-    if (!g_ent_ledger_flush || !g_ent_ledger_load || !g_ent_ledger_compact ||
-        !g_ent_ledger_reset_soft || !g_ent_ledger_reset_hard ||
-        !g_ent_ledger_truth_count || !g_ent_ledger_shadow_count ||
-        !g_ent_audit_unpack)
+    return g_ent_ledger_flush && g_ent_ledger_load && g_ent_ledger_compact &&
+           g_ent_ledger_reset_soft && g_ent_ledger_reset_hard &&
+           g_ent_ledger_truth_count && g_ent_ledger_shadow_count &&
+           g_ent_audit_unpack;
+}
+
+/* Loads FRACTALSQL_ENTERPRISE_LIB (if set) and resolves the 8 required
+ * symbols, exactly once per process. Thread-safe: every read and write
+ * of the load-state flags happens under the process-wide lock
+ * (g_ent_loaded is a plain bool, so there is deliberately no
+ * unsynchronized fast path -- a stale read would be exactly the race
+ * this lock exists to prevent, and the lock is uncontended after the
+ * first load anyway). MariaDB is one shared multithreaded process, so
+ * this must guard against two connection threads racing their first
+ * enterprise call simultaneously. Returns true iff every required
+ * symbol resolved.
+ *
+ * The load is three steps: the signature gate, the load itself, and
+ * the symbol resolution. There is deliberately no separate
+ * verify-after-load step, and there does not need to be one: the
+ * verified path loads the exact bytes the signature was verified over
+ * (via a private temp copy), not the on-disk path, so the bytes that
+ * were checked and the bytes that get used are the same bytes by
+ * construction -- a time-of-check/time-of-use window cannot open
+ * between them. Unverified (missing-signature, soft-allowed) loads
+ * keep the previous behavior of loading the path directly: there is
+ * no verification claim for a swap to violate. */
+static bool
+ensure_enterprise_lib(void)
+{
+    const char *path;
+    void       *h;
+    unsigned char    *verified_bytes = NULL;
+    size_t            verified_len   = 0;
+    bool              verified        = false;
+
+    ent_lock();
+    if (g_ent_loaded) { ent_unlock(); return true; }
+    if (g_ent_attempted) { ent_unlock(); return false; }
+    g_ent_attempted = true;
+    ent_env_capture_locked();
+
+    path = g_ent_lib;
+    if (path == NULL || path[0] == '\0') { ent_unlock(); return false; }
+
+    if (!ent_signature_gate(path, &verified_bytes, &verified_len, &verified))
+    {
+        ent_unlock();
+        return false;
+    }
+
+    if (verified)
+    {
+        h = ent_dlopen_verified_copy(path, verified_bytes, verified_len);
+        free(verified_bytes);
+    }
+    else
+        h = ent_dlopen(path);
+    if (h == NULL)
+    {
+        if (verified)
+            fprintf(stderr,
+                   "fractalsql: enterprise library \"%s\" passed signature "
+                   "verification but could not be loaded (dlopen failed: %s)\n",
+                   path,
+#if defined(_WIN32)
+                   "see GetLastError()");
+#else
+                   dlerror());
+#endif
+        else
+            fprintf(stderr,
+                   "fractalsql: enterprise library \"%s\" could not be "
+                   "loaded (dlopen failed: %s)\n",
+                   path,
+#if defined(_WIN32)
+                   "see GetLastError()");
+#else
+                   dlerror());
+#endif
+        ent_unlock();
+        return false;
+    }
+
+    if (!ent_resolve_symbols(h))
     {
 #if defined(_WIN32)
         FreeLibrary((HMODULE) h);
@@ -710,6 +895,49 @@ ensure_enterprise_lib(void)
     g_ent_loaded = true;
     ent_unlock();
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Read side for the configuration surface (fractalsql_config.h).      */
+/* ------------------------------------------------------------------ */
+
+/* The effective value of one configuration key this tier owns.
+ * Returns 0 and fills `out` when the key is one this tier owns and
+ * currently holds a value for, -1 otherwise. The ledger key is a
+ * secret: the config surface redacts it before a session ever sees
+ * one, so reading it here is safe. */
+int
+fractalsql_enterprise_config_value(const char *name, char *out, size_t outcap)
+{
+    int rc = -1;
+
+    if (name == NULL || out == NULL || outcap == 0) return -1;
+    out[0] = '\0';
+
+    /* The copy happens INSIDE the lock: the value is a pointer into
+     * the tier's own config, and the provider-reload path frees
+     * exactly these strings under the same lock. A copy taken after
+     * the unlock was a use-after-free read, racing a `fsqlctl reload`
+     * on another connection thread. */
+    ent_lock();
+    ent_env_capture_locked();
+    {
+        const char *v = NULL;
+        if (strcmp(name, "enterprise_lib") == 0)             v = g_ent_lib;
+        else if (strcmp(name, "enterprise_ledger_path") == 0) v = g_ent_ledger_path;
+        else if (strcmp(name, "enterprise_ledger_key") == 0)  v = g_ent_ledger_key;
+        else if (strcmp(name, "enterprise_require_signature") == 0)
+            v = g_ent_require_sig ? "1" : "0";
+        if (v != NULL && v[0] != '\0') {
+            size_t n = strlen(v);
+            if (n > outcap - 1) n = outcap - 1;
+            memcpy(out, v, n);
+            out[n] = '\0';
+            rc = 0;
+        }
+    }
+    ent_unlock();
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -807,10 +1035,19 @@ fractalsql_enterprise_apply_provider(const struct fsq_provider_cfg *c)
     g_ent_ledger_key   = nkey;
     g_ent_require_sig  = nsig;
 
-    /* Re-arm a failed load attempt only when the library itself changed
-     * while not currently loaded: a changed path (or a newly provided
-     * one) deserves a fresh load attempt on the next enterprise call. */
-    if (lib_changed && !g_ent_loaded)
+    /* Re-arm a failed load attempt whenever the library is not loaded.
+     * A RELOAD is the operator saying "try again": the file at the
+     * configured path may have been replaced in place since the last
+     * attempt (the common case -- the library is installed, or
+     * re-signed, without its path changing), and the old rule only
+     * re-armed when the PATH STRING changed, so a failed load was
+     * permanent for the life of the process: every later enterprise
+     * call returned "not loaded" with no way out but a daemon
+     * restart. Nothing is at risk in re-arming: a failed attempt
+     * leaves no handle, no resolved symbols and no state behind, and
+     * a load that SUCCEEDS latches g_ent_loaded, so this cannot
+     * un-load anything. */
+    if (!g_ent_loaded)
         g_ent_attempted = false;
     ent_unlock();
     return 0;
@@ -829,6 +1066,43 @@ oom:
 #define LEDGER_MAGIC_LEN 8
 #define LEDGER_VERSION   1
 #define LEDGER_HASH_LEN  32
+
+/* The largest blob a ledger record may hold.
+ *
+ * The on-disk length field is a uint32_t, so a record header can CLAIM
+ * up to 4 GiB -- and the READ path has to be able to trust the length
+ * it reads, because two things downstream of it are sized from that
+ * number:
+ *
+ *   - the blob itself is malloc'd at the claimed length, and
+ *   - the hash-recomputation buffer is sized
+ *     LEDGER_HASH_LEN + blob_len + (has_mac ? LEDGER_HASH_LEN : 0).
+ *
+ * That second expression is the sharper edge: LEDGER_HASH_LEN is an int
+ * literal and blob_len is a uint32_t, so the whole sum is evaluated in
+ * 32-bit UNSIGNED arithmetic and only then widened to size_t. A claimed
+ * length near 2^32 wraps the sum around to a small number, so the
+ * allocation comes out 32 bytes while the memcpy right below it copies
+ * the claimed length into it -- a heap overflow in the daemon's own
+ * address space, on both the O(1) tip check and the full chain walk.
+ * (The WRITE path has always guarded its own copy of this arithmetic;
+ * it is the two read paths that were missing the guard.)
+ *
+ * Nothing this extension writes comes close to 64 MiB -- the QTL blobs
+ * and the decision-audit records are kilobytes at most -- so a record
+ * claiming more is a corrupt record, not a legitimate one. It is
+ * refused as such rather than being sized from. */
+#define LEDGER_MAX_BLOB_BYTES (64u * 1024u * 1024u)
+
+/* The ledger's kind tags. The engine's own semantic slots are
+ * 1=truth, 2=shadow, 3=shadow_vectors, and the decision-audit chain
+ * shares kind=2 with the shadow slot -- one file, one chain per kind,
+ * so the two never corrupt each other's hash links; they are simply
+ * two different records in the same kind's chain. The tags above 3 are
+ * headroom, not a semantic promise: a kind outside 1..LEDGER_MAX_KIND
+ * is refused (FSQL_ESTORAGE) rather than appended, so a record can
+ * never land under a tag nothing walks. */
+#define LEDGER_MAX_KIND 16
 
 typedef struct {
     uint32_t kind;
@@ -855,6 +1129,542 @@ ledger_key(void)
 {
     ent_env_capture_locked();
     return (g_ent_ledger_key && g_ent_ledger_key[0]) ? g_ent_ledger_key : NULL;
+}
+
+/* Hex-encodes a hash into `out` (LEDGER_HASH_LEN*2+1 bytes). */
+static void
+ledger_hex_encode(const uint8_t src[LEDGER_HASH_LEN], char out[LEDGER_HASH_LEN * 2 + 1])
+{
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < LEDGER_HASH_LEN; i++)
+    {
+        out[i * 2]     = hexd[(src[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hexd[src[i] & 0xF];
+    }
+    out[LEDGER_HASH_LEN * 2] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
+/* Owner-only files                                                     */
+/*                                                                       */
+/* The ledger file, its CSV mirror and the head file hold the audit      */
+/* trail itself, so they are created with mode 0600 -- owner read and    */
+/* write, nothing for the group or the world -- instead of whatever the  */
+/* process umask happens to allow, and a file that already exists with   */
+/* looser permissions is tightened to the same. Creating a file through */
+/* fopen() takes the umask, so a deployment that ran with a permissive   */
+/* umask left the audit trail readable by every account on the host.     */
+/* ------------------------------------------------------------------ */
+#if defined(_WIN32) || defined(__CYGWIN__)
+#  define LEDGER_FILE_MODE (_S_IREAD | _S_IWRITE)
+#else
+#  define LEDGER_FILE_MODE 0600
+#endif
+
+/* Opens `path` for reading or writing with owner-only permissions.
+ *
+ * `flags` is the open(2) flag set (O_RDONLY, O_RDWR, O_WRONLY|O_APPEND),
+ * `fmode` the matching stream mode for fdopen, and `create` says whether
+ * the file may be created. A file this call creates gets
+ * LEDGER_FILE_MODE; an existing file's mode is tightened to the same,
+ * so a file left behind by an older build keeps no wider permissions.
+ * Only a regular file is tightened: whatever else the path names is
+ * left exactly as it is.
+ * Returns NULL when the file cannot be opened. */
+static FILE *
+ledger_open_private(const char *path, int flags, const char *fmode, int create)
+{
+#if defined(_WIN32) || defined(__CYGWIN__)
+    int fd;
+    int oflags = flags | _O_BINARY | (create ? _O_CREAT : 0);
+    if (_sopen_s(&fd, path, oflags, _SH_DENYNO, LEDGER_FILE_MODE) != 0)
+        return NULL;
+    /* _sopen_s applies the mode only to a file it CREATES, so an
+     * existing file keeps whatever permissions it had: tighten it. */
+    {
+        struct _stat st;
+        if (_fstat(fd, &st) == 0 && (st.st_mode & _S_IFREG))
+            (void) _chmod(path, LEDGER_FILE_MODE);
+    }
+    FILE *fp = _fdopen(fd, fmode);
+    if (fp == NULL) { (void) _close(fd); return NULL; }
+    return fp;
+#else
+    int fd = open(path, flags | (create ? O_CREAT : 0), LEDGER_FILE_MODE);
+    if (fd < 0) return NULL;
+    /* Only a regular file is tightened. The configured path is not
+     * guaranteed to be one: a path that names a directory opens for
+     * reading, and taking a directory's permissions down to the
+     * ledger's file mode strips its execute bit -- after which no file
+     * inside it can be opened, by this daemon or by anyone else. */
+    {
+        struct stat st;
+        if (fstat(fd, &st) == 0)
+        {
+            if (S_ISREG(st.st_mode))
+                (void) fchmod(fd, LEDGER_FILE_MODE);
+            else if ((flags & O_ACCMODE) != O_RDONLY)
+            {
+                /* A ledger that is written must be a real file. /dev/null
+                 * accepts every write and keeps none of it, so an append
+                 * would be reported as done while the audit record is
+                 * gone; /dev/full and a directory fail only by accident of
+                 * the platform (fsync(/dev/null) fails on Linux and
+                 * succeeds on macOS). Refuse them up front. */
+                (void) close(fd);
+                errno = EINVAL;
+                return NULL;
+            }
+        }
+    }
+    FILE *fp = fdopen(fd, fmode);
+    if (fp == NULL) { (void) close(fd); return NULL; }
+    return fp;
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* The head file: how many rows each chain ever had                     */
+/*                                                                       */
+/* A hash chain cannot show that its NEWEST records were cut off the end */
+/* of the file: nothing follows the last record to disagree with it. The */
+/* head file holds, per chain kind, the number of rows that were ever   */
+/* appended to that kind -- a counter that lives OUTSIDE the chain and   */
+/* is therefore not affected by a truncation of the chain itself.       */
+/*                                                                       */
+/* The file sits next to the ledger ("<ledger>.head") and is a plain     */
+/* text file with one record per line:                                  */
+/*                                                                       */
+/*   kind=1 rows=12 mac=<64 hex digits>                                */
+/*   kind=2 rows=3                                                       */
+/*                                                                       */
+/* The MAC is an HMAC-SHA256 over "kind=<n> rows=<n>", keyed with the   */
+/* enterprise ledger key. With a key configured every head record MUST  */
+/* carry a MAC: a record without one was written before the key was set */
+/* and the verify reports that as a failure. With no key the records    */
+/* carry no MAC at all -- there is nothing to authenticate them with -- */
+/* and that missing field is how a later run WITH a key recognises a    */
+/* record that predates it.                                             */
+/*                                                                       */
+/* A head record written before the head file carried MACs is still     */
+/* read (it is the bare "<kind> <count>" pair), so an upgraded           */
+/* deployment keeps its counters; it simply has no MAC until the next   */
+/* append to that kind re-writes the record with one.                   */
+/*                                                                       */
+/* The file is replaced atomically: a temporary file is written next to */
+/* it and renamed over it, so a reader never sees a half-written head.  */
+/* ------------------------------------------------------------------ */
+#define LEDGER_HEAD_SUFFIX ".head"
+
+typedef struct {
+    int       kind;
+    long long rows;
+    int       has_mac;
+    uint8_t   mac[LEDGER_HASH_LEN];
+} ledger_head_rec_t;
+
+#define LEDGER_HEAD_MAX_RECS (LEDGER_MAX_KIND + 1)
+
+static int
+ledger_head_path(char *buf, size_t cap)
+{
+    int n = snprintf(buf, cap, "%s" LEDGER_HEAD_SUFFIX, ledger_path());
+    return n > 0 && (size_t) n < cap;
+}
+
+static int
+ledger_hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Case-insensitive comparison of two short strings. */
+static bool
+ledger_str_eq_ci(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) return a == b;
+    for (; *a && *b; a++, b++)
+    {
+        int ca = (unsigned char) *a, cb = (unsigned char) *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+        if (ca != cb) return false;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Parses one head-file record: "kind=<n> rows=<n>" with an optional
+ * " mac=<hex>" after it. A bare "<kind> <count>" pair is the form used
+ * before the head records carried MACs; it is read as a record with no
+ * MAC. Returns false when the line is not a record this build
+ * understands. */
+static bool
+ledger_head_parse(const char *line, ledger_head_rec_t *rec)
+{
+    const char *p = line;
+
+    rec->kind    = -1;
+    rec->rows    = -1;
+    rec->has_mac = 0;
+    memset(rec->mac, 0, sizeof rec->mac);
+
+    while (*p == ' ' || *p == '\t') p++;
+
+    /* The pre-MAC form: a bare "<kind> <count>" pair. */
+    if (*p >= '0' && *p <= '9')
+    {
+        char *end = NULL;
+        long k = strtol(p, &end, 10);
+        if (end == p) return false;
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p < '0' || *p > '9') return false;
+        long long c = strtoll(p, &end, 10);
+        if (end == p) return false;
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '\0' && *p != '\n' && *p != '\r') return false;
+        rec->kind = (int) k;
+        rec->rows = c;
+        return true;   /* no MAC: this record predates the ledger key */
+    }
+
+    while (*p != '\0')
+    {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '\n' || *p == '\r') break;
+
+        if (strncmp(p, "kind=", 5) == 0)
+        {
+            char *end = NULL;
+            p += 5;
+            rec->kind = (int) strtol(p, &end, 10);
+            if (end == p) return false;
+            p = end;
+        }
+        else if (strncmp(p, "rows=", 5) == 0)
+        {
+            char *end = NULL;
+            p += 5;
+            rec->rows = strtoll(p, &end, 10);
+            if (end == p) return false;
+            p = end;
+        }
+        else if (strncmp(p, "mac=", 4) == 0)
+        {
+            p += 4;
+            for (int i = 0; i < LEDGER_HASH_LEN; i++)
+            {
+                int hi = ledger_hex_value(p[i * 2]);
+                int lo = ledger_hex_value(p[i * 2 + 1]);
+                if (hi < 0 || lo < 0) return false;
+                rec->mac[i] = (uint8_t) ((hi << 4) | lo);
+            }
+            p += LEDGER_HASH_LEN * 2;
+            rec->has_mac = 1;
+        }
+        else return false;   /* an unknown field: not a record of ours */
+    }
+    return (rec->kind >= 0 && rec->rows >= 0);
+}
+
+/* Reads the head file into `recs` (at most `max` records). Returns the
+ * number of records read, or -1 when a file exists but does not parse
+ * -- a corrupt head and a missing head are different things, because a
+ * missing one means "there is no head information" while a corrupt one
+ * means the file was damaged. */
+static int
+ledger_head_read(ledger_head_rec_t *recs, int max)
+{
+    char p[4096];
+    if (!ledger_head_path(p, sizeof p)) return 0;
+
+    FILE *fp = ledger_open_private(p, O_RDONLY, "rb", 0);
+    if (fp == NULL) return 0;    /* no head file yet: nothing to compare */
+
+    int  n = 0;
+    char line[512];
+    while (n < max && fgets(line, sizeof line, fp) != NULL)
+    {
+        const char *q = line;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '\0' || *q == '\n' || *q == '\r' || *q == '#') continue;
+        if (!ledger_head_parse(line, &recs[n])) { fclose(fp); return -1; }
+        n++;
+    }
+    fclose(fp);
+    return n;
+}
+
+/* Renames `tmp` over `dst`. POSIX rename() replaces an existing file
+ * atomically; the Windows C runtime's rename() refuses to, so the
+ * platform's replace-move is used there. */
+static bool
+ledger_replace_file(const char *tmp, const char *dst)
+{
+#if defined(_WIN32) || defined(__CYGWIN__)
+    return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(tmp, dst) == 0;
+#endif
+}
+
+/* Replaces the head file with `recs`. The write goes to a temporary file
+ * next to it which is then renamed over the head, so a reader never
+ * sees a partially written file and a crash cannot leave a head that
+ * says something the chain does not. */
+static bool
+ledger_head_write(const ledger_head_rec_t *recs, int n)
+{
+    char p[4096];
+    if (!ledger_head_path(p, sizeof p)) return false;
+
+    char tmp[4200];
+    int  tn = snprintf(tmp, sizeof tmp, "%s.tmp", p);
+    if (tn < 0 || (size_t) tn >= sizeof tmp) return false;
+
+    FILE *fp = ledger_open_private(tmp, O_WRONLY | O_TRUNC | O_CREAT, "wb", 1);
+    if (fp == NULL) return false;
+
+    bool ok = true;
+    for (int i = 0; i < n && ok; i++)
+    {
+        char mac_hex[LEDGER_HASH_LEN * 2 + 1];
+        if (recs[i].has_mac)
+        {
+            ledger_hex_encode(recs[i].mac, mac_hex);
+            ok = fprintf(fp, "kind=%d rows=%lld mac=%s\n",
+                         recs[i].kind, recs[i].rows, mac_hex) > 0;
+        }
+        else
+        {
+            ok = fprintf(fp, "kind=%d rows=%lld\n", recs[i].kind, recs[i].rows) > 0;
+        }
+    }
+    if (ok) ok = (fflush(fp) == 0);
+    if (ok)
+    {
+#if defined(_WIN32) || defined(__CYGWIN__)
+        ok = (_commit(_fileno(fp)) == 0);
+#else
+        ok = (fsync(fileno(fp)) == 0);
+#endif
+    }
+    fclose(fp);
+    if (!ok) { (void) remove(tmp); return false; }
+    if (!ledger_replace_file(tmp, p)) { (void) remove(tmp); return false; }
+    return true;
+}
+
+/* The MAC of a head record: an HMAC-SHA256 over the record's own
+ * content, keyed with the enterprise ledger key. */
+static bool
+ledger_head_mac(int kind, long long rows, const char *key,
+                uint8_t out[LEDGER_HASH_LEN])
+{
+    char msg[64];
+    int  n = snprintf(msg, sizeof msg, "kind=%d rows=%lld", kind, rows);
+    if (n < 0 || (size_t) n >= sizeof msg) return false;
+    fsql_hmac_sha256((const uint8_t *) key, strlen(key),
+                     (const uint8_t *) msg, (size_t) n, out);
+    return true;
+}
+
+/* Updates the head file after a successful append to `kind`.
+ *
+ * `chain_rows` is the number of records of this kind the chain held
+ * BEFORE the append, so the record just written is number chain_rows+1.
+ * The counter in the head file never goes down: it counts the rows that
+ * were EVER appended, so a chain that was truncated cannot pull the
+ * counter down with it and hide the truncation.
+ *
+ * Returns the row count the head file now records for `kind`, or -1
+ * when the head file could not be updated (in which case the count it
+ * would have recorded is still returned, so the caller can publish it). */
+static long long
+ledger_head_update(int kind, long long chain_rows)
+{
+    char p[4096];
+    if (!ledger_head_path(p, sizeof p)) return -1;
+
+    ledger_head_rec_t recs[LEDGER_HEAD_MAX_RECS];
+    int n = ledger_head_read(recs, LEDGER_HEAD_MAX_RECS);
+    if (n < 0)
+    {
+        /* A head file that does not parse is replaced: the chain is the
+         * authoritative store and the head file is derived from it. */
+        n = 0;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < n; i++) if (recs[i].kind == kind) { slot = i; break; }
+    if (slot < 0)
+    {
+        if (n >= LEDGER_HEAD_MAX_RECS) return -1;
+        slot = n++;
+        recs[slot].kind    = kind;
+        recs[slot].rows    = 0;
+        recs[slot].has_mac = 0;
+        memset(recs[slot].mac, 0, sizeof recs[slot].mac);
+    }
+
+    long long rows = recs[slot].rows;
+    if (chain_rows + 1 > rows) rows = chain_rows + 1;
+    recs[slot].rows = rows;
+
+    const char *key = ledger_key();
+    if (key != NULL)
+    {
+        uint8_t mac[LEDGER_HASH_LEN];
+        if (ledger_head_mac(kind, rows, key, mac))
+        {
+            memcpy(recs[slot].mac, mac, LEDGER_HASH_LEN);
+            recs[slot].has_mac = 1;
+        }
+    }
+    else
+    {
+        /* No key: the record carries no MAC. A later run WITH a key has
+         * to be able to tell that this record predates the key, and a
+         * missing MAC field is how it says so. */
+        recs[slot].has_mac = 0;
+        memset(recs[slot].mac, 0, sizeof recs[slot].mac);
+    }
+
+    if (!ledger_head_write(recs, n))
+        fprintf(stderr, "fractalsql-ledger: could not update the head file %s\n", p);
+    return rows;
+}
+
+/* Checks the head file against the chain that was just walked.
+ *
+ * Returns NULL when everything agrees, or the reason the verify fails.
+ *
+ * A head file that does not exist, or that has no record for this kind,
+ * is not a failure: there is no head information to compare against
+ * (a ledger written before the head file existed). A record that IS
+ * there has to be right: with a key configured its MAC must be present
+ * and must match its own contents -- a head record edited by hand does
+ * not. The row count it claims is compared with the chain by the
+ * caller. */
+static const char *
+ledger_head_check(int kind)
+{
+    ledger_head_rec_t recs[LEDGER_HEAD_MAX_RECS];
+    int n = ledger_head_read(recs, LEDGER_HEAD_MAX_RECS);
+    if (n < 0) return "the head file is corrupt or was edited by hand";
+
+    const ledger_head_rec_t *rec = NULL;
+    for (int i = 0; i < n; i++) if (recs[i].kind == kind) { rec = &recs[i]; break; }
+    if (rec == NULL) return NULL;
+
+    const char *key = ledger_key();
+    if (key != NULL)
+    {
+        if (!rec->has_mac)
+            return "the head record has no MAC (it was written before the ledger key was set)";
+        uint8_t mac[LEDGER_HASH_LEN];
+        if (!ledger_head_mac(rec->kind, rec->rows, key, mac))
+            return "the head record's MAC could not be computed";
+        if (CRYPTO_memcmp(mac, rec->mac, LEDGER_HASH_LEN) != 0)
+            return "the head record's MAC does not match its contents (the head was edited by hand)";
+    }
+    return NULL;
+}
+
+static void
+ledger_head_clear(void)
+{
+    char p[4096];
+    ent_lock();
+    if (ledger_head_path(p, sizeof p)) remove(p);
+    ent_unlock();
+}
+
+/* The recorded high-water row count for one kind (0 when none). Caller holds the ledger lock. */
+static long long
+ledger_head_get(uint32_t kind)
+{
+    ledger_head_rec_t recs[LEDGER_HEAD_MAX_RECS];
+    int n;
+    if (kind < 1 || kind > LEDGER_MAX_KIND) return 0;
+    n = ledger_head_read(recs, LEDGER_HEAD_MAX_RECS);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++)
+        if (recs[i].kind == (int) kind) return recs[i].rows;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* The anchor log                                                       */
+/*                                                                       */
+/* A chain cannot show that its newest records were cut off the end, so */
+/* an operator can have the daemon publish the chain's state to a place  */
+/* whose administrator cannot rewrite it. FSQL_LEDGER_ANCHOR_LOG picks  */
+/* the sink: off (the default), stderr or syslog. Exactly one JSON line  */
+/* is published per append:                                           */
+/*                                                                       */
+/*   {"event":"ledger_head","kind":2,"rows":7,"hash":"<64 hex digits>"}  */
+/*                                                                       */
+/* where `kind` is the chain kind, `rows` is the number of rows the    */
+/* head file records for that kind, and `hash` is the newest entry hash */
+/* of that chain -- the value the chain's next record links to. Nothing */
+/* is published while the anchor log is off.                            */
+/* ------------------------------------------------------------------ */
+#define LEDGER_ANCHOR_OFF    0
+#define LEDGER_ANCHOR_STDERR 1
+#define LEDGER_ANCHOR_SYSLOG 2
+
+static int
+ledger_anchor_mode(void)
+{
+    /* Read once and cached: the sink is a process-wide decision, and the
+     * append path must not call getenv() for every record it writes. */
+    static int cached = -1;
+    if (cached < 0)
+    {
+        cached = LEDGER_ANCHOR_OFF;
+        const char *e = getenv("FSQL_LEDGER_ANCHOR_LOG");
+        if (e != NULL && e[0] != '\0')
+        {
+            if (ledger_str_eq_ci(e, "stderr"))      cached = LEDGER_ANCHOR_STDERR;
+            else if (ledger_str_eq_ci(e, "syslog")) cached = LEDGER_ANCHOR_SYSLOG;
+        }
+    }
+    return cached;
+}
+
+static void
+ledger_anchor_publish(int kind, long long rows,
+                       const uint8_t entry_hash[LEDGER_HASH_LEN])
+{
+    int mode = ledger_anchor_mode();
+    if (mode == LEDGER_ANCHOR_OFF) return;
+
+    char hash_hex[LEDGER_HASH_LEN * 2 + 1];
+    ledger_hex_encode(entry_hash, hash_hex);
+
+    char line[256];
+    int  n = snprintf(line, sizeof line,
+                      "{\"event\":\"ledger_head\",\"kind\":%d,\"rows\":%lld,\"hash\":\"%s\"}",
+                      kind, rows, hash_hex);
+    if (n < 0 || (size_t) n >= sizeof line) return;
+
+    if (mode == LEDGER_ANCHOR_SYSLOG)
+    {
+#ifndef _WIN32
+        syslog(LOG_INFO, "%s", line);
+        return;
+#else
+        /* No system logger on this platform: the line goes to standard
+         * error rather than being dropped. */
+#endif
+    }
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -939,26 +1749,18 @@ ledger_b64_len(size_t len)
     return ((len + 2) / 3) * 4;
 }
 
-static void
-ledger_hex_encode(const uint8_t src[LEDGER_HASH_LEN], char out[LEDGER_HASH_LEN * 2 + 1])
-{
-    static const char hexd[] = "0123456789abcdef";
-    for (int i = 0; i < LEDGER_HASH_LEN; i++)
-    {
-        out[i * 2]     = hexd[(src[i] >> 4) & 0xF];
-        out[i * 2 + 1] = hexd[src[i] & 0xF];
-    }
-    out[LEDGER_HASH_LEN * 2] = '\0';
-}
-
-/* Counts existing lines in the CSV mirror (0 if it doesn't exist yet),
- * used to assign the next row's `id`. A plain line count, not a
- * per-kind count: `id` is a single sequence shared by kind=1 and kind=2
- * rows, not two independent per-kind sequences. */
+/* Counts existing lines in the CSV mirror (0 if it doesn't exist yet).
+ * Used as a FLOOR on the row's id: the chain's own record count is the
+ * id's source of truth (see ledger_csv_append), but a mirror that is
+ * ahead of the chain -- a torn-tail repair discarded a chain record the
+ * mirror still has a row for -- must not hand out an id the mirror has
+ * already used. A plain line count, not a per-kind count: `id` is a
+ * single sequence shared by kind=1 and kind=2 rows, not two independent
+ * per-kind sequences. */
 static long long
 ledger_csv_next_id(const char *path)
 {
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = ledger_open_private(path, O_RDONLY, "rb", 0);
     if (fp == NULL) return 1;
     long long n = 0;
     int c;
@@ -968,13 +1770,21 @@ ledger_csv_next_id(const char *path)
 }
 
 /* Best-effort: appends one CSV row. Never fails the caller's flush --
- * see this section's header comment. */
+ * see this section's header comment.
+ *
+ * `id` is the row's position in the chain (the authoritative binary
+ * store), NOT a line count of this mirror file. The CSV write is
+ * best-effort and can fail on its own (a full disk, a path the daemon
+ * cannot write) while the binary append has already succeeded, so
+ * counting mirror lines would drift from the chain and could repeat an
+ * id. The chain's own record count is the source of truth for the id
+ * whether or not the mirror kept up. */
 static void
 ledger_csv_append(uint32_t kind, const void *payload, size_t len,
                   bool has_mac, const uint8_t mac[LEDGER_HASH_LEN],
                   const uint8_t prev_hash[LEDGER_HASH_LEN],
                   const uint8_t entry_hash[LEDGER_HASH_LEN],
-                  int64_t updated)
+                  int64_t updated, long long chain_records)
 {
     const char *csv_path = ledger_csv_path();
     if (csv_path == NULL) return;
@@ -990,9 +1800,19 @@ ledger_csv_append(uint32_t kind, const void *payload, size_t len,
     ledger_hex_encode(entry_hash, hash_hex);
     if (has_mac) ledger_hex_encode(mac, mac_hex); else mac_hex[0] = '\0';
 
-    long long next_id = ledger_csv_next_id(csv_path);
+    /* The chain's record count is the row's id. It is the position this
+     * record occupies in the authoritative store, and it is what the
+     * mirror's ORDER BY id is meant to reproduce. The mirror's own line
+     * count is a floor on it: a mirror left ahead of the chain (a
+     * torn-tail repair discarded a chain record the mirror still has a
+     * row for) must not hand out an id it has already used. */
+    long long next_id = chain_records + 1;
+    {
+        long long mirror_next = ledger_csv_next_id(csv_path);
+        if (mirror_next > next_id) next_id = mirror_next;
+    }
 
-    FILE *fp = fopen(csv_path, "ab");
+    FILE *fp = ledger_open_private(csv_path, O_WRONLY | O_APPEND, "ab", 1);
     if (fp != NULL)
     {
         fprintf(fp, "%lld,%u,%s,%s,%s,%s,0,%lld\n",
@@ -1048,7 +1868,7 @@ static FILE *
 ledger_open_for_read(bool *bad_header)
 {
     *bad_header = false;
-    FILE *fp = fopen(ledger_path(), "rb");
+    FILE *fp = ledger_open_private(ledger_path(), O_RDONLY, "rb", 0);
     if (fp == NULL) return NULL;
 
     char magic[LEDGER_MAGIC_LEN];
@@ -1071,11 +1891,23 @@ ledger_open_for_read(bool *bad_header)
  * per call is the simplest correct implementation; an index isn't worth
  * the complexity yet. Frees discarded candidates itself. Returns 0 on a
  * clean scan (have_latest/have_prior report what was found), -1 on a
- * corrupt/truncated file. */
+ * corrupt/truncated file.
+ *
+ * *out_records, when not NULL, receives the number of records the scan
+ * walked over -- ALL of them, not just the ones of `want_kind`. That is
+ * the chain's own record count, i.e. the 1-based position the next
+ * appended record will occupy, and it is what the CSV mirror's `id`
+ * column is derived from (see ledger_csv_append).
+ *
+ * *out_kind_records, when not NULL, receives the number of records of
+ * `want_kind` alone -- the chain's row count for that kind, which is
+ * what the head file records (see ledger_head_update). */
 static int
 ledger_scan_latest_two(FILE *fp, uint32_t want_kind,
                        ledger_record_t *latest, bool *have_latest,
-                       ledger_record_t *prior,  bool *have_prior)
+                       ledger_record_t *prior,  bool *have_prior,
+                       long long *out_records,
+                       long long *out_kind_records)
 {
     *have_latest = false;
     *have_prior  = false;
@@ -1086,6 +1918,8 @@ ledger_scan_latest_two(FILE *fp, uint32_t want_kind,
      * real reads of uninitialized memory all the same. */
     memset(latest, 0, sizeof *latest);
     memset(prior,  0, sizeof *prior);
+    long long records = 0;
+    long long kind_records = 0;
 
     for (;;)
     {
@@ -1095,18 +1929,26 @@ ledger_scan_latest_two(FILE *fp, uint32_t want_kind,
         int      hr = ledger_read_record_header(fp, &kind, &blen, &has_mac, &sealed,
                                                 mac, prev, hash, &updated);
         if (hr == 0) break;
-        if (hr < 0) return -1;
+        if (hr < 0) goto fail;
+        records++;   /* a complete record header: the chain grows by one */
 
         uint8_t *blob = NULL;
         if (blen > 0)
         {
+            /* The claimed length is checked BEFORE it sizes anything:
+             * see LEDGER_MAX_BLOB_BYTES for why an unchecked length
+             * from the file is a heap overflow, not just a big
+             * allocation. A record that claims an implausible length
+             * is a corrupt record, and the scan says so. */
+            if (blen > LEDGER_MAX_BLOB_BYTES) goto fail;
             blob = (uint8_t *) malloc(blen);
-            if (blob == NULL) return -1;
-            if (fread(blob, 1, blen, fp) != blen) { free(blob); return -1; }
+            if (blob == NULL) goto fail;
+            if (fread(blob, 1, blen, fp) != blen) { free(blob); goto fail; }
         }
 
         if (kind == want_kind)
         {
+            kind_records++;
             if (*have_prior) free(prior->blob);
             *prior      = *latest;
             *have_prior = *have_latest;
@@ -1127,7 +1969,23 @@ ledger_scan_latest_two(FILE *fp, uint32_t want_kind,
             free(blob);
         }
     }
+    if (out_records) *out_records = records;
+    if (out_kind_records) *out_kind_records = kind_records;
     return 0;
+
+fail:
+    /* A scan that gives up must not keep what it read. The two blob
+     * buffers belong to the two records this scan was tracking, and
+     * every caller returns immediately on rc < 0 -- so without this,
+     * each aborted scan leaked up to 2 x LEDGER_MAX_BLOB_BYTES. The
+     * paths that reach here are the ordinary ones for a corrupt tail
+     * (a crash mid-append) and they are walked again by every later
+     * read and verify, in a process that never restarts. */
+    free(latest->blob); latest->blob = NULL;
+    free(prior->blob);  prior->blob  = NULL;
+    *have_latest = false;
+    *have_prior  = false;
+    return -1;
 }
 
 /* Diagnostics for the ledger write path: the UDF layer collapses every
@@ -1179,6 +2037,13 @@ ledger_repair_torn_tail(void)
 
         if (blen > 0)
         {
+            /* An implausible length is treated as a torn tail, the same
+             * as a blob that reads short: the record cannot be parsed,
+             * so the chain ends before it and the file is truncated
+             * there. (The alternative -- refusing the file outright --
+             * would leave the ledger permanently unwritable, since the
+             * write path only ever repairs a torn tail.) */
+            if (blen > LEDGER_MAX_BLOB_BYTES) { torn_at = rec_start; break; }
             uint8_t *blob = (uint8_t *) malloc(blen);
             if (blob == NULL) { fclose(fp); return false; }
             if (fread(blob, 1, blen, fp) != blen) { free(blob); torn_at = rec_start; break; }
@@ -1195,13 +2060,13 @@ ledger_repair_torn_tail(void)
          * file for good. Reopen read-write for the truncate. */
         fclose(fp);
 #if defined(_WIN32) || defined(__CYGWIN__)
-        FILE *wr = fopen(ledger_path(), "r+b");
+        FILE *wr = ledger_open_private(ledger_path(), O_RDWR, "r+b", 0);
         if (wr == NULL) return false;
         int rc = _chsize(_fileno(wr), torn_at);
         int werr = errno;
         fclose(wr);
 #else
-        FILE *wr = fopen(ledger_path(), "r+b");
+        FILE *wr = ledger_open_private(ledger_path(), O_RDWR, "r+b", 0);
         if (wr == NULL) return false;
         int rc = ftruncate(fileno(wr), torn_at);
         int werr = errno;
@@ -1225,22 +2090,138 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
                    const void *payload, size_t len)
 {
     (void) user;
+
+    /* The kind must be one the ledger knows. The engine's own semantic
+     * slots are 1=truth, 2=shadow, 3=shadow_vectors, and the
+     * decision-audit chain shares kind=2 with the shadow slot; the
+     * bound above those is headroom, not a semantic promise. A kind
+     * outside it is REFUSED (FSQL_ESTORAGE) rather than appended: a
+     * record under a tag nothing reads is a record the verifier will
+     * never walk and the operator will never find, and an unbounded
+     * tag range is a way for a caller to grow the per-thread read
+     * slots without limit. */
+    if (kind < 1 || kind > LEDGER_MAX_KIND)
+    {
+        ledger_log_exit("kind out of range");
+        return FSQL_ESTORAGE;
+    }
+
     /* The record header stores the blob length as uint32_t: a silent
      * truncation here would write a record whose header undersells its
      * own bytes (an instant chain brick for every later reader). No
      * current caller can reach this (packet caps bound len far below
-     * 4 GiB), but this is an exported seam -- fail loudly instead. */
+     * 4 GiB), but this is an exported seam -- fail loudly instead.
+     *
+     * WHY 0xFFFFFFFFu AND NOT 0x7fffffffu: the threshold is the
+     * format's own limit -- the on-disk record header's length field
+     * is a uint32_t, so a length above 2^32-1 simply cannot be
+     * represented in the record this function is about to write. It
+     * is NOT an `int`-truncation bound (0x7fffffffu is what a
+     * signed-`int` blob length would force, and there is
+     * no such call on this path).
+     *
+     * AND WHY THIS CHECK MUST STAY WHERE IT IS: this bound is
+     * evaluated at the ENTRY of ledger_write_entry, strictly BEFORE
+     * the `buflen = LEDGER_HASH_LEN + len + (have_mac ? LEDGER_HASH_LEN
+     * : 0)` arithmetic further down. That ordering is the whole
+     * invariant. The buflen expression is what sizes the malloc that
+     * the three memcpy() calls below write into, so a `len` large
+     * enough to wrap `buflen` around size_t's range would UNDERSIZE
+     * the allocation relative to the bytes actually copied into it --
+     * a heap overflow, in the exact place where a ledger record is
+     * being hashed. Checking the bound after the arithmetic would
+     * check a number that had already wrapped. The 64-bit daemon
+     * cannot wrap buflen at len <= 0xFFFFFFFF, but the SIZE_MAX
+     * guard below keeps the intent explicit (and true) if the code
+     * ever grows a 32-bit build, where it would otherwise be
+     * load-bearing. */
     if (len > 0xFFFFFFFFu) { ledger_log_exit("oversize blob"); return FSQL_ESTORAGE; }
+    /* The writer must respect the SAME ceiling the readers enforce
+     * (LEDGER_MAX_BLOB_BYTES). A record larger than the readers will
+     * accept is worse than no record at all: the next append's scan
+     * refuses the file, the repair path classifies the oversized
+     * record as a torn tail and truncates the ledger AT IT -- so the
+     * record just written is silently destroyed while the CSV mirror
+     * keeps its row, and the two stores diverge for good. Refusing the
+     * write is loud, immediate, and leaves the chain intact.
+     * Nothing this extension writes comes close to the ceiling (the
+     * QTL blobs and the decision-audit records are kilobytes at most),
+     * so this bounds the writer to the same contract the reader has
+     * always had. */
+    if (len > LEDGER_MAX_BLOB_BYTES)
+    {
+        ledger_log_exit("oversize blob");
+        return FSQL_ESTORAGE;
+    }
+    /* The second half of the same invariant, stated in the units the
+     * buflen arithmetic actually uses: the total buffer size must be
+     * representable. On a 64-bit size_t this can never fail given the
+     * bound above; on a 32-bit size_t it is the difference between a
+     * clean rejection and a wrapped allocation size. */
+    if (len > SIZE_MAX - 2 * (size_t) LEDGER_HASH_LEN)
+    {
+        ledger_log_exit("oversize blob");
+        return FSQL_ESTORAGE;
+    }
 
     ent_lock();
 
-    FILE *fp = fopen(ledger_path(), "r+b");
+    FILE *fp = ledger_open_private(ledger_path(), O_RDWR, "r+b", 0);
     bool  is_new = false;
     if (fp == NULL)
     {
-        fp = fopen(ledger_path(), "w+b");
+        fp = ledger_open_private(ledger_path(), O_RDWR, "r+b", 1);
         if (fp == NULL) { ledger_log_exit("open new ledger"); ent_unlock(); return FSQL_ESTORAGE; }
         is_new = true;
+    }
+    else
+    {
+        /* A ZERO-LENGTH file is not a corrupt ledger: it is a ledger
+         * that was created but never got its header (a crash between
+         * the create and the first append, an operator's `touch`, a
+         * copy that lost the tail). There is no chain in it to lose,
+         * so the header is written here and the file becomes a
+         * normal, empty ledger. Without this, one zero-byte file
+         * bricked the ledger PERMANENTLY: the file existed, so the
+         * "r+b" open above succeeded and the read path below saw a
+         * file with no magic and refused every append -- and the
+         * operator's only way out was to delete the file, and with it
+         * the whole chain. A NON-EMPTY file with a bad header is
+         * still refused below: it holds data this build cannot read,
+         * and overwriting it would destroy it. */
+        long sz = -1L;
+        if (fseek(fp, 0, SEEK_END) == 0) sz = ftell(fp);
+        if (sz == 0) is_new = true;
+        /* The ledger is append-only (a hash chain cannot lose a row
+         * without breaking), so it is bounded by size instead.
+         * FRACTALSQL_LEDGER_MAX_BYTES (default 1 GiB; 0 = unbounded) is the size
+         * past which appends are refused; the operator archives the file and
+         * starts a new chain. */
+        {
+            const char *mx = getenv("FRACTALSQL_LEDGER_MAX_BYTES");
+            long long cap = 1073741824LL;
+            if (mx != NULL && mx[0] != '\0')
+            {
+                char *endp = NULL;
+                long long v = strtoll(mx, &endp, 10);
+                if (endp != NULL && *endp == '\0' && v >= 0) cap = v;
+            }
+            if (cap > 0 && sz >= 0 && (long long) sz >= cap)
+            {
+                fclose(fp); ledger_log_exit("ledger full (FRACTALSQL_LEDGER_MAX_BYTES)");
+                ent_unlock(); return FSQL_ESTORAGE;
+            }
+        }
+        /* Seek back to the start: the header check below reads the
+         * magic at the CURRENT position, and fopen left it at 0.
+         * Measuring the size moved it to the end, where the magic
+         * read finds the file's tail -- so every write to an existing
+         * ledger was refused as a "bad ledger header", and the ledger
+         * stopped accepting records entirely. */
+        if (fseek(fp, 0, SEEK_SET) != 0)
+        {
+            fclose(fp); ledger_log_exit("seek ledger"); ent_unlock(); return FSQL_ESTORAGE;
+        }
     }
 
     if (is_new)
@@ -1270,8 +2251,11 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
 
     ledger_record_t latest, prior;
     bool have_latest = false, have_prior = false;
+    long long chain_records = 0;   /* the chain's own record count */
+    long long kind_records = 0;    /* the chain's row count for THIS kind */
     if (ledger_scan_latest_two(fp, (uint32_t) kind, &latest, &have_latest,
-                               &prior, &have_prior) < 0)
+                               &prior, &have_prior, &chain_records,
+                               &kind_records) < 0)
     {
         /* The scan failed: most likely a torn tail from a crash or
          * power loss mid-append. Repair (truncate the partial final
@@ -1280,7 +2264,7 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
         fclose(fp);
         if (!ledger_repair_torn_tail())
             { ledger_log_exit("torn-tail repair"); ent_unlock(); return FSQL_ESTORAGE; }
-        fp = fopen(ledger_path(), "r+b");
+        fp = ledger_open_private(ledger_path(), O_RDWR, "r+b", 0);
         if (fp == NULL)
             { ledger_log_exit("reopen after repair"); ent_unlock(); return FSQL_ESTORAGE; }
         /* Re-position past the file header: a fresh fopen starts at
@@ -1300,7 +2284,8 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
             }
         }
         if (ledger_scan_latest_two(fp, (uint32_t) kind, &latest, &have_latest,
-                                   &prior, &have_prior) < 0)
+                                   &prior, &have_prior, &chain_records,
+                                   &kind_records) < 0)
         {
             fclose(fp); ledger_log_exit("rescan after repair"); ent_unlock(); return FSQL_ESTORAGE;
         }
@@ -1345,7 +2330,7 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
      * process-internal writers are already serialized by the lock held
      * across this whole function.) */
     fclose(fp);
-    fp = fopen(ledger_path(), "ab");
+    fp = ledger_open_private(ledger_path(), O_WRONLY | O_APPEND, "ab", 1);
     if (fp == NULL) { ledger_log_exit("open ledger for append"); ent_unlock(); return FSQL_ESTORAGE; }
 
     uint32_t kind32     = (uint32_t) kind;
@@ -1386,8 +2371,17 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
     fclose(fp);
 
     if (ok)
+    {
         ledger_csv_append(kind32, payload, len, have_mac, mac_field,
-                          prev_hash, entry_hash, updated);
+                          prev_hash, entry_hash, updated, chain_records);
+        /* One more row appended to THIS kind. (kind_records counts this
+         * kind alone, so the record just written is number
+         * kind_records+1 -- which is what the head file now records and
+         * what the anchor log publishes.) */
+        long long head_rows = ledger_head_update(kind, kind_records);
+        if (head_rows < 0) head_rows = kind_records + 1;
+        ledger_anchor_publish(kind, head_rows, entry_hash);
+    }
 
     ent_unlock();
     return ok ? FSQL_OK : FSQL_ESTORAGE;
@@ -1397,18 +2391,27 @@ ledger_write_entry(fsql_storage_user_ctx user, int kind,
  * implementation owns; the engine never frees". MariaDB has no automatic
  * memory reclamation for this, so this keeps one outstanding buffer
  * alive per calling thread (freed at the START of that thread's next
- * read_entry call, or at thread exit) rather than leaking one buffer
- * per call -- a bounded, per-thread single-slot cache, not a real free,
- * matching the contract's letter (the engine itself never has to free
- * it). Per-thread, not process-global: the consumer decodes the buffer
+ * read_entry call for the SAME kind) rather than leaking one buffer
+ * per call -- a bounded, per-thread cache, not a real free, matching
+ * the contract's letter (the engine itself never has to free it).
+ * Per-thread, not process-global: the consumer decodes the buffer
  * AFTER this function returns and after the lock is dropped, so a
  * shared slot would let a second connection's read free the first
  * connection's buffer mid-decode (heap corruption in the daemon
- * process). */
+ * process).
+ *
+ * One slot PER KIND, not one slot for the thread: the engine loads the
+ * ledgers by reading each kind and decoding what it read, and a ledger
+ * load touches more than one kind (the truth chain and the shadow
+ * chain). With a single slot, reading the second kind freed the first
+ * kind's buffer -- and the decode of the first kind then read freed
+ * memory. A per-kind slot keeps every kind's buffer alive until that
+ * same kind is read again. */
+#define LEDGER_READ_SLOTS (LEDGER_MAX_KIND + 1)   /* indexed by kind */
 #if defined(_WIN32) || defined(__CYGWIN__)
-static __declspec(thread) uint8_t *t_last_read_blob = NULL;
+static __declspec(thread) uint8_t *t_last_read_blob[LEDGER_READ_SLOTS];
 #else
-static __thread uint8_t *t_last_read_blob = NULL;
+static __thread uint8_t *t_last_read_blob[LEDGER_READ_SLOTS];
 #endif
 
 static int
@@ -1418,6 +2421,12 @@ ledger_read_entry(fsql_storage_user_ctx user, int kind,
     (void) user;
     *payload_out = NULL;
     *len_out     = 0;
+
+    /* A kind outside the ledger's range has no slot and no chain: the
+     * write path refuses it for the same reason, so refusing it here
+     * keeps the two ends of the ledger in step. */
+    if (kind < 1 || kind > LEDGER_MAX_KIND)
+        return FSQL_ESTORAGE;
 
     ent_lock();
 
@@ -1432,20 +2441,55 @@ ledger_read_entry(fsql_storage_user_ctx user, int kind,
     ledger_record_t latest, prior;
     bool have_latest = false, have_prior = false;
     int  rc = ledger_scan_latest_two(fp, (uint32_t) kind, &latest, &have_latest,
-                                     &prior, &have_prior);
+                                     &prior, &have_prior, NULL, NULL);
     fclose(fp);
 
     if (rc < 0) { ent_unlock(); return FSQL_ESTORAGE; }
     if (have_prior) free(prior.blob);
     if (!have_latest) { ent_unlock(); return FSQL_ESTORAGE_UNAVAILABLE; }
 
-    free(t_last_read_blob);
-    t_last_read_blob = latest.blob;   /* transfer ownership to this thread's slot */
+    {
+        /* The slot is this kind's: the buffer the previous read of THIS
+         * kind handed out is the one that can be released. The kind is
+         * bounds-checked above, so the index is always in range, and
+         * each kind keeps its own slot so reading one kind never frees
+         * another kind's buffer. */
+        int slot = kind;
+        free(t_last_read_blob[slot]);
+        t_last_read_blob[slot] = latest.blob;   /* ownership moves to this thread's slot */
 
-    *payload_out = t_last_read_blob;
+        *payload_out = t_last_read_blob[slot];
+    }
     *len_out     = latest.blob_len;
     ent_unlock();
     return FSQL_OK;
+}
+
+/* Release this thread's per-kind read buffers.
+ *
+ * The buffer handed to the core is owned by this thread's slot: the
+ * core decodes it AFTER the callback returns, and the engine never
+ * frees it, so the slot can only be released once the thread is done
+ * with the buffer. Normally that is the next read of the SAME kind,
+ * which frees the previous one -- but a thread that reads a kind once
+ * and then ends never reaches that read.
+ *
+ * The daemon runs ONE THREAD PER CONNECTION, so without an explicit
+ * release when the connection's thread ends, every connection that
+ * read a ledger kind stranded its buffer for the life of the process:
+ * an unbounded growth that tracks the number of connections ever
+ * served, not the number alive at once.
+ *
+ * Called by the daemon when a connection's thread is done. */
+void
+fractal_enterprise_release_thread_read_buffers(void)
+{
+    int i;
+    for (i = 0; i < LEDGER_READ_SLOTS; i++)
+    {
+        free(t_last_read_blob[i]);
+        t_last_read_blob[i] = NULL;
+    }
 }
 
 static int
@@ -1472,12 +2516,50 @@ fractal_ledger_storage_vfs(void)
 bool
 fractal_enterprise_lib_loaded(void)
 {
-    return g_ent_loaded;
+    /* Under the lock: g_ent_loaded is written by ensure_enterprise_lib
+     * under it, and reading it without it is a data race (MariaDB is
+     * one shared multithreaded process, so two connections can be in
+     * this function at once while a third loads the library). The
+     * answer is a plain bool, so the only thing the lock buys is that
+     * the read is ordered against the write -- and the lock is
+     * uncontended after the first load. */
+    ent_lock();
+    bool loaded = g_ent_loaded;
+    ent_unlock();
+    return loaded;
 }
 
 int
 fractal_ledger_write_kind2(const char *json, size_t len)
 {
+    /* Redaction happens HERE, at the one place every audit record
+     * passes through: the audit UDF, the SQL agents' own audit calls
+     * and the portfolio optimizers' audit records all write through
+     * this function, so a single choke point covers all of them and
+     * nothing is redacted twice. The values handed back to the caller
+     * are the caller's own buffer and are never touched -- only the
+     * copy that is persisted changes. */
+    if (json != NULL && fsql_audit_redact_mode() != FSQL_AUDIT_REDACT_NONE)
+    {
+        char *copy = (char *) malloc(len + 1);
+        if (copy != NULL)
+        {
+            memcpy(copy, json, len);
+            copy[len] = '\0';
+            char *redacted = fsql_audit_redact_json(copy);
+            free(copy);
+            if (redacted != NULL)
+            {
+                int rc = ledger_write_entry(NULL, 2, redacted, strlen(redacted));
+                free(redacted);
+                return rc;
+            }
+            /* A payload the redactor cannot walk (it is not valid JSON)
+             * is stored as it is: the record is worth more than the
+             * redaction, and the chain's own validation decides whether
+             * such a record is acceptable. */
+        }
+    }
     return ledger_write_entry(NULL, 2, json, len);
 }
 
@@ -1513,7 +2595,7 @@ ledger_verify_latest_file(uint32_t kind)
 
     ledger_record_t latest, prior;
     bool have_latest = false, have_prior = false;
-    int  rc = ledger_scan_latest_two(fp, kind, &latest, &have_latest, &prior, &have_prior);
+    int  rc = ledger_scan_latest_two(fp, kind, &latest, &have_latest, &prior, &have_prior, NULL, NULL);
     fclose(fp);
     if (rc < 0) { ent_unlock(); return FSQL_ESTORAGE_INTEGRITY; }
     if (!have_latest) { if (have_prior) { free(prior.blob); } ent_unlock(); return FSQL_OK; }
@@ -1540,7 +2622,13 @@ ledger_verify_latest_file(uint32_t kind)
         if (result == FSQL_OK)
         {
             uint8_t  recomputed[LEDGER_HASH_LEN];
-            size_t   buflen = LEDGER_HASH_LEN + latest.blob_len + (latest.has_mac ? LEDGER_HASH_LEN : 0);
+            /* Sized in size_t arithmetic, deliberately: with an int
+             * literal and a uint32_t length the sum is computed in
+             * 32-bit UNSIGNED arithmetic and wraps (see
+             * LEDGER_MAX_BLOB_BYTES). The length itself is already
+             * bounded by the scan that produced this record. */
+            size_t   buflen = (size_t) LEDGER_HASH_LEN + (size_t) latest.blob_len
+                            + (latest.has_mac ? (size_t) LEDGER_HASH_LEN : (size_t) 0);
             uint8_t *buf    = (uint8_t *) malloc(buflen);
             if (buf == NULL)
             {
@@ -1549,7 +2637,7 @@ ledger_verify_latest_file(uint32_t kind)
             else
             {
                 memcpy(buf, latest.prev_hash, LEDGER_HASH_LEN);
-                memcpy(buf + LEDGER_HASH_LEN, latest.blob, latest.blob_len);
+                if (latest.blob_len > 0) memcpy(buf + LEDGER_HASH_LEN, latest.blob, latest.blob_len);
                 if (latest.has_mac) memcpy(buf + LEDGER_HASH_LEN + latest.blob_len, latest.mac, LEDGER_HASH_LEN);
                 fsql_sha256(buf, buflen, recomputed);
                 free(buf);
@@ -1585,7 +2673,7 @@ ledger_verify_latest_file(uint32_t kind)
 /* fractal_ledger_flush/_compact/_reset_soft/_reset_hard                */
 /*   (session_id) -> INT (0)                                           */
 /* ------------------------------------------------------------------ */
-#define ENT_LEDGER_VOID_UDF(name, fnptr)                                              \
+#define ENT_LEDGER_VOID_UDF(name, fnptr, post_ok)                                              \
 FRACTAL_EXPORT bool                                                                    \
 name##_init(UDF_INIT *initid, UDF_ARGS *args, char *message)                           \
 {                                                                                       \
@@ -1604,6 +2692,11 @@ name(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)              
 {                                                                                        \
     (void) initid;                                                                      \
     if (args->args[0] == NULL) { *is_null = 1; return 0; }                             \
+    /* Latched by fractal_lock_destructive(session_id): refuse before the */           \
+    /* enterprise core is even resolved, so Community and Enterprise      */           \
+    /* builds refuse identically.                                          */          \
+    if (fractal_session_destructive_locked(                                            \
+            (unsigned long long) *(long long *) args->args[0])) { *error = 1; return 0; } \
     if (!ensure_enterprise_lib()) { *error = 1; return 0; }                            \
     unsigned long long sid = (unsigned long long) *(long long *) args->args[0];        \
     fsql_ctx *ctx = fractal_session_acquire(sid);                                      \
@@ -1611,14 +2704,47 @@ name(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)              
     int rc = fnptr(ctx);                                                                \
     fractal_session_release(sid);                                                      \
     if (rc != FSQL_OK) { *error = 1; return 0; }                                       \
+    post_ok;                                                                            \
     *is_null = 0;                                                                       \
     return 0;                                                                           \
 }
 
-ENT_LEDGER_VOID_UDF(fractal_ledger_flush,      g_ent_ledger_flush)
-ENT_LEDGER_VOID_UDF(fractal_ledger_compact,    g_ent_ledger_compact)
-ENT_LEDGER_VOID_UDF(fractal_ledger_reset_soft, g_ent_ledger_reset_soft)
-ENT_LEDGER_VOID_UDF(fractal_ledger_reset_hard, g_ent_ledger_reset_hard)
+ENT_LEDGER_VOID_UDF(fractal_ledger_flush,      g_ent_ledger_flush,      (void) 0)
+ENT_LEDGER_VOID_UDF(fractal_ledger_compact,    g_ent_ledger_compact,    (void) 0)
+ENT_LEDGER_VOID_UDF(fractal_ledger_reset_soft, g_ent_ledger_reset_soft, ledger_head_clear())
+ENT_LEDGER_VOID_UDF(fractal_ledger_reset_hard, g_ent_ledger_reset_hard, ledger_head_clear())
+
+/* fractal_lock_destructive(session_id) -> INT (1). One-way: latches the
+ * destructive ledger UDFs (flush / compact / reset_soft / reset_hard) for that
+ * session id for the life of the process; there is no unlock. The MCP server
+ * calls it with its own connection id when FSQL_MCP_READ_ONLY=true. It works
+ * with no enterprise core loaded. The latch is keyed by the session id the
+ * caller passes, so it does not stop a caller that passes a DIFFERENT id. */
+FRACTAL_EXPORT bool
+fractal_lock_destructive_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+    if (args->arg_count != 1) {
+        SFS_INIT_ERROR(message, "fractal_lock_destructive(session_id): expected 1 argument, got %u",
+                       args->arg_count);
+        return true;
+    }
+    args->arg_type[0] = INT_RESULT;
+    initid->maybe_null = 1;
+    return false;
+}
+
+FRACTAL_EXPORT void
+fractal_lock_destructive_deinit(UDF_INIT *initid) { (void) initid; }
+
+FRACTAL_EXPORT long long
+fractal_lock_destructive(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
+{
+    (void) initid; (void) error;
+    if (args->args[0] == NULL) { *is_null = 1; return 0; }
+    fractal_session_lock_destructive((unsigned long long) *(long long *) args->args[0]);
+    *is_null = 0;
+    return 1;
+}
 
 /* fractal_ledger_load(session_id) -> INT (0). Written by hand (not via
  * ENT_LEDGER_VOID_UDF above) so it can run ledger_verify_latest_file()'s
@@ -1644,6 +2770,11 @@ fractal_ledger_load(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error
 {
     (void) initid;
     if (args->args[0] == NULL) { *is_null = 1; return 0; }
+    /* Overwrites the live in-memory ledger state, so it honours the same
+     * destructive latch as flush/compact/reset (a latched session must not
+     * be able to roll the ledger back). */
+    if (fractal_session_destructive_locked(
+            (unsigned long long) *(long long *) args->args[0])) { *error = 1; return 0; }
     if (!ensure_enterprise_lib()) { *error = 1; return 0; }
 
     if (ledger_verify_latest_file(1) != FSQL_OK) { *error = 1; return 0; }
@@ -1758,8 +2889,12 @@ fractal_ledger_verify(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     if (fp == NULL && !bad_header)
     {
+        const long long recorded = ledger_head_get(kind);
         ent_unlock();
-        out = strdup("{\"ok\":true,\"rows_verified\":0}");
+        if (recorded > 0)
+            out = strdup("{\"ok\":false,\"first_failure_id\":0,\"reason\":\"ledger file is missing but rows were recorded (wiped or replaced)\"}");
+        else
+            out = strdup("{\"ok\":true,\"rows_verified\":0}");
     }
     else if (fp == NULL)   /* bad_header */
     {
@@ -1773,6 +2908,12 @@ fractal_ledger_verify(UDF_INIT *initid, UDF_ARGS *args, char *result,
         uint8_t     prev_expected[LEDGER_HASH_LEN];
         memset(prev_expected, 0, LEDGER_HASH_LEN);
         long long   n = 0, fail_id = 0;
+        /* The record number in the FILE, counting every kind. `n` counts
+         * only the records of the kind being verified, so with a file
+         * that carries several kinds the two diverge -- and the id an
+         * operator is given has to be the one they can find in the
+         * file. */
+        long long   rec = 0;
         const char *reason = NULL;
 
         for (;;)
@@ -1783,17 +2924,28 @@ fractal_ledger_verify(UDF_INIT *initid, UDF_ARGS *args, char *result,
             int      hr = ledger_read_record_header(fp, &rkind, &blen, &has_mac, &sealed,
                                                     mac, prev, hash, &updated);
             if (hr == 0) break;
-            if (hr < 0) { reason = "truncated or corrupt record"; fail_id = n + 1; break; }
+            if (hr < 0) { reason = "truncated or corrupt record"; fail_id = rec + 1; break; }
+            rec++;
 
             uint8_t *blob = NULL;
             if (blen > 0)
             {
+                /* The claimed length is checked before it sizes the
+                 * allocation: an unchecked length from the file is a
+                 * heap overflow in the hash recomputation below, not
+                 * just a big allocation (see LEDGER_MAX_BLOB_BYTES). */
+                if (blen > LEDGER_MAX_BLOB_BYTES)
+                {
+                    reason = "record blob length out of range";
+                    fail_id = rec;
+                    break;
+                }
                 blob = (uint8_t *) malloc(blen);
                 if (blob == NULL || fread(blob, 1, blen, fp) != blen)
                 {
                     free(blob);
                     reason = "truncated blob";
-                    fail_id = n + 1;
+                    fail_id = rec;
                     break;
                 }
             }
@@ -1811,13 +2963,17 @@ fractal_ledger_verify(UDF_INIT *initid, UDF_ARGS *args, char *result,
             if (ok)
             {
                 uint8_t  recomputed[LEDGER_HASH_LEN];
-                size_t   buflen = LEDGER_HASH_LEN + blen + (has_mac ? LEDGER_HASH_LEN : 0);
+                /* size_t arithmetic on purpose: an int literal plus a
+                 * uint32_t length computes in 32-bit unsigned
+                 * arithmetic and wraps (see LEDGER_MAX_BLOB_BYTES). */
+                size_t   buflen = (size_t) LEDGER_HASH_LEN + (size_t) blen
+                                + (has_mac ? (size_t) LEDGER_HASH_LEN : (size_t) 0);
                 uint8_t *buf    = (uint8_t *) malloc(buflen);
                 if (buf == NULL) { ok = false; reason = "out of memory"; }
                 else
                 {
                     memcpy(buf, prev, LEDGER_HASH_LEN);
-                    memcpy(buf + LEDGER_HASH_LEN, blob, blen);
+                    if (blen > 0) memcpy(buf + LEDGER_HASH_LEN, blob, blen);
                     if (has_mac) memcpy(buf + LEDGER_HASH_LEN + blen, mac, LEDGER_HASH_LEN);
                     fsql_sha256(buf, buflen, recomputed);
                     free(buf);
@@ -1829,11 +2985,29 @@ fractal_ledger_verify(UDF_INIT *initid, UDF_ARGS *args, char *result,
                 { ok = false; reason = "chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)"; }
 
             free(blob);
-            if (!ok) { fail_id = n; break; }
+            if (!ok) { fail_id = rec; break; }
             memcpy(prev_expected, hash, LEDGER_HASH_LEN);
         }
         fclose(fp);
+        const long long recorded = ledger_head_get(kind);
+        /* The head file is the counter that lives OUTSIDE the chain, so
+         * it is the only thing that can tell a truncated chain from a
+         * short one. Its own MAC says the same thing about the counter:
+         * a head record edited by hand does not match its MAC. */
+        const char *head_reason = ledger_head_check((int) kind);
         ent_unlock();
+
+        if (reason == NULL && head_reason != NULL)
+        {
+            reason  = head_reason;
+            fail_id = 0;
+        }
+        /* Fewer rows than the chain has ever held: rows were removed or the file was replaced. */
+        else if (reason == NULL && n < recorded)
+        {
+            reason  = "chain holds fewer rows than were recorded (rows removed, or the ledger was replaced)";
+            fail_id = n + 1;
+        }
 
         char *buf = (char *) malloc(320);
         if (buf == NULL) { *error = 1; *is_null = 1; return NULL; }
@@ -1885,6 +3059,27 @@ ent_json_escape(const char *s, size_t len, char *out, size_t cap)
     return o;
 }
 
+/* A portable substring search over a bounded buffer. memmem() is a GNU
+ * extension that the MSVC CRT does not have, and the Windows build of the
+ * daemon links against that CRT -- so the searches below go through this
+ * one instead. Both sides are length-bounded here (the haystack is a UDF
+ * argument with a ceiling, the needle is a short literal), so the scan is
+ * linear and never reads past either end. */
+static const char *
+ent_memmem(const void *hay, size_t hay_len, const void *needle, size_t needle_len)
+{
+    const unsigned char *h = (const unsigned char *) hay;
+    const unsigned char *n = (const unsigned char *) needle;
+    size_t i;
+
+    if (needle_len == 0) return (const char *) h;
+    if (hay_len < needle_len) return NULL;
+    for (i = 0; i + needle_len <= hay_len; i++) {
+        if (h[i] == n[0] && memcmp(h + i, n, needle_len) == 0) return (const char *) (h + i);
+    }
+    return NULL;
+}
+
 /* Minimal structural JSON validation (for payload_json): enough to keep
  * malformed or deliberately spliced text out of the chain record -- one
  * well-bracketed JSON value over exactly the whole length, with no raw
@@ -1895,10 +3090,28 @@ static bool
 ent_json_well_formed(const char *s, size_t len)
 {
     char stack[64];
+    unsigned char st[65];
     int  sp = 0;
     bool in_str = false, esc = false;
-    bool after_value = false, seen_any = false;
+    bool seen_any = false;
     size_t i;
+
+    /* Per-container state. ST_EMPTY: nothing in this container yet.
+     * ST_VALUE: a value has been completed here. ST_SEP: a separator
+     * was consumed and a value is expected next.
+     *
+     * WHY NOT ONE FLAG: the old single "after_value" flag could not
+     * tell an EMPTY container from a container left dangling after a
+     * separator. A closing bracket wants a completed value -- except
+     * when the container is empty -- and the same flag served for both,
+     * so "{}" and "[]" were rejected: fractal_audit_log(type,
+     * JSON_OBJECT()) wrote nothing to the chain and returned a bare
+     * NULL, and the file's own comment claimed JSON_OBJECT() output
+     * "clears this easily". The state is per depth, so a nested
+     * container's contents no longer overwrite its parent's. */
+    enum { ST_EMPTY = 0, ST_VALUE = 1, ST_SEP = 2 };
+
+    st[0] = ST_EMPTY;   /* the document itself is the outermost container */
 
     for (i = 0; i < len; i++)
     {
@@ -1913,33 +3126,38 @@ ent_json_well_formed(const char *s, size_t len)
         }
         if (c == '"')
         {
-            if (after_value) return false;
+            if (st[sp] == ST_VALUE) return false;   /* two values, no separator */
             in_str = true;
-            after_value = true;
+            st[sp] = ST_VALUE;
             seen_any = true;
             continue;
         }
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
         if (c == '[' || c == '{')
         {
-            if (after_value) return false;
+            if (st[sp] == ST_VALUE) return false;
             if (sp >= (int) sizeof stack) return false;
             stack[sp++] = c;
+            st[sp] = ST_EMPTY;
             seen_any = true;
             continue;
         }
         if (c == ']' || c == '}')
         {
-            if (sp == 0 || !after_value) return false;
-            sp--;
-            char open = stack[sp];
+            if (sp == 0) return false;
+            /* A separator wants a value: "[1,]" and {"a":1,} are not
+             * JSON. An empty container is fine. */
+            if (st[sp] == ST_SEP) return false;
+            char open = stack[sp - 1];
             if ((c == ']' && open != '[') || (c == '}' && open != '{')) return false;
+            sp--;
+            st[sp] = ST_VALUE;   /* the closed container is a value in its parent */
             continue;
         }
         if (c == ',')
         {
-            if (sp == 0 || !after_value) return false;
-            after_value = false;
+            if (sp == 0 || st[sp] != ST_VALUE) return false;
+            st[sp] = ST_SEP;
             continue;
         }
         if (c == ':')
@@ -1954,11 +3172,11 @@ ent_json_well_formed(const char *s, size_t len)
              * key string -- every valid object was rejected, so
              * fractal_audit_log(type, JSON_OBJECT(...)) refused every
              * payload and silently wrote nothing. */
-            if (sp == 0 || !after_value) return false;
-            after_value = false;
+            if (sp == 0 || st[sp] != ST_VALUE) return false;
+            st[sp] = ST_SEP;
             continue;
         }
-        if (after_value) return false;
+        if (st[sp] == ST_VALUE) return false;
         if (c == 't' || c == 'f' || c == 'n')
         {
             const char *lit;
@@ -1968,7 +3186,7 @@ ent_json_well_formed(const char *s, size_t len)
             size_t ll = strlen(lit);
             if (len - i < ll || memcmp(s + i, lit, ll) != 0) return false;
             i += ll - 1;
-            after_value = true;
+            st[sp] = ST_VALUE;
             seen_any = true;
             continue;
         }
@@ -1995,11 +3213,11 @@ ent_json_well_formed(const char *s, size_t len)
                 if (j == ed) return false;
             }
             i = j - 1;
-            after_value = true;
+            st[sp] = ST_VALUE;
             seen_any = true;
         }
     }
-    return seen_any && !in_str && sp == 0 && after_value;
+    return seen_any && !in_str && sp == 0 && st[0] == ST_VALUE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2028,14 +3246,16 @@ ent_json_well_formed(const char *s, size_t len)
 FRACTAL_EXPORT bool
 fractal_audit_log_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-    if (args->arg_count != 2) {
+    if (args->arg_count < 2 || args->arg_count > 4) {
         SFS_INIT_ERROR(message,
-                       "fractal_audit_log(entry_type, payload_json): expected 2 arguments, got %u",
+                       "fractal_audit_log(entry_type, payload_json[, session_id[, actor]]): expected 2 to 4 arguments, got %u",
                        args->arg_count);
         return true;
     }
     args->arg_type[0] = STRING_RESULT;
     args->arg_type[1] = STRING_RESULT;
+    if (args->arg_count >= 3) args->arg_type[2] = INT_RESULT;
+    if (args->arg_count >= 4) args->arg_type[3] = STRING_RESULT;
     initid->maybe_null = 1;
     return false;
 }
@@ -2053,13 +3273,37 @@ fractal_audit_log(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
     const char *payload  = (args->args[1] != NULL) ? args->args[1] : "null";
     size_t      payload_len = (args->args[1] != NULL) ? args->lengths[1] : 4;
 
+    /* The optional third argument is the caller's session id (the
+     * engine procedures and the MCP tool pass CONNECTION_ID()). When given, the
+     * destructive latch applies to this append exactly as it does to the ledger
+     * mutators, and the optional fourth argument names the actor. A UDF cannot read
+     * the authenticated user itself, so callers that want attribution supply it;
+     * FRACTALSQL_AUDIT_REQUIRE_ACTOR=1 makes a bare two-argument call an error. */
+    const bool have_sid   = args->arg_count >= 3 && args->args[2] != NULL;
+    const bool have_actor = args->arg_count >= 4 && args->args[3] != NULL;
+    long long  sid        = have_sid ? *(long long *) args->args[2] : 0;
+    if (have_sid && fractal_session_destructive_locked((unsigned long long) sid)) { *error = 1; return 0; }
+    if (!have_sid && ent_env_flag("FRACTALSQL_AUDIT_REQUIRE_ACTOR")) { *error = 1; return 0; }
+
     /* Shape-gate both fields before they reach the chain record (see
      * the comment block above). Built-in flows pass fixed short
      * literals and JSON_OBJECT() output, which both clear this easily;
      * a session trying to splice in forged fields now fails cleanly
      * here instead of landing in the chain. */
     if (type_len > 256) { *error = 1; return 0; }
+    /* The payload is the one unbounded argument on this path, and it
+     * becomes the record's blob. Two reasons to bound it here rather
+     * than only in the writer: the "%.*s" below narrows the length to
+     * an int (a length above INT_MAX would become a negative
+     * precision, which C reads as "no precision" -- the format would
+     * then run to the next NUL instead of stopping at the length it
+     * was given), and a record this big is refused by the writer's own
+     * ceiling anyway -- so the boundary belongs at the UDF, where the
+     * caller gets a clean error instead of a late storage failure. */
+    if (payload_len > LEDGER_MAX_BLOB_BYTES) { *error = 1; return 0; }
     if (!ent_json_well_formed(payload, payload_len)) { *error = 1; return 0; }
+    /* "_actor" is reserved for the attribution block added below. */
+    if (ent_memmem(payload, payload_len, "\"_actor\"", 8) != NULL) { *error = 1; return 0; }
 
     char   esc_stack[512];
     char  *esc = esc_stack;
@@ -2068,12 +3312,61 @@ fractal_audit_log(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
     size_t esc_len = ent_json_escape(type_s, type_len, esc, esc_cap);
     if (esc_len == (size_t) -1) { if (esc != esc_stack) { free(esc); } *error = 1; return 0; }
 
-    size_t buflen = esc_len + payload_len + 32;
+    /* Attribution block: {"session":<id>,"attested":<bool>[,"actor":"..."]}. */
+    char   actor_esc_stack[512];
+    char  *actor_esc = actor_esc_stack;
+    size_t actor_esc_len = 0;
+    if (have_actor) {
+        size_t al = args->lengths[3];
+        if (al > 256) { if (esc != esc_stack) free(esc); *error = 1; return 0; }
+        size_t acap = al * 6 + 1;
+        if (acap > sizeof actor_esc_stack) {
+            actor_esc = (char *) malloc(acap);
+            if (actor_esc == NULL) { if (esc != esc_stack) free(esc); *error = 1; return 0; }
+        }
+        actor_esc_len = ent_json_escape(args->args[3], al, actor_esc, acap);
+        if (actor_esc_len == (size_t) -1) {
+            if (actor_esc != actor_esc_stack) free(actor_esc);
+            if (esc != esc_stack) free(esc);
+            *error = 1; return 0;
+        }
+    }
+    char   actor_blk[1024];
+    int    ab = snprintf(actor_blk, sizeof actor_blk, "{\"session\":%lld,\"attested\":%s%s%.*s%s}",
+                         have_sid ? sid : 0LL, have_sid ? "true" : "false",
+                         have_actor ? ",\"actor\":\"" : "", (int) actor_esc_len, have_actor ? actor_esc : "",
+                         have_actor ? "\"" : "");
+    if (actor_esc != actor_esc_stack) free(actor_esc);
+    if (ab < 0 || (size_t) ab >= sizeof actor_blk) { if (esc != esc_stack) free(esc); *error = 1; return 0; }
+
+    /* Splice the block into the entry value: before the closing brace of an object
+     * payload, or by wrapping a scalar/array payload as {"value":...,"_actor":...}.
+     * The chain document's outer {"type","entry"} shape is unchanged. */
+    const char *pb = payload, *pe = payload + payload_len;
+    while (pb < pe && (*pb == ' ' || *pb == '\t' || *pb == '\n' || *pb == '\r')) pb++;
+    while (pe > pb && (pe[-1] == ' ' || pe[-1] == '\t' || pe[-1] == '\n' || pe[-1] == '\r')) pe--;
+    const bool is_obj = (pb < pe && *pb == '{' && pe[-1] == '}');
+    bool obj_empty = false;
+    if (is_obj) {
+        const char *q = pb + 1;
+        while (q < pe - 1 && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) q++;
+        obj_empty = (q == pe - 1);
+    }
+
+    size_t buflen = esc_len + payload_len + (size_t) ab + 64;
     char  *buf = (char *) malloc(buflen);
     if (buf == NULL) { if (esc != esc_stack) { free(esc); } *error = 1; return 0; }
 
-    int n = snprintf(buf, buflen, "{\"type\":\"%.*s\",\"entry\":%.*s}",
-                     (int) esc_len, esc, (int) payload_len, payload);
+    int n;
+    if (is_obj && !obj_empty)
+        n = snprintf(buf, buflen, "{\"type\":\"%.*s\",\"entry\":%.*s,\"_actor\":%s}}",
+                     (int) esc_len, esc, (int) ((pe - 1) - pb), pb, actor_blk);
+    else if (is_obj)
+        n = snprintf(buf, buflen, "{\"type\":\"%.*s\",\"entry\":{\"_actor\":%s}}",
+                     (int) esc_len, esc, actor_blk);
+    else
+        n = snprintf(buf, buflen, "{\"type\":\"%.*s\",\"entry\":{\"value\":%.*s,\"_actor\":%s}}",
+                     (int) esc_len, esc, (int) (pe - pb), pb, actor_blk);
     if (esc != esc_stack) free(esc);
     if (n < 0 || (size_t) n >= buflen) { free(buf); *error = 1; return 0; }
 
@@ -2157,7 +3450,18 @@ fractal_audit_unpack(UDF_INIT *initid, UDF_ARGS *args, char *result,
             *is_null = 0;
             return so->buf;
         }
-        if (rc == FSQL_ETRUNCATED && need > cap && cap < (16u * 1024u * 1024u)) {
+        if (rc == FSQL_ETRUNCATED && need > cap) {
+            /* The core's "need" is as untrusted as its "success" length:
+             * taken verbatim it would size the next allocation, and
+             * `cap + 1` in the realloc above could wrap to 0 for a
+             * need near SIZE_MAX -- realloc(ptr, 0) FREES the buffer
+             * and returns NULL, leaving so->buf NULL with a huge so->cap
+             * for the next call to hand to the core. The growth is
+             * clamped to the ceiling this UDF declared in its init
+             * (16 MiB): a blob that needs more than the UDF's own
+             * max_length cannot be returned anyway, so it is a clean
+             * error rather than a giant allocation. */
+            if (need > (16u * 1024u * 1024u)) { *error = 1; return NULL; }
             cap = need;
             continue;
         }
@@ -2227,8 +3531,19 @@ ent_jsonbuf_append(ent_jsonbuf_t *jb, const char *fmt, ...)
             return true;
         }
 
-        size_t newcap = jb->cap * 2;
-        while (newcap < jb->len + (size_t) need + 1) newcap *= 2;
+        size_t want = jb->len + (size_t) need + 1;
+        size_t newcap = jb->cap ? jb->cap : 256;
+        while (newcap < want)
+        {
+            /* The doubling must be able to terminate: past SIZE_MAX/2 a
+             * further doubling wraps to 0, and "0 < want" stays true
+             * for ever -- an infinite loop inside a statement, with the
+             * connection held. Sizing straight to the requirement is
+             * the honest answer: if even that cannot be allocated, the
+             * realloc below says so. */
+            if (newcap > SIZE_MAX / 2) { newcap = want; break; }
+            newcap *= 2;
+        }
         char *nb = (char *) realloc(jb->buf, newcap);
         if (nb == NULL) return false;
         jb->buf = nb;
@@ -2271,20 +3586,36 @@ portfolio_multimodal_audit_log_best_effort(const double *mu, const double *cov,
     for (int i = 0; i < 32; i++)
         snprintf(hash_hex + i * 2, 3, "%02x", hash[i]);
 
-    size_t cap = 300 + result_len;
-    char  *js  = (char *) malloc(cap);
-    if (js == NULL) return;
-
-    int pos = snprintf(js, cap,
+    /* The record's head: everything up to the result document. 1024
+     * bytes covers it -- the widest fields are the two "%.10g"
+     * doubles and the 64-character hash. */
+    char head[1024];
+    int  hn = snprintf(head, sizeof head,
         "{\"type\":\"portfolio_optimize_multimodal\",\"entry\":{"
         "\"seed\":%lld,\"n_assets\":%zu,\"k\":%zu,\"n_restarts\":%d,"
         "\"overlap_threshold\":%.10g,\"quality_frac\":%.10g,"
-        "\"inputs_hash\":\"%s\",\"result\":%.*s}}",
-        seed, n_assets, k, n_restarts, overlap, qfrac, hash_hex,
-        (int) result_len, result_json);
-    if (pos < 0 || (size_t) pos >= cap) { free(js); return; }
+        "\"inputs_hash\":\"%s\",\"result\":",
+        seed, n_assets, k, n_restarts, overlap, qfrac, hash_hex);
+    if (hn < 0 || (size_t) hn >= sizeof head) return;
 
-    (void) fractal_ledger_write_kind2(js, (size_t) pos);
+    /* The exact record length, computed rather than ESTIMATED. The
+     * old budget was a fixed 300 bytes plus the result, but the head
+     * alone can be longer than that (the two "%.10g" doubles, the
+     * counts, the 64-character hash), so the snprintf truncated and
+     * the audit record was SILENTLY DROPPED -- the decision's
+     * provenance went missing for exactly the runs with the most
+     * interesting numbers. */
+    size_t rlen = (result_json != NULL) ? strnlen(result_json, result_len) : 0;
+    size_t cap  = (size_t) hn + rlen + 3;   /* head + result + "}}" + the NUL */
+
+    char *js = (char *) malloc(cap);
+    if (js == NULL) return;
+
+    memcpy(js, head, (size_t) hn);
+    if (rlen) memcpy(js + hn, result_json, rlen);
+    memcpy(js + hn + rlen, "}}", 3);   /* includes the NUL */
+
+    (void) fractal_ledger_write_kind2(js, (size_t) hn + rlen + 2);
     free(js);
 }
 
@@ -2355,7 +3686,14 @@ fractal_optimize_portfolio_multimodal(UDF_INIT *initid, UDF_ARGS *args, char *re
     n_restarts_arg = *(long long *) args->args[3];
     overlap        = *(double *) args->args[4];
     qfrac          = *(double *) args->args[5];
-    seed           = *(long long *) args->args[6];
+    /* Clamp instead of casting: the core's seed is a uint64_t, so a
+     * plain cast turned a negative argument into 18446744073709551615
+     * -- a value the caller never asked for. A negative seed is not a
+     * seed the core documents, so it falls back to the default. */
+    {
+        long long s = *(long long *) args->args[6];
+        seed = (s < 0) ? 0 : s;
+    }
 
     if (n_restarts_arg < 1 || n_restarts_arg > 64) { *error = 1; return NULL; }
     n_restarts = (int) n_restarts_arg;
@@ -2527,7 +3865,12 @@ fractal_optimize_portfolio_multimodal_ex(UDF_INIT *initid, UDF_ARGS *args, char 
     for (int a = 0; a < 8; a++) {           /* diffusion_mode NULL-checks below */
         if (args->args[a] == NULL) { *is_null = 1; return NULL; }
     }
-    if (!ensure_enterprise_lib() || g_ent_portfolio_multimodal == NULL) {
+    /* Either symbol satisfies this wrapper: the _ex symbol is preferred
+     * when the loaded enterprise .so has it, and the base symbol is the
+     * fallback for an older .so. Requiring the BASE symbol unconditionally
+     * refused an enterprise .so that ships only the newer one. */
+    if (!ensure_enterprise_lib() ||
+        (g_ent_portfolio_multimodal == NULL && g_ent_portfolio_multimodal_ex == NULL)) {
         *is_null = 1;
         return NULL;
     }
@@ -2540,7 +3883,11 @@ fractal_optimize_portfolio_multimodal_ex(UDF_INIT *initid, UDF_ARGS *args, char 
     n_restarts_arg = *(long long *) args->args[3];
     overlap        = *(double *) args->args[4];
     qfrac          = *(double *) args->args[5];
-    seed           = *(long long *) args->args[6];
+    /* Clamp instead of casting -- see the sibling optimizer above. */
+    {
+        long long s = *(long long *) args->args[6];
+        seed = (s < 0) ? 0 : s;
+    }
     use_obl_arg    = *(long long *) args->args[7];
     use_obl        = (use_obl_arg != 0) ? 1 : 0;
     diffusion_mode = 0;                     /* gaussian */
@@ -2682,20 +4029,34 @@ portfolio_multimodal_pareto_audit_log_best_effort(const double *mu, const double
     for (int i = 0; i < 32; i++)
         snprintf(hash_hex + i * 2, 3, "%02x", hash[i]);
 
-    size_t cap = 300 + result_len;
-    char  *js  = (char *) malloc(cap);
-    if (js == NULL) return;
-
-    int pos = snprintf(js, cap,
+    /* The record's head: everything up to the result document. 1024
+     * bytes covers it -- the widest fields are the counts and the
+     * 64-character hash. */
+    char head[1024];
+    int  hn = snprintf(head, sizeof head,
         "{\"type\":\"portfolio_optimize_multimodal_pareto\",\"entry\":{"
         "\"seed\":%lld,\"n_assets\":%zu,\"k\":%zu,\"n_restarts\":%d,"
         "\"max_front\":%d,"
-        "\"inputs_hash\":\"%s\",\"result\":%.*s}}",
-        seed, n_assets, k, n_restarts, max_front, hash_hex,
-        (int) result_len, result_json);
-    if (pos < 0 || (size_t) pos >= cap) { free(js); return; }
+        "\"inputs_hash\":\"%s\",\"result\":",
+        seed, n_assets, k, n_restarts, max_front, hash_hex);
+    if (hn < 0 || (size_t) hn >= sizeof head) return;
 
-    (void) fractal_ledger_write_kind2(js, (size_t) pos);
+    /* The exact record length, computed rather than ESTIMATED, like
+     * the two sibling auditors above. This one still budgeted a fixed
+     * 300 bytes plus the result; the head alone can exceed 300, so the
+     * snprintf truncated and the whole audit record was SILENTLY
+     * DROPPED for the widest inputs. */
+    size_t rlen = (result_json != NULL) ? strnlen(result_json, result_len) : 0;
+    size_t cap  = (size_t) hn + rlen + 3;   /* head + result + "}}" + the NUL */
+
+    char *js = (char *) malloc(cap);
+    if (js == NULL) return;
+
+    memcpy(js, head, (size_t) hn);
+    if (rlen) memcpy(js + hn, result_json, rlen);
+    memcpy(js + hn + rlen, "}}", 3);   /* includes the NUL */
+
+    (void) fractal_ledger_write_kind2(js, (size_t) hn + rlen + 2);
     free(js);
 }
 
@@ -2783,7 +4144,11 @@ fractal_optimize_portfolio_multimodal_pareto(UDF_INIT *initid, UDF_ARGS *args, c
     k              = *(long long *) args->args[2];
     n_restarts_arg = *(long long *) args->args[3];
     max_front_arg  = *(long long *) args->args[4];
-    seed           = *(long long *) args->args[5];
+    /* Clamp instead of casting -- see the sibling optimizer above. */
+    {
+        long long s = *(long long *) args->args[5];
+        seed = (s < 0) ? 0 : s;
+    }
     use_obl_arg    = *(long long *) args->args[6];
     use_obl        = (use_obl_arg != 0) ? 1 : 0;
     diffusion_mode = 0;                     /* gaussian */

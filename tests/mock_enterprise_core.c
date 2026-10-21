@@ -57,9 +57,9 @@
 /* access()/F_OK are POSIX (<unistd.h>); MSVC's CRT has no unistd.h at
  * all. <io.h>'s _access() is the direct MSVC CRT equivalent; its mode 0
  * means the same "existence only" check POSIX's F_OK does. (Confirmed
- * the same fix was needed porting this identical file to fractalsql-
- * postgresql's own gate 31 build on Windows -- that repo hit the exact
- * same cl.exe failure the first time it compiled this file there.) */
+ * the same fix was needed in an earlier Windows build of this file --
+ * it hit the exact same cl.exe failure the first time it compiled
+ * here.) */
 #if defined(_WIN32)
 #include <io.h>
 #define access _access

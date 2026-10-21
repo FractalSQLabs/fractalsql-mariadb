@@ -1,0 +1,371 @@
+# Configuration files for the daemon boot gate (build_test.sh gate 54).
+#
+# Each block is "case NAME EXPECT [conf=MODE] [key=CONTENT] [keymode=MODE]" followed by the
+# configuration file body and a line "end". EXPECT is "start" (the daemon opens its socket)
+# or "refuse" (it exits without listening). The placeholders below are replaced before use:
+#   @SOCK@ socket path   @KEY@ HMAC key file   @UID@ the invoking user's uid
+#   @DIR@  scratch dir   @LONG@ 20000 characters   @MANYKEYS@ 300 unknown keys
+#   @UIDS80@ a list of 80 uids then @UID@   @LONGSOCK@ a socket path past the sun_path limit
+# key=CONTENT replaces the key file's text (@RAND@ means 64 random hex digits).
+
+case minimal start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UID@
+end
+
+case numbers_and_log_file start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UID@
+log_file = @DIR@/daemon.log
+max_connections = 8
+idle_timeout_secs = 5
+end
+
+case comments_blanks_unknown_keys start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UID@
+# a comment
+
+   
+  max_connections   =   3  
+unknown_key = 1
+noequals
+=novalue
+end
+
+case many_unknown_keys start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UID@
+@MANYKEYS@
+end
+
+case log_file_is_a_directory start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UID@
+log_file = @DIR@
+end
+
+case every_provider_key start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UID@
+reasoning_plugin = /opt/fractalsql/plugin.so
+reasoning_url = http://127.0.0.1:1/v1
+reasoning_token = token
+reasoning_model = model
+reasoning_allow_plaintext = true
+embed_url = http://127.0.0.1:1/v1
+embed_model = embed
+think = high
+think_provider = ollama
+think_native_url = http://127.0.0.1:1
+think_num_ctx = 4096
+t2s_max_attempts = 3
+t2s_allowed_statements = select_insert_update
+t2s_use_review = on
+enterprise_lib = /opt/fractalsql/enterprise.so
+enterprise_ledger_path = /opt/fractalsql/ledger.bin
+enterprise_ledger_key = ledger-key
+enterprise_require_signature = 1
+end
+
+case max_connections_low_edge start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections = 1
+end
+case max_connections_high_edge start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections = 1024
+end
+case idle_timeout_low_edge start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+idle_timeout_secs = 1
+end
+case think_num_ctx_edge start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+think_num_ctx = 1
+end
+case t2s_max_attempts_edge start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_max_attempts = 10
+end
+case bool_spellings start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = yes
+t2s_use_review = off
+enterprise_require_signature = 0
+end
+case key_file_with_spaces_and_newlines start key=aa bb\ncc dd
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case conf_mode_640 start conf=640
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case non_canonical_absolute_path start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_plugin = /a/./b
+end
+
+case boolean_spelling_true start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = true
+t2s_use_review = true
+enterprise_require_signature = true
+end
+case boolean_spelling_false start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = false
+t2s_use_review = false
+enterprise_require_signature = false
+end
+case boolean_spelling_on start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = on
+t2s_use_review = on
+enterprise_require_signature = on
+end
+case boolean_spelling_off start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = off
+t2s_use_review = off
+enterprise_require_signature = off
+end
+case boolean_spelling_yes start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = yes
+t2s_use_review = yes
+enterprise_require_signature = yes
+end
+case boolean_spelling_no start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = no
+t2s_use_review = no
+enterprise_require_signature = no
+end
+case boolean_spelling_1 start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = 1
+t2s_use_review = 1
+enterprise_require_signature = 1
+end
+case boolean_spelling_0 start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = 0
+t2s_use_review = 0
+enterprise_require_signature = 0
+end
+case boolean_spelling_TRUE start
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_allow_plaintext = TRUE
+t2s_use_review = TRUE
+enterprise_require_signature = TRUE
+end
+
+case max_connections_zero refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections = 0
+end
+case max_connections_negative refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections = -1
+end
+case max_connections_text refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections = abc
+end
+case max_connections_too_high refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections = 1025
+end
+case max_connections_empty refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+max_connections =
+end
+case idle_timeout_zero refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+idle_timeout_secs = 0
+end
+case idle_timeout_negative refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+idle_timeout_secs = -1
+end
+case idle_timeout_text refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+idle_timeout_secs = abc
+end
+case think_num_ctx_zero refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+think_num_ctx = 0
+end
+case think_num_ctx_text refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+think_num_ctx = abc
+end
+case think_num_ctx_fraction refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+think_num_ctx = 1.5
+end
+case think_num_ctx_overflow refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+think_num_ctx = 99999999999
+end
+case t2s_max_attempts_zero refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_max_attempts = 0
+end
+case t2s_max_attempts_too_high refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_max_attempts = 11
+end
+case t2s_max_attempts_text refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_max_attempts = abc
+end
+case t2s_allowed_statements_delete refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_allowed_statements = delete
+end
+case t2s_allowed_statements_list refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_allowed_statements = select|select_insert_update
+end
+case t2s_allowed_statements_empty refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+t2s_allowed_statements =
+end
+case reasoning_plugin_relative refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_plugin = relative/plugin.so
+end
+case reasoning_plugin_dotdot refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_plugin = /a/../b
+end
+case reasoning_plugin_empty refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+reasoning_plugin =
+end
+case enterprise_lib_relative refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+enterprise_lib = relative/enterprise.so
+end
+case enterprise_lib_dotdot refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+enterprise_lib = ../enterprise.so
+end
+case enterprise_ledger_path_relative refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+enterprise_ledger_path = ledger.bin
+end
+case enterprise_ledger_path_dotdot refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+enterprise_ledger_path = /a/../ledger.bin
+end
+case too_many_allowed_uids refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+allowed_uids = @UIDS80@
+end
+case socket_path_missing refuse
+hmac_key_file = @KEY@
+end
+case key_file_setting_missing refuse
+socket_path = @SOCK@
+end
+case socket_path_too_long refuse
+socket_path = @LONGSOCK@
+hmac_key_file = @KEY@
+end
+case socket_directory_missing refuse
+socket_path = @DIR@/nodir/s.sock
+hmac_key_file = @KEY@
+end
+case key_file_missing refuse
+socket_path = @SOCK@
+hmac_key_file = @DIR@/missing
+end
+case conf_mode_644 refuse conf=644
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case conf_mode_666 refuse conf=666
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_mode_644 refuse keymode=644
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_empty refuse key=
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_not_hex refuse key=zz
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_odd_length refuse key=abc
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_mixed_hex refuse key=0g
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_too_long refuse key=@LONG@
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case value_longer_than_the_line_limit refuse
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+think = @LONG@
+end

@@ -16,7 +16,7 @@
 # run the UDF bodies the shim forwards calls to.
 
 Name:           fractalsql-mariadb
-Version:        2.0.10
+Version:        2.0.11
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 
@@ -128,20 +128,88 @@ systemctl enable --now fractalsqld.service >/dev/null 2>&1 || true
 %dir %attr(0750,fractalsql,fractalsql) %{confdir}
 
 %changelog
+* Wed Oct 21 2026 FractalSQLabs - 2.0.11-1
+- Text-to-SQL: fractal_sql_agent and the MCP text-to-SQL tool take a
+  required p_auto_execute argument. FALSE generates and validates the
+  statement and returns it without running it; TRUE runs it under the
+  caller's privileges. NULL is treated as FALSE. Existing calls to the
+  procedure need the extra argument.
+- Safety: a reasoning plugin is verified (signature or pinned digest)
+  before it is loaded; generated SELECT/INSERT/UPDATE statements are
+  checked against a list of functions they may not call; the text of an
+  agent's question can be hashed or masked before it is written to an
+  audit entry.
+- Work limits: calls that can run for a long time are bounded by the
+  size of the job requested, with defaults suited to a shared server;
+  an oversized request returns a clear error. Geometry functions refuse
+  non-finite coordinates and degenerate input, and the periodogram uses
+  an FFT for long series.
+- Audit ledger: the chain, CSV mirror and head files are owner-only; a
+  signed head file makes truncation detectable and fractal_ledger_verify
+  names the specific failure; a session can lock the destructive ledger
+  operations; the daemon refuses a configuration file other users can
+  read.
+- MCP: authentication with a deployment token or a per-client token
+  policy file; the registered tool surface is pinned by committed lock
+  files; both the handshake and the stateless request styles are
+  supported; new conformance and fuzz tests and Windows ASan/UBSan
+  build scripts; the MCP documentation is rewritten with a full settings
+  reference.
+- Documentation and packaging: the support matrix lists Linux amd64 and
+  arm64 separately; the Docker image, install scripts and bundled core
+  libraries are refreshed.
+- MCP: the SIGHUP handler now only raises a flag and the auth-token
+  reload happens on the request path (the reload is file I/O plus
+  allocation, neither of which is async-signal-safe); the HTTP
+  transport serves one request per connection instead of holding a
+  keep-alive loop; the shutdown flag is an atomic, closing a genuine
+  data race against the per-connection threads; command-line parsing,
+  the connection setup, and the version-skew check are split into
+  their own units; coverage builds use atomic profile updates so the
+  thread-per-connection transport cannot corrupt its own counters.
+- Test coverage: new assertions inside the existing gates (composite
+  foreign keys with ON UPDATE/ON DELETE actions in the schema
+  context, the non-keyword/INSERT/empty-candidate branches of the
+  text-to-SQL allowlist, schema context against a table-less
+  database, the vectorizer's argument-validation and failed-queue
+  paths, and the reasoning tier's argument-count and input-size
+  caps), new standalone probe suites for the MCP vector, database, and
+  concurrency layers, a deterministically slow reasoning plugin so the
+  shutdown-drain path is exercised with a request genuinely in flight,
+  and a sanitizer runtime that refused to start in the host process is
+  now reported as a skip rather than an extension failure.
+- Benchmarks: the connection target is validated before the driver is
+  asked to connect, so a malformed host or database name cannot
+  silently redirect a run at another server.
+- Shim: a failure with an empty message is replaced by a generic
+  one -- MariaDB renders an empty error buffer as a NULL result with
+  no explanation at all -- and the per-call error buffers are zeroed
+  on entry.
+- Cognition: the string-duplication helper rejects a null output
+  pointer instead of dereferencing it.
+- Build and install scripts: the Docker build rejects an unrecognized
+  argument and an unhandled architecture instead of continuing; the
+  Linux install script pins its downloads to https in one auditable
+  place; the Windows install script's wizard is split into single-step
+  functions and its release download asserts an https scheme.
 * Mon Oct 12 2026 FractalSQLabs - 2.0.10-1
 - Pin darwin-asan/ubsan/tsan CI jobs to mariadb lts.
 - Add vcpkg binary caching to Windows CI jobs.
-* Tue Sep 23 2026 FractalSQLabs - 2.0.7-1
-- v2.0.7: 10 new v2.0.25-core analytics/vector primitives as UDFs
-  (change-point detection, periodogram, SimHash state fingerprint,
-  streaming cycle detection, TDA persistence, k-subset allocation,
-  Lp distance, int8/binary quantization, Hamming distance), agent
-  loop-detection rewrite over real state fingerprints, JSON_VALUE
-  boolean-contract fix in shipped procedures.
-* Sun Aug 30 2026 FractalSQLabs - 2.0.0-1
-- Full v2.0.0: Discovery/Vector/Cognition/Text-to-SQL/Vectorizer/
-  Agency/Enterprise-activation tiers. Single generic package (no
-  per-major split -- the UDF ABI is stable across the whole 10.6-12.3
-  compat range), Apache-2.0, no LuaJIT.
-* Sat Apr 18 2026 FractalSQLabs - 1.0.0-1
-- Initial Factory-standardized release for MariaDB 10.6 / 10.11 / 11.4.
+* Wed Oct 07 2026 FractalSQLabs - 2.0.9-1
+- 10 new analytics and vector functions: change-point detection,
+  periodogram, state fingerprinting, cycle detection, TDA persistence
+  diagrams, subset optimization, L_p distance, and int8/binary vector
+  quantization with Hamming-distance matching.
+- ctid-based id resolution for table-backed agents, so row references
+  survive table rewrites; the trajectory and cross-modal agents are
+  unchanged.
+- Agents: 16 engines updated; new fractal_agent_detect_loop (SimHash,
+  streaming cycle detection and DFA) and a metric argument for
+  fractal_agent_outlier_intercept.
+- Two new vertical demos (biotech-genomics, agentic-edge-swarm); the
+  quant-finance and cybersecurity demos exercise the new analytics
+  functions.
+- Full-API benchmark functions; refreshed docs across the api-* pages,
+  features, composition-guide, starter-kits and the demo README.
+- Refreshed vendored core artifacts, build-test assertions and CI
+  workflow tests for the easy_install assets.

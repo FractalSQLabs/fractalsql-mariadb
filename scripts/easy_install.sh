@@ -102,6 +102,38 @@ warn() { printf "  ${Y}!${Z} %s\n" "$1" >&2; }
 err()  { printf "  ${R}✗${Z} %s\n" "$1" >&2; }
 die()  { err "$1"; exit 1; }
 
+# Every package download below is a release asset fetched over the
+# network, so all of them go through this wrapper, which pins curl to
+# https via --proto (same pin the release workflow's own downloads use).
+# One place, so the pin is auditable: a call site that grows its own
+# curl invocation is a call site that can lose the pin.
+fetch() {
+    curl -fsSL --proto '=https' "$@" || return $?
+    # Release assets are verified against the release's SHA256SUMS before anything installs them.
+    # Set FSQL_ALLOW_UNVERIFIED=1 only for a release that predates SHA256SUMS.
+    local url="" out="" prev="" a
+    for a in "$@"; do
+        [[ "$prev" == "-o" ]] && out="$a"
+        [[ "$a" == https://* ]] && url="$a"
+        prev="$a"
+    done
+    [[ -n "$url" && -n "$out" && "$url" == */releases/download/* && "${url##*/}" != "SHA256SUMS" ]] || return 0
+    local sums="${out}.SHA256SUMS.check" want got
+    if ! curl -fsSL --proto '=https' "${url%/*}/SHA256SUMS" -o "$sums" 2>/dev/null; then
+        rm -f "$sums"
+        if [[ "${FSQL_ALLOW_UNVERIFIED:-0}" == "1" ]]; then echo "WARNING: no SHA256SUMS for this release; installing unverified (FSQL_ALLOW_UNVERIFIED=1)" >&2; return 0; fi
+        echo "ERROR: ${url%/*}/SHA256SUMS could not be fetched; refusing to install an unverified download (set FSQL_ALLOW_UNVERIFIED=1 to override)" >&2
+        rm -f "$out"; return 1
+    fi
+    want="$(awk -v f="${url##*/}" '{n=$2; sub(/^\*/,"",n); if (n==f) {print $1; exit}}' "$sums")"
+    rm -f "$sums"
+    got="$(sha256sum "$out" 2>/dev/null | awk '{print $1}')"; [[ -n "$got" ]] || got="$(shasum -a 256 "$out" | awk '{print $1}')"
+    if [[ -z "$want" || "$want" != "$got" ]]; then
+        echo "ERROR: checksum mismatch or missing entry for ${url##*/} (expected '${want:-none}', got '$got'); removing the download" >&2
+        rm -f "$out"; return 1
+    fi
+}
+
 # --- /dev/tty-aware prompting --------------------------------------------
 YES=0
 NO_INSTALL=0
@@ -334,14 +366,14 @@ phase_b_install() {
         debian)
             local asset="fractalsql-mariadb-${ARCH_DEB}.deb"
             log "Downloading ${asset}..."
-            curl -fsSL --proto '=https' "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
+            fetch "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
             log "sudo apt-get install -y ${TMP_DIR}/${asset}"
             [[ "${DRY_RUN}" -eq 1 ]] || sudo apt-get install -y "${TMP_DIR}/${asset}"
             ;;
         rhel)
             local asset="fractalsql-mariadb-${ARCH_DEB}.rpm"
             log "Downloading ${asset}..."
-            curl -fsSL --proto '=https' "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
+            fetch "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
             if [[ "${PKG_MGR}" == "zypper" ]]; then
                 # zypper enforces signature checks by default, even for a
                 # locally-supplied file; dnf/yum don't.
@@ -358,7 +390,7 @@ phase_b_install() {
             [[ "${ARCH_DARWIN}" == "arm64" ]] && platform_tag="osx_arm64"
             local asset="fractalsql-mariadb-${platform_tag}.zip"
             log "Downloading ${asset}..."
-            curl -fsSL --proto '=https' "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
+            fetch "${asset_base}/${asset}" -o "${TMP_DIR}/${asset}"
             (cd "${TMP_DIR}" && unzip -q "${asset}" -d extracted)
             log "Running the bundled install.sh (reused, not reimplemented)..."
             local mdb_bin; mdb_bin="$(dirname "${MDB_CONFIG_BIN}")/mariadb"

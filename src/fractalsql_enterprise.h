@@ -30,6 +30,14 @@ const fsql_storage_vfs_t *fractal_ledger_storage_vfs(void);
  * calls without duplicating the dlopen/dlsym machinery here. */
 bool fractal_enterprise_lib_loaded(void);
 
+/* Authenticity gate for the reasoning plugin, which is native code run in the
+ * server (or daemon) process. Called before every fsql_load_reasoning(). Trusted when:
+ * FRACTALSQL_REASONING_ALLOW_UNVERIFIED is set (operator opt-out); or the plugin's SHA-256
+ * equals FRACTALSQL_REASONING_PLUGIN_SHA256; or <plugin>.sig is a valid detached Ed25519
+ * signature by the FractalSQLabs release key (the one that signs the enterprise core).
+ * Returns true when trusted; otherwise false with a message in err. */
+bool fractal_plugin_verify(const char *path, char *err, size_t errsz);
+
 /* Append one kind=2 (general decision-audit chain) entry to the ledger,
  * a second, independent append-only chain alongside kind=1's QTL blobs,
  * same hash-chain/CSV-mirror guarantees, queryable via

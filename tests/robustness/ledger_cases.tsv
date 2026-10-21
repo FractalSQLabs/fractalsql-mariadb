@@ -1,0 +1,89 @@
+# Expected results for the forged-ledger gate (build_test.sh gate 55).
+# Columns: daemon key mode (keyed: the daemon and the records share the key; unkeyed: neither
+# has one; wrongkey: records were authenticated with another key), scenario (see
+# ledger_forge.py), fractal_ledger_load result, then fractal_ledger_verify for kind 1 and kind 2
+# as ok:ROWS or bad:FIRST_FAILURE_ID:REASON.
+keyed	k1_ok	ok	ok:1	ok:0
+keyed	k1_two	ok	ok:2	ok:0
+keyed	k1_three	ok	ok:3	ok:0
+keyed	k2_two	ok	ok:0	ok:2
+keyed	mixed	ok	ok:2	ok:1
+keyed	bad_hash	refused	bad:1:entry_hash mismatch (structural tamper)	ok:0
+keyed	bad_mac	refused	bad:1:HMAC mismatch	ok:0
+keyed	nomac	refused	bad:1:row has no MAC but a ledger key is configured	ok:0
+keyed	genesis_nonzero_prev	refused	bad:1:chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)	ok:0
+keyed	bad_link	refused	bad:2:chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)	ok:0
+keyed	bad_link_prior	refused	bad:3:chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)	ok:0
+keyed	kind0	ok	ok:0	ok:0
+keyed	kind17	ok	ok:0	ok:0
+keyed	kind_huge	ok	ok:0	ok:0
+keyed	blen_big	refused	bad:1:record blob length out of range	bad:1:record blob length out of range
+keyed	blen_over	refused	bad:1:record blob length out of range	bad:1:record blob length out of range
+keyed	blen_short	refused	bad:1:truncated blob	bad:1:truncated blob
+keyed	blen_zero	ok	ok:1	ok:0
+keyed	torn_hdr	refused	bad:2:truncated or corrupt record	bad:2:truncated or corrupt record
+keyed	torn_blob	refused	bad:2:truncated blob	bad:2:truncated blob
+keyed	sealed	ok	ok:1	ok:0
+keyed	big_blob	ok	ok:1	ok:0
+keyed	many	ok	ok:0	ok:60
+keyed	empty	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+keyed	magic_only	ok	ok:0	ok:0
+keyed	bad_version	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+keyed	bad_magic	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+keyed	short_magic	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+unkeyed	k1_ok	ok	ok:1	ok:0
+unkeyed	k1_two	ok	ok:2	ok:0
+unkeyed	k1_three	ok	ok:3	ok:0
+unkeyed	k2_two	ok	ok:0	ok:2
+unkeyed	mixed	ok	ok:2	ok:1
+unkeyed	bad_hash	refused	bad:1:entry_hash mismatch (structural tamper)	ok:0
+unkeyed	bad_mac	ok	ok:1	ok:0
+unkeyed	nomac	ok	ok:1	ok:0
+unkeyed	genesis_nonzero_prev	refused	bad:1:chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)	ok:0
+unkeyed	bad_link	refused	bad:2:chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)	ok:0
+unkeyed	bad_link_prior	refused	bad:3:chain-link break (prev_hash does not match predecessor -- row rewritten, reordered, or deleted)	ok:0
+unkeyed	kind0	ok	ok:0	ok:0
+unkeyed	kind17	ok	ok:0	ok:0
+unkeyed	kind_huge	ok	ok:0	ok:0
+unkeyed	blen_big	refused	bad:1:record blob length out of range	bad:1:record blob length out of range
+unkeyed	blen_over	refused	bad:1:record blob length out of range	bad:1:record blob length out of range
+unkeyed	blen_short	refused	bad:1:truncated blob	bad:1:truncated blob
+unkeyed	blen_zero	ok	ok:1	ok:0
+unkeyed	torn_hdr	refused	bad:2:truncated or corrupt record	bad:2:truncated or corrupt record
+unkeyed	torn_blob	refused	bad:2:truncated blob	bad:2:truncated blob
+unkeyed	sealed	ok	ok:1	ok:0
+unkeyed	big_blob	ok	ok:1	ok:0
+unkeyed	many	ok	ok:0	ok:60
+unkeyed	empty	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+unkeyed	magic_only	ok	ok:0	ok:0
+unkeyed	bad_version	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+unkeyed	bad_magic	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+unkeyed	short_magic	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+wrongkey	k1_ok	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	k1_two	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	k1_three	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	k2_two	ok	ok:0	bad:1:HMAC mismatch
+wrongkey	mixed	refused	bad:1:HMAC mismatch	bad:2:HMAC mismatch
+wrongkey	bad_hash	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	bad_mac	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	nomac	refused	bad:1:row has no MAC but a ledger key is configured	ok:0
+wrongkey	genesis_nonzero_prev	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	bad_link	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	bad_link_prior	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	kind0	ok	ok:0	ok:0
+wrongkey	kind17	ok	ok:0	ok:0
+wrongkey	kind_huge	ok	ok:0	ok:0
+wrongkey	blen_big	refused	bad:1:record blob length out of range	bad:1:record blob length out of range
+wrongkey	blen_over	refused	bad:1:record blob length out of range	bad:1:record blob length out of range
+wrongkey	blen_short	refused	bad:1:truncated blob	bad:1:truncated blob
+wrongkey	blen_zero	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	torn_hdr	refused	bad:1:HMAC mismatch	bad:2:truncated or corrupt record
+wrongkey	torn_blob	refused	bad:1:HMAC mismatch	bad:2:truncated blob
+wrongkey	sealed	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	big_blob	refused	bad:1:HMAC mismatch	ok:0
+wrongkey	many	ok	ok:0	bad:1:HMAC mismatch
+wrongkey	empty	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+wrongkey	magic_only	ok	ok:0	ok:0
+wrongkey	bad_version	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+wrongkey	bad_magic	refused	bad:0:bad ledger file header	bad:0:bad ledger file header
+wrongkey	short_magic	refused	bad:0:bad ledger file header	bad:0:bad ledger file header

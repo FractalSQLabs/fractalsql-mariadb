@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+#pragma once
+#include <vector>
+#include "../tool_registry.h"
+
+namespace fsqlmcp
+{
+    class Db;
+    struct EngineConfig;
+    std::vector<ToolSpec> buildAdminTools( Db& db, const EngineConfig& ecfg );
+}

@@ -20,12 +20,25 @@
 
 static int connect_to(const char *path) {
     struct sockaddr_un sa;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int attempt;
+    /* The path goes into sun_path, which is 108 bytes on Linux but only
+     * 104 on macOS/BSD: a path that does not fit is refused here rather
+     * than overrunning the struct. */
+    if (strlen(path) >= sizeof(sa.sun_path)) return -1;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
     strcpy(sa.sun_path, path);
-    if (fd < 0 || connect(fd, (struct sockaddr *) &sa, sizeof(sa)) != 0) return -1;
-    return fd;
+    /* The daemon makes the socket file at bind() and starts listening a
+     * moment later, so a client that finds the file at once can still be
+     * refused. On a slow or heavily loaded machine that window is wide
+     * enough to hit, so try again for a couple of seconds. */
+    for (attempt = 0; attempt < 40; attempt++) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0 && connect(fd, (struct sockaddr *) &sa, sizeof(sa)) == 0) return fd;
+        if (fd >= 0) close(fd);
+        usleep(50000);
+    }
+    return -1;
 }
 
 /* The request id of the most recent response frame read (see

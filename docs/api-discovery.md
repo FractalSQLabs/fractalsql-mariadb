@@ -6,7 +6,9 @@
 
 The Discovery tier provides high-precision and diverse retrieval mechanisms. Unlike traditional vector search, it treats the embedding space as a continuous optimization problem.
 
-`fractal_search` covers two modes in **one** function: pass a non-empty corpus for top-k search, or pass an empty corpus (`''`) for pure Sniper-mode convergence, and set `"debug":true` in `params` for a trajectory trace. There is no separate `fractal_search_debug` function.
+`fractal_search` covers two modes in **one** function: pass a non-empty corpus for top-k search, or pass an empty corpus (`''`) for pure Sniper-mode convergence, and set `"debug":true` in `params` for a trajectory trace.
+
+For a convergence run that reports the trace with no corpus at all, use `fractal_search_debug` -- the same search with the corpus removed and the trace always on.
 
 ---
 
@@ -33,11 +35,13 @@ fractal_search(
 | Key | Default | Range | Description |
 | --- | --- | --- | --- |
 | `iterations` | `30` | 1–10,000 | Number of SFS generations to run. |
-| `population_size` | `50` | 1–100,000 | Number of particles per generation. |
+| `population_size` | `50` | 2–10,000 | Number of particles per generation. |
 | `diffusion_factor` | `2` | 1–32 | SFS MDN (walk-per-particle count). |
 | `walk` | `0.5` | n/a | Diffusion walk parameter. |
 | `debug` | `false` | n/a | Adds a `"trace"` object to the result (see below): `{"trace":{"best_point":[...],"best_fit":..,"edition":"Community"}}`, no per-generation history. |
 | `session_id` | `0` (none) | n/a | Pass `CONNECTION_ID()` to run this search on your session's persistent, Diversify-aware ctx instead of a fresh throwaway one. Required for `fractal_diversify_*` settings (below) to actually affect this call, and for D_q/overhead stats to accumulate across calls. Omit for the default, stateless behavior. |
+
+`iterations` x `population_size` x `diffusion_factor` x the vector length must not exceed 2,147,483,648 (about a minute of work) in one call; each limit is checked on its own and then their product, and a larger search is refused.
 
 A value outside its documented range makes the whole call return `NULL` (verified: `iterations=10001` → `NULL`), not a clamped or partial result.
 
@@ -58,6 +62,57 @@ FROM JSON_TABLE(
      ) t;
 ```
 This is different from the table-backed procedures below: `fractal_search` takes the corpus as an inline argument, it never reads a table.
+
+---
+
+## `fractal_search_debug`
+**Convergence view of the SFS: the trace, with no corpus**
+
+Runs the same Stochastic Fractal Search as `fractal_search`, but with the corpus
+removed and the debug trace always on. There is no top-k here: the search has
+nothing to match against, so it optimises the single query point and reports
+where it landed and how well it fit.
+
+### Signature
+```sql
+fractal_search_debug(
+    query_csv         TEXT,  -- the single query vector
+    iterations        INT,   -- optional: SFS generations, 1-10000 (default 60)
+    population_size   INT,   -- optional: particles per generation, 2-10000 (default 50)
+    diffusion_factor  INT,   -- optional: SFS MDN, 1-32 (default 2)
+    seed              INT    -- optional: walk seed (see below)
+) RETURNS TEXT   -- JSON
+```
+
+A SQL `NULL` in any of the four optional arguments falls back to that argument's
+default rather than failing the call, so a nullable column can be passed straight
+through. An out-of-range value in any of them makes the call return `NULL`.
+
+### Return
+```json
+{ "dim": 2, "n_corpus": 0, "best_fit": 0.0,
+  "best_point": [1, 0],
+  "trace": {"best_point": [1, 0], "best_fit": 0.0, "edition": "Community"} }
+```
+
+### Why it is a separate function
+`fractal_search` reaches the same trace by passing an empty corpus and
+`"debug":true` in `params` -- but `"debug":true` alone is not enough to make it a
+pure convergence run. Without the core's `no_corpus` mode the call degenerates
+into the ordinary one-row-corpus search (a trivial top-k of the query against
+itself) and carries no trace at all. `fractal_search_debug` sets that mode for
+you, which is why its trace is always present.
+
+### Reproducibility
+`seed` is optional. Left out, the core's own non-deterministic seed applies and
+two calls may differ. Pin it for a byte-stable, reproducible trace:
+
+```sql
+SELECT fractal_search_debug('[1,0]', 60, 50, 2, 12345);
+```
+
+The core's seed is unsigned, so a negative value falls back to the default
+(`0`) rather than wrapping to a huge unsigned number.
 
 ---
 
@@ -210,6 +265,8 @@ SELECT fractal_session_close(CONNECTION_ID());  -- optional early cleanup
 | `repulsion_weight` | n/a | n/a |
 | `max_shadows_considered` | `64` | n/a |
 | `tail_buffer_cap` | `256` | 1024 |
+
+`tail_buffer_cap` is **reserved** for a future shadow-index release: it is range-checked (1-1024) and stored, but has no effect on search or the ledger in v2.0.x.
 
 ### `fractal_detect_collapse(session_id)` → `DOUBLE`
 Current D_q (diversity metric). `NULL` if Diversify is disabled or no Diversify-aware search has run yet on this session.

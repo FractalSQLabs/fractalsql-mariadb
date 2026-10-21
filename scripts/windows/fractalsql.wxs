@@ -7,7 +7,7 @@
     -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.3 (dotted, for display)
     -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_3 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-mdb...
-    -dMSI_VERSION=2.0.10
+    -dMSI_VERSION=2.0.11
   plus the standard candle -arch x64|arm64, which populates
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 
@@ -89,6 +89,9 @@
            C:\Program Files\MariaDB X.Y\
              lib\
                plugin\              fractalsql.dll
+             fractalsql-mcp\       fractalsql-mariadb-mcp.exe, libmariadb.dll,
+                                    .mcp-schema-lock, .mcp-safety-annotations-lock,
+                                    README.md, manifest.json
              share\
                doc\
                  fractalsql-mariadb\ LICENSE
@@ -103,6 +106,7 @@
             <Directory Id="PLUGINDIR" Name="plugin" />
           </Directory>
           <Directory Id="FractalSqldDir" Name="fractalsqld" />
+          <Directory Id="McpDir" Name="fractalsql-mcp" />
           <Directory Id="ShareDir" Name="share">
             <Directory Id="DocDir" Name="doc">
               <Directory Id="FractalSqlDocDir" Name="fractalsql-mariadb" />
@@ -206,6 +210,55 @@
               KeyPath="yes" />
       </Component>
 
+      <!-- MCP server: everything it needs sits in one folder. The two lock files are looked up beside the
+           executable; Windows Installer long file names allow the leading dot. -->
+      <Component Id="c_McpExe"
+                 Directory="McpDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)00B-0000-4000-B000-00000000DA07">
+        <File Id="fractalsql_mariadb_mcp.exe"
+              Source="$(var.STAGE_DIR)\fractalsql-mariadb-mcp.exe"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="c_McpLibMariadb"
+                 Directory="McpDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)00C-0000-4000-B000-00000000DA08">
+        <File Id="mcp_libmariadb.dll"
+              Name="libmariadb.dll"
+              Source="$(var.STAGE_DIR)\libmariadb.dll"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="c_McpSchemaLock"
+                 Directory="McpDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)00D-0000-4000-B000-00000000DA09">
+        <File Id="mcp_schema_lock"
+              Name=".mcp-schema-lock"
+              Source="$(var.STAGE_DIR)\.mcp-schema-lock"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="c_McpSafetyLock"
+                 Directory="McpDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)00E-0000-4000-B000-00000000DA0A">
+        <File Id="mcp_safety_lock"
+              Name=".mcp-safety-annotations-lock"
+              Source="$(var.STAGE_DIR)\.mcp-safety-annotations-lock"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="c_McpReadme"
+                 Directory="McpDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)00F-0000-4000-B000-00000000DA0B">
+        <File Id="mcp_readme_md"
+              Name="README.md"
+              Source="$(var.STAGE_DIR)\mcp-README.md"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="c_McpManifest"
+                 Directory="McpDir"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)010-0000-4000-B000-00000000DA0C">
+        <File Id="mcp_manifest_json"
+              Name="manifest.json"
+              Source="$(var.STAGE_DIR)\mcp-manifest.json"
+              KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
     <Feature Id="MainFeature"

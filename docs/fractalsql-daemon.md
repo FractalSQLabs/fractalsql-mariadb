@@ -67,7 +67,7 @@ on that tier's *next* call.
 
 | Key | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `reasoning_plugin` | no | — | Path to the reasoning plugin (.so/.dll). |
+| `reasoning_plugin` | no | — | Path to the reasoning plugin (.so/.dll). Must be an absolute path with no `..` segments. |
 | `reasoning_url` | no | — | HTTP reasoning endpoint. |
 | `reasoning_token` | no | — | Secret — Bearer token for the reasoning endpoint. |
 | `reasoning_model` | no | — | Model name sent to the reasoning endpoint. |
@@ -81,8 +81,8 @@ on that tier's *next* call.
 | `t2s_max_attempts` | no | `2` | Text-to-SQL GENERATE retry budget, clamped to `1`–`10`. |
 | `t2s_allowed_statements` | no | `select` | Exactly `select` or `select_insert_update` (the latter permits writes). |
 | `t2s_use_review` | no | off | Add the text-to-SQL REVIEW pass. |
-| `enterprise_lib` | no | — | Path to the FractalSQL Enterprise library. |
-| `enterprise_ledger_path` | no | — | Ledger file path (opens per operation, so it can be swapped live). |
+| `enterprise_lib` | no | — | Path to the FractalSQL Enterprise library. Must be an absolute path with no `..` segments. |
+| `enterprise_ledger_path` | no | — | Ledger file path (opens per operation, so it can be swapped live). Must be an absolute path with no `..` segments. |
 | `enterprise_ledger_key` | no | — | Secret — HMAC-SHA256 ledger key (unset means structural-only validation). |
 | `enterprise_require_signature` | no | off | Refuse to load an enterprise library with no detached signature file. |
 
@@ -100,6 +100,108 @@ as plaintext, the daemon's conf file is gated like `hmac_key_file`: a
 world/groups-readable config refuses both startup and `fsqlctl reload`
 (the message names "permissions"). Make it private — `chmod 600` on
 POSIX, a private ACL on Windows.
+
+### Path-shaped keys are validated at load and reload
+
+The three keys that name a file on disk -- `reasoning_plugin`,
+`enterprise_lib`, `enterprise_ledger_path` -- must hold an **absolute path
+with no `..` segments**. A relative path resolves differently depending on how
+the daemon was started, and a `..` segment makes the path's meaning depend on
+the operator's directory tree, so a value that looks harmless in one working
+directory can name a different file in another.
+
+The daemon validates the provider settings when it reads the config file, at
+startup and again on every reload. A rejected value refuses the **whole**
+reload -- the running configuration is left untouched -- and the daemon's log
+names the key and the rule:
+
+```
+provider key reasoning_plugin: must be an absolute path with no '..' segments (got 'relative/plugin.so')
+```
+
+`fsqlctl reload` then reports `reload failed: provider settings rejected (see
+the daemon log)`. The check applies to the keys actually present in the file;
+a key that is absent falls back to the daemon's own environment as usual.
+
+### Per-session configuration overrides
+
+The config file is process-wide. Changing it means a filesystem edit plus a
+reload -- the right shape for an operator, the wrong shape for a session that
+wants one knob changed for its own work. Five SQL functions give a
+**connection** a live, per-session override of the tuning keys, layered over
+the daemon-wide values:
+
+| Function | Returns |
+| --- | --- |
+| `fractal_config_set(name, value, session_id)` | `'ok'`, or the refusal reason |
+| `fractal_config_get(name, session_id)` | the effective value for that session, or `NULL` when the key is unknown; a secret key reports `'<redacted>'` or `'<unset>'` instead of a value |
+| `fractal_config_reset(session_id)` | how many overrides were dropped |
+| `fractal_config_list(session_id)` | the session's own overrides, as a JSON object |
+| `fractal_config_keys()` | every known key, as a JSON array of `{name, type, session_overridable}` |
+
+The session key is the caller's own, by the same convention every other
+session-scoped function in this extension uses: `CONNECTION_ID()`. A session
+may only override its own key.
+
+`fractal_config_set` **returns** the refusal reason rather than raising it:
+MariaDB's UDF ABI has no error text on the runtime path, so a refusal has to
+hand the caller something it can read.
+
+A session may change the **tuning** keys -- `reasoning_model`, `embed_model`,
+`think`, `think_num_ctx`, `t2s_max_attempts`, `t2s_use_review` -- and nothing
+else. A refused key is refused **by name, with the reason**, and the key is
+checked before the value -- so the refusal always names the key, never the
+value:
+
+```
+'reasoning_plugin' is a daemon-wide setting and cannot be changed by a session;
+edit fractalsqld.conf and run `fsqlctl reload`
+```
+
+The refused keys, and why:
+
+| Key | Why a session may not change it |
+| --- | --- |
+| `reasoning_plugin`, `enterprise_lib`, `enterprise_ledger_path` | which code the daemon loads -- a session that could name its own `.so` would run attacker-chosen code as the daemon |
+| `reasoning_url`, `embed_url`, `think_native_url` | where the daemon's outbound traffic (and its bearer token) goes -- a session that could re-point the URL could exfiltrate the operator's token |
+| `reasoning_token`, `enterprise_ledger_key` | the operator's own credentials -- a session never reads or replaces them |
+| `reasoning_allow_plaintext`, `enterprise_require_signature` | transport-posture flags the operator set deliberately |
+| `think_provider`, `t2s_allowed_statements` | routing and capability widening |
+
+A secret's value is never returned: `fractal_config_get` reports
+`'<redacted>'` when it is configured and `'<unset>'` when it is not.
+
+A session may hold **several** overrides at once -- `think` and `think_num_ctx`
+together, say. The overlay keeps one entry per session, so every override a
+session holds reads back, `fractal_config_list` shows all of them, and
+`fractal_config_reset` drops all of them: there is no way for an override to be
+accepted and then be invisible, and no way for a reset to report a clean
+session that still holds one.
+
+**This surface is not a boundary.** The functions above are a full-power
+database surface: a caller that can run `SELECT fractal_config_get(...)` reads
+the effective value of every non-secret key, daemon-wide ones included, so the
+overlay's refusals are there to keep one connection from silently re-pointing
+the shared daemon -- not to partition an untrusted caller from an untrusted
+one. An agent-facing layer that wants a stricter line draws it itself; see the
+MCP plugin's own configuration tools, which refuse the enterprise tier's keys
+by name on the read path.
+
+**How the override reaches the plugin.** The model and THINK overrides are
+published into the process environment the reasoning plugin reads, and the
+plugin reads its own configuration ONCE -- when it is loaded -- and bakes it
+into the loaded instance. So a tier republishes its settings (plus the
+session's overrides) before every dispatch and compares a fingerprint of the
+bridge environment against the one the live instance was loaded with; when
+they differ, the tier reloads the plugin and the override takes effect on that
+call. `t2s_max_attempts` and `t2s_use_review` are read by the engine on every
+call, so those two take effect immediately.
+
+**The cost of that.** Each tier holds ONE plugin instance, shared by every
+session. Two sessions asking for different models make the tier reload the
+instance between their calls. A session that overrides nothing pays nothing:
+the fingerprint then matches the instance the tier already holds, and no
+reload happens.
 
 The shim's own config (`fractalsql.conf`, same default-path convention,
 `FRACTALSQL_CONFIG` for the shim's process — i.e. `mariadbd`'s environment)
@@ -260,6 +362,33 @@ lose an in-flight stateful call's answer**. In that case the statement
 fails with an error and re-running it is a fresh execution — but a call
 that *completed and was never answered* is always replayed, never
 double-run.
+
+### What happens to a statement whose connection went away
+
+A statement handle lives on the daemon side and is scoped to the
+connection that created it: when that connection closes, the daemon
+frees the connection's handles. The shim's socket, meanwhile, is
+process-wide and can be replaced at any time — the daemon closes an idle
+connection, a transport failure drops it, the daemon restarts.
+
+The shim therefore counts connections. Every time it establishes a new
+one it bumps a generation counter, and each statement remembers the
+generation it was opened on. When the two disagree, the statement is
+re-opened on the current connection before its next call: the same
+`UDF_INIT` frame the statement started with is sent again, yielding a
+fresh handle for the connection the calls now travel on. The
+re-open happens for every retry class, including the stateful ones — it
+re-establishes the statement, it does not re-run the call, so the
+idempotency token and the replay rules above are unaffected.
+
+If the re-open itself fails, the call fails. A re-open that fails for
+transport reasons is retried with the call (the daemon restarting, say),
+and one the daemon refuses is not — the same refusal would come
+straight back. Either way the reason is written to the server's error
+log with the function's name: MariaDB's UDF ABI has no error text on
+the runtime path, so a shim-side failure reaches the client as the
+bare "Can't initialize function" and the explanation has to be in the
+log.
 
 ### What happens when a call runs too long
 

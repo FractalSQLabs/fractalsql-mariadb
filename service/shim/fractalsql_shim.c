@@ -19,7 +19,7 @@
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
+#  include <Windows.h>
 #  define FSQ_EXPORT __declspec(dllexport)
 #  define FSQ_SHIM_CONFIG_DEFAULT "C:\\ProgramData\\FractalSQL\\fractalsql.conf"
 typedef SRWLOCK fsq_mutex;
@@ -55,7 +55,20 @@ typedef int fsq_sock;
 #include "../protocol/fsq_protocol.h"
 
 #define FSQ_SHIM_CONFIG_ENV     "FRACTALSQL_CONFIG"
-#define FSQ_SOCKET_PATH_MAX     108
+#ifdef _WIN32
+/* A named pipe path, not a sun_path: the pipe namespace has its own
+ * (longer) limit, and nothing here copies it into a fixed struct. */
+#  define FSQ_SOCKET_PATH_MAX 108
+#else
+/* The socket path is copied into sockaddr_un.sun_path, whose size is
+ * 108 bytes on Linux but only 104 on macOS/BSD. Sizing this buffer to
+ * the field itself makes the config-load length check and the
+ * fsq_connect() copy the SAME bound, so a path that does not fit is
+ * refused when the config is read instead of overrunning the stack
+ * later -- and the shim runs INSIDE mariadbd, where a stack smash
+ * takes the whole database server down with it. */
+#  define FSQ_SOCKET_PATH_MAX sizeof(((struct sockaddr_un *)0)->sun_path)
+#endif
 #define FSQ_IO_TIMEOUT_CALL_S   60
 #define FSQ_IO_TIMEOUT_INIT_S   5
 #define FSQ_MAX_ARG_BYTES       ((size_t) FSQ_MAX_PAYLOAD - 4096u)
@@ -87,6 +100,49 @@ static uint32_t g_next_request_id = 1;
  * constant across a call's resend attempts. */
 static uint64_t g_idem_base = 0;
 static uint64_t g_idem_counter = 0;
+
+/* ------------------------------------------------------------------ */
+/* The connection generation                                           */
+/* ------------------------------------------------------------------ */
+
+/* A statement handle lives on the daemon side, and the daemon scopes a
+ * handle to the connection that created it: a connection's handles are
+ * freed when that connection closes. The shim's socket, meanwhile, is
+ * process-wide and can be replaced at any time -- the daemon closes an
+ * idle connection, a transport failure drops it, the daemon restarts.
+ * A statement whose handle was minted on an older connection is then
+ * simply not there any more, and the next call for it would be refused
+ * with "unknown handle" (the daemon's answer to a handle it cannot
+ * find).
+ *
+ * So the shim counts connections: every time it establishes a NEW one
+ * it bumps this counter, and a statement remembers the generation it
+ * was opened on. When the two disagree, the statement is re-opened on
+ * the current connection before its next call -- the same UDF_INIT the
+ * statement started with, sent again, which yields a fresh handle for
+ * the connection the calls now travel on.
+ *
+ * The counter is bumped under g_mu, which every roundtrip holds, so
+ * there is no race between a reconnect and a statement reading it. */
+static uint64_t g_conn_gen = 0;
+
+/* Called by fsq_roundtrip before the request frame goes out, so the
+ * caller can refresh whatever the frame refers to on the daemon side (a
+ * statement handle, which lives and dies with its connection). Returns
+ * 0 to continue; a non-zero return aborts the roundtrip. The error
+ * buffer is the roundtrip's own, so the hook can say WHY the refresh
+ * failed instead of leaving the caller with a bare "could not
+ * re-open".
+ *
+ * The return value also says whether a retry could help: a refresh
+ * that failed because the TRANSPORT gave up (the daemon is restarting,
+ * say) is worth another attempt, while a refresh the daemon REFUSED is
+ * not -- the same refusal would come back. */
+#define FSQ_HOOK_OK        0
+#define FSQ_HOOK_RETRY     1   /* transport-level: the attempt budget applies */
+#define FSQ_HOOK_FATAL  (-1)   /* the daemon refused: retrying cannot help */
+
+typedef int (*fsq_reconnect_fn)(void *ctx, char *err, size_t errlen);
 
 /* The retry class comes from protocol/functions.def (r/s/e) through
  * shim_udfs.h: pure functions reconnect and re-send; stateful functions
@@ -385,7 +441,8 @@ static int fsq_roundtrip(uint16_t opcode, uint64_t context,
                          const uint8_t *req, uint32_t req_len, unsigned timeout_s,
                          unsigned max_attempts,
                          uint32_t *status, int32_t *core_rc,
-                         uint8_t **body, uint32_t *body_len, char *err, size_t errlen) {
+                         uint8_t **body, uint32_t *body_len, char *err, size_t errlen,
+                         fsq_reconnect_fn on_reconnect, void *hook_ctx) {
     uint8_t hdr[FSQ_HEADER_LEN], rhdr[FSQ_HEADER_LEN], rtag[FSQ_TAG_LEN], want[FSQ_TAG_LEN];
     struct fsq_header rh;
     struct fsq_header h;
@@ -394,6 +451,10 @@ static int fsq_roundtrip(uint16_t opcode, uint64_t context,
     unsigned attempt;
 
     for (attempt = 1; attempt <= max_attempts; attempt++) {
+        /* Each attempt reports its own outcome: a reason left over from
+         * an earlier attempt must not survive into this one, or a later
+         * success would still be carrying a stale failure text. */
+        if (err != NULL && errlen > 0) err[0] = '\0';
         /* gcc -Werror=maybe-uninitialized can't prove rh is only read
          * after fsq_header_decode fills it (the failure paths continue
          * or return; a partial-read attempt re-enters this loop), so
@@ -415,7 +476,42 @@ static int fsq_roundtrip(uint16_t opcode, uint64_t context,
                 if (attempt < max_attempts) continue;
                 return -1;
             }
+            /* A new connection: the connection generation moves on, and
+             * anything the request refers to on the daemon side (a
+             * statement handle) has to be re-established on it before
+             * the frame goes out. */
+            g_conn_gen++;
         }
+
+        /* Give the caller the chance to refresh whatever the frame
+         * refers to on the daemon side, BEFORE the frame goes out.
+         *
+         * This runs on EVERY attempt, not only right after a connect.
+         * A statement can be stale on a connection that is itself
+         * current: another statement's call reconnected in between, so
+         * the generation moved on while this statement kept the old
+         * handle. The refresh is what notices that, and it is a no-op
+         * when the statement is still bound to the live connection. */
+        if (on_reconnect) {
+            int hook_rc = on_reconnect(hook_ctx, err, errlen);
+            if (hook_rc != FSQ_HOOK_OK) {
+                fsq_sock_close(g_fd);
+                g_fd = FSQ_SOCK_INVALID;
+                /* A refresh that failed for transport reasons gets the
+                 * attempt budget the call's own retry tier allows: the
+                 * next attempt reconnects and tries the refresh again.
+                 * A refusal from the daemon does not -- the same
+                 * refusal would come straight back. */
+                if (hook_rc == FSQ_HOOK_RETRY && attempt < max_attempts)
+                    goto fsq_retry;
+                if (err[0] == '\0')
+                    snprintf(err, errlen,
+                             "fractalsql: could not re-open the statement on the current connection to fractalsqld");
+                return -1;
+            }
+        }
+        /* After the refresh, which is a roundtrip of its own and sets
+         * its own timeout on the same socket. */
         fsq_sock_set_timeout(g_fd, timeout_s);
 
         memset(&h, 0, sizeof(h));
@@ -428,10 +524,29 @@ static int fsq_roundtrip(uint16_t opcode, uint64_t context,
         fsq_header_encode(hdr, &h);
         fsq_mac(hdr, req, req_len, tag);
 
+/* A transport or protocol failure. The socket is closed and the next
+ * attempt re-probes and reconnects, so "retry" means a clean socket
+ * with a fresh request id and the same context token.
+ *
+ * WHY A GOTO AND NOT `continue`: this macro is a do/while(0), and a
+ * `continue` inside a do/while(0) applies to THAT loop -- it
+ * evaluates the (false) condition and falls out of the macro, straight
+ * into the code after the macro invocation, with the socket already
+ * closed and the reply buffer already freed. The fall-through then
+ * read a response frame from a dead socket and dereferenced the
+ * freed payload (memcpy from NULL, then fsq_get_u32(NULL)): a crash
+ * inside mariadbd, on the shim's own thread. It also meant the retry
+ * NEVER happened -- the loop's next iteration was unreachable from
+ * every failure site, so the documented retry contract (and the
+ * daemon's stateful-replay path behind it) was dead code.
+ *
+ * The label at the end of the loop body is the retry point: control
+ * reaches the loop's increment from there, and the next iteration
+ * re-memsets the response header. */
 #define FSQ_TR_FAIL(text)                                                     \
         do {                                                                  \
             fsq_sock_close(g_fd); g_fd = FSQ_SOCK_INVALID;                    \
-            if (attempt < max_attempts) continue;                             \
+            if (attempt < max_attempts) goto fsq_retry;                       \
             snprintf(err, errlen, text " (after %u attempt(s))", attempt);    \
             return -1;                                                        \
         } while (0)
@@ -485,18 +600,52 @@ static int fsq_roundtrip(uint16_t opcode, uint64_t context,
         if (*body_len) memcpy(*body, rpay + 8, *body_len);
         free(rpay);
         return 0;
+
+    fsq_retry:
+        /* Reached only through FSQ_TR_FAIL's goto. The socket is closed
+         * and the reply buffer is gone; drop it again (NULL at every
+         * failure site today) so the next attempt starts from a clean
+         * socket with a fresh request id and the same context token. */
+        free(rpay);
+        rpay = NULL;
+        continue;
     }
     /* Unreachable: the loop returns or continues. */
     snprintf(err, errlen, "fractalsql: internal retry error");
     return -1;
 }
 
-/* Converts a local failure into the caller's error buffer. */
+/* Converts a local failure into the caller's error buffer. An empty
+ * `text` would produce an empty error message, which MariaDB renders
+ * as a NULL result with no explanation -- never leave the user with
+ * nothing. The generic fallback keeps the message non-empty. */
 static void fsq_set_msg(char *message, const char *text) {
-    size_t n = strlen(text);
+    size_t n;
+    if (text == NULL || text[0] == '\0') {
+        text = "fractalsql: unspecified failure";
+    }
+    n = strlen(text);
     if (n >= FSQ_MSG_MAX) n = FSQ_MSG_MAX - 1;
     memcpy(message, text, n);
     message[n] = '\0';
+}
+
+/* The RUNTIME path has nowhere to put a reason: MariaDB's UDF ABI
+ * carries a single error FLAG, and a flag surfaces as the bare "Can't
+ * initialize function" with no text. A call that fails in the shim --
+ * the daemon is down, the statement could not be re-opened, the reply
+ * was malformed -- would therefore reach the user as an unexplained
+ * error and reach the operator as nothing at all.
+ *
+ * The shim runs INSIDE mariadbd, so stderr lands in the server's own
+ * error log: the one place an operator looks when a query fails. The
+ * reason is written there, once per failed call, with the function's
+ * name so the log line says which call failed. */
+static void fsq_log_call_failure(const char *fn_name, const char *text) {
+    if (text == NULL || text[0] == '\0') text = "unspecified failure";
+    fprintf(stderr, "fractalsql: %s failed: %s\n",
+            fn_name != NULL ? fn_name : "(unknown function)", text);
+    fflush(stderr);
 }
 
 /* Maps a wire ARG type to the TLV type code. */
@@ -534,6 +683,14 @@ static enum Item_result fsq_server_type(uint8_t t) {
 struct fsq_stmt {
     uint64_t handle;
     char *out;
+    /* The connection generation this handle belongs to, and the
+     * UDF_INIT frame that opened it. A handle is scoped to the
+     * connection that created it, so when the connection is replaced
+     * the statement is re-opened with this same frame and the new
+     * handle replaces the old one. */
+    uint64_t gen;
+    uint8_t *init_req;
+    uint32_t init_req_len;
 };
 
 #define FSQ_STR_INLINE_MAX 255u
@@ -559,12 +716,13 @@ static char *fsq_return_string(UDF_INIT *initid, char *result, unsigned long *le
 
 static my_bool fsq_udf_init(UDF_INIT *initid, UDF_ARGS *args, char *message,
                             const char *fn_name) {
-    uint8_t *req = NULL, *body = NULL;
+    uint8_t *req = NULL, *body = NULL, *init_copy = NULL;
     uint32_t status = 0, body_len = 0, req_len, i, nargs;
     uint8_t namelen = (uint8_t) strlen(fn_name);
     int32_t core_rc = 0;
-    char err[FSQ_MSG_MAX];
+    char err[FSQ_MSG_MAX] = { 0 };
     uint64_t handle;
+    uint64_t gen = 0;
     struct fsq_stmt *st;
     int rc;
 
@@ -615,11 +773,24 @@ static my_bool fsq_udf_init(UDF_INIT *initid, UDF_ARGS *args, char *message,
         }
     }
 
+    /* Keep a copy of the frame that opened the statement. A handle is
+     * scoped to the connection that created it, so a statement whose
+     * connection is later replaced has to be re-opened -- and the
+     * re-open is this same frame, sent again. */
+    init_copy = (uint8_t *) malloc(req_len);
+    if (!init_copy) {
+        free(req);
+        fsq_set_msg(message, "fractalsql: out of memory");
+        return 1;
+    }
+    memcpy(init_copy, req, req_len);
+
     FSQ_LOCK(g_mu);
     if (!g_configured) {
         if (fsq_load_config() != 0) {
             FSQ_UNLOCK(g_mu);
             free(req);
+            free(init_copy);
             fsq_set_msg(message, "fractalsql: cannot read fractalsql.conf (socket_path, hmac_key_file)");
             return 1;
         }
@@ -627,43 +798,118 @@ static my_bool fsq_udf_init(UDF_INIT *initid, UDF_ARGS *args, char *message,
         g_idem_base = fsq_idem_draw_base();
     }
     rc = fsq_roundtrip(FSQ_OP_UDF_INIT, 0, req, req_len, FSQ_IO_TIMEOUT_INIT_S, 1,
-                       &status, &core_rc, &body, &body_len, err, sizeof(err));
+                       &status, &core_rc, &body, &body_len, err, sizeof(err),
+                       NULL, NULL);
+    /* The generation the handle was minted on, read INSIDE the lock. The
+     * counter is bumped by every roundtrip that connects, and those
+     * roundtrips hold this same lock, so reading it here pairs the
+     * handle with the connection it belongs to. Reading it after the
+     * unlock would open a window in which another connection could
+     * reconnect and bump the counter: the statement
+     * would then be stamped with a generation NEWER than the one its
+     * handle was minted on, the re-open hook would compare the two,
+     * find them equal, skip the re-open, and the call would go out
+     * carrying a handle the daemon no longer knows. */
+    gen = g_conn_gen;
     FSQ_UNLOCK(g_mu);
     free(req);
 
-    if (rc != 0) { fsq_set_msg(message, err); free(body); return 1; }
+    if (rc != 0) { fsq_set_msg(message, err); free(body); free(init_copy); return 1; }
     if (status != FSQ_OK) {
         size_t n = body_len < FSQ_MSG_MAX ? body_len : FSQ_MSG_MAX - 1;
         memcpy(message, body, n);
         message[n] = '\0';
         free(body);
+        free(init_copy);
         return 1;
     }
     /* Body: handle u64, max_length u32, maybe_null u8, nargs u32, types[nargs] u8 */
     if (body_len < 17 || fsq_get_u32(body + 13) != nargs || body_len < 17 + nargs) {
         free(body);
+        free(init_copy);
         fsq_set_msg(message, "fractalsql: malformed init reply");
         return 1;
     }
     handle = fsq_get_u64(body);
     if (handle == 0) {
         free(body);
+        free(init_copy);
         fsq_set_msg(message, "fractalsql: fractalsqld returned no handle");
         return 1;
     }
     st = calloc(1, sizeof(*st));
     if (!st) {
         free(body);
+        free(init_copy);
         fsq_set_msg(message, "fractalsql: out of memory");
         return 1;
     }
     st->handle = handle;
+    st->gen = gen;
+    st->init_req = init_copy;
+    st->init_req_len = req_len;
     initid->ptr = (char *) st;
     initid->max_length = fsq_get_u32(body + 8);
     if (initid->max_length > FSQ_MAX_RESULT_BYTES) initid->max_length = (unsigned long) FSQ_MAX_RESULT_BYTES;
     initid->maybe_null = body[12] ? 1 : 0;
     for (i = 0; i < nargs; i++) args->arg_type[i] = fsq_server_type(body[17 + i]);
     free(body);
+    return 0;
+}
+
+/* The reconnect hook for a call: re-opens the statement on the new
+ * connection and patches the fresh handle into the request about to be
+ * sent. A handle is scoped to the connection that created it, so a
+ * statement carried across a connection change would be refused with
+ * "unknown handle"; the re-open sends the statement's own UDF_INIT
+ * frame again, which yields a handle valid on the current connection.
+ *
+ * The idempotency token is NOT part of this: the token belongs to the
+ * logical CALL, and it travels with the resend so the daemon can
+ * answer from its cache if the call had already run. */
+struct fsq_call_ctx {
+    struct fsq_stmt *st;
+    uint8_t *req;          /* the CALL request being sent */
+    uint32_t handle_off;   /* where its handle field sits */
+};
+
+static int fsq_call_reconnect(void *vctx, char *err, size_t errlen) {
+    struct fsq_call_ctx *c = (struct fsq_call_ctx *) vctx;
+    struct fsq_stmt *st = c->st;
+    uint32_t status = 0, body_len = 0;
+    int32_t core_rc = 0;
+    uint8_t *body = NULL;
+    char local_err[FSQ_MSG_MAX] = { 0 };
+    uint64_t handle;
+    int rc;
+
+    if (!st || !st->init_req) return 0;   /* nothing to re-open */
+    if (st->gen == g_conn_gen) return 0;  /* the handle still belongs here */
+
+    rc = fsq_roundtrip(FSQ_OP_UDF_INIT, 0, st->init_req, st->init_req_len,
+                       FSQ_IO_TIMEOUT_INIT_S, 1, &status, &core_rc, &body,
+                       &body_len, local_err, sizeof(local_err), NULL, NULL);
+    if (rc != 0 || status != FSQ_OK || body_len < 17) {
+        free(body);
+        snprintf(err, errlen, "fractalsql: could not re-open the statement on the "
+                              "current connection to fractalsqld: %s",
+                 local_err[0] ? local_err : "the daemon refused the re-open");
+        /* A roundtrip that did not complete is a transport event, and
+         * the call's own retry tier can have another go at it. A
+         * completed roundtrip whose answer was a refusal is not. */
+        return rc != 0 ? FSQ_HOOK_RETRY : FSQ_HOOK_FATAL;
+    }
+    handle = fsq_get_u64(body);
+    free(body);
+    if (handle == 0) {
+        snprintf(err, errlen, "fractalsql: could not re-open the statement on the "
+                              "current connection to fractalsqld: no handle");
+        return FSQ_HOOK_FATAL;
+    }
+
+    st->handle = handle;
+    st->gen = g_conn_gen;
+    fsq_put_u64(c->req + c->handle_off, handle);
     return 0;
 }
 
@@ -679,10 +925,11 @@ static int fsq_udf_call(UDF_INIT *initid, UDF_ARGS *args, const char *fn_name,
     uint8_t *req, *p, *body = NULL;
     uint32_t status = 0, body_len = 0, i;
     int32_t core_rc = 0;
-    char err[FSQ_MSG_MAX];
+    char err[FSQ_MSG_MAX] = { 0 };
     uint64_t handle = initid->ptr ? ((struct fsq_stmt *) initid->ptr)->handle : 0;
     uint64_t token;
     unsigned attempts = fsq_attempts_for(cls);
+    struct fsq_call_ctx cctx;
     int rc;
 
     if (handle == 0 || args->arg_count > FSQ_MAX_ARGS) { *error = 1; return -1; }
@@ -727,22 +974,49 @@ static int fsq_udf_call(UDF_INIT *initid, UDF_ARGS *args, const char *fn_name,
 
     FSQ_LOCK(g_mu);
     token = g_idem_base + g_idem_counter++;
+    /* The hook re-opens the statement if this call has to travel on a
+     * connection the statement was not opened on (the daemon scopes a
+     * handle to its connection), and patches the fresh handle into the
+     * request built above. */
+    cctx.st    = (struct fsq_stmt *) initid->ptr;
+    cctx.req   = req;
+    cctx.handle_off = 1 + namelen;
     rc = fsq_roundtrip(FSQ_OP_UDF_CALL, token, req, (uint32_t) (p - req),
                        FSQ_IO_TIMEOUT_CALL_S, attempts,
-                       &status, &core_rc, &body, &body_len, err, sizeof(err));
+                       &status, &core_rc, &body, &body_len, err, sizeof(err),
+                       fsq_call_reconnect, &cctx);
     FSQ_UNLOCK(g_mu);
     free(req);
 
     if (rc != 0 || status != FSQ_OK || body_len < 6) {
+        char why[FSQ_MSG_MAX];
         *error = 1;
+        /* The reason cannot ride back to the client -- MariaDB's UDF ABI
+         * has no error text on the runtime path -- so it goes to the
+         * server's own error log instead, where an operator will find
+         * it. */
+        if (rc != 0)
+            snprintf(why, sizeof why, "%s", err);
+        else if (status != FSQ_OK)
+            snprintf(why, sizeof why, "the daemon refused the call (status %u)",
+                     (unsigned) status);
+        else
+            snprintf(why, sizeof why, "the daemon sent a malformed reply");
+        fsq_log_call_failure(fn_name, why);
         free(body);
         return -1;
     }
     *out_null = body[1];
     *out_len = fsq_get_u32(body + 2);
-    if (*out_len > body_len - 6) { *error = 1; free(body); return -1; }
+    if (*out_len > body_len - 6) {
+        fsq_log_call_failure(fn_name, "the daemon sent a reply of the wrong length");
+        *error = 1; free(body); return -1;
+    }
     *out_bytes = malloc(*out_len ? *out_len : 1);
-    if (!*out_bytes) { *error = 1; free(body); return -1; }
+    if (!*out_bytes) {
+        fsq_log_call_failure(fn_name, "out of memory");
+        *error = 1; free(body); return -1;
+    }
     if (*out_len) memcpy(*out_bytes, body + 6, *out_len);
     free(body);
     *is_null = *out_null ? 1 : 0;
@@ -757,18 +1031,20 @@ static void fsq_udf_deinit(UDF_INIT *initid) {
     uint8_t req[8], *body = NULL;
     uint32_t status = 0, body_len = 0;
     int32_t core_rc = 0;
-    char err[FSQ_MSG_MAX];
+    char err[FSQ_MSG_MAX] = { 0 };
     struct fsq_stmt *st = (struct fsq_stmt *) initid->ptr;
     if (!st) return;
     if (handle != 0) {
         fsq_put_u64(req, handle);
         FSQ_LOCK(g_mu);
         fsq_roundtrip(FSQ_OP_UDF_DEINIT, 0, req, 8, FSQ_IO_TIMEOUT_INIT_S, 1,
-                      &status, &core_rc, &body, &body_len, err, sizeof(err));
+                      &status, &core_rc, &body, &body_len, err, sizeof(err),
+                      NULL, NULL);
         FSQ_UNLOCK(g_mu);
         free(body);
     }
     free(st->out);
+    free(st->init_req);
     free(st);
     initid->ptr = NULL;
 }

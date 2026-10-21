@@ -64,11 +64,21 @@ esac
 case "${PKG_ARCH}" in
     amd64) RPM_ARCH="x86_64"  ; FSQL_PLATFORM="linux-x86_64"  ;;
     arm64) RPM_ARCH="aarch64" ; FSQL_PLATFORM="linux-aarch64" ;;
-    *)     echo "unknown arch '${PKG_ARCH}': expected amd64 or arm64" >&2; exit 2 ;;
+    # The arch was validated above, so reaching this arm is an internal
+    # dispatch gap, not a user typo: fail loudly rather than let a
+    # half-populated RPM_ARCH/FSQL_PLATFORM reach the staging below.
+    *)     echo "internal error: unhandled arch '${PKG_ARCH}' (validated above)" >&2; exit 2 ;;
 esac
 
 SHIM="dist/${PKG_ARCH}/fractalsql.so"
 DAEMON="dist/${PKG_ARCH}/fractalsqld"
+MCP_BIN="dist/${PKG_ARCH}/fractalsql-mariadb-mcp"
+HAVE_MCP=0
+if [[ -f "${MCP_BIN}" ]]; then
+    HAVE_MCP=1
+else
+    echo "warning: ${MCP_BIN} not found: packaging without the MCP server (run ./build.sh ${PKG_ARCH})" >&2
+fi
 for f in "${SHIM}" "${DAEMON}"; do
     if [[ ! -f "${f}" ]]; then
         echo "missing ${f}: run ./build.sh ${PKG_ARCH} first" >&2
@@ -146,6 +156,21 @@ stage_common() {
         "${stage}/usr/lib/systemd/system/fractalsqld.service"
 }
 
+# The MCP server (a client of the database, Apache-2.0). The binary and its two lock files go to /usr/bin together:
+# the server looks for the locks beside its own executable, so nothing depends on /usr/share/doc (some images strip
+# it). The README and the manifest are documentation and travel with the other docs.
+stage_mcp() {
+    local stage="$1"
+    [[ "${HAVE_MCP}" = "1" ]] || return 0
+    install -Dm0755 "${REPO_ROOT}/${MCP_BIN}" "${stage}/usr/bin/fractalsql-mariadb-mcp"
+    for f in .mcp-schema-lock .mcp-safety-annotations-lock; do
+        install -Dm0644 "${REPO_ROOT}/mcp/${f}" "${stage}/usr/bin/${f}"
+    done
+    for f in README.md manifest.json; do
+        install -Dm0644 "${REPO_ROOT}/mcp/${f}" "${stage}/usr/share/doc/${PKG_NAME}/mcp/${f}"
+    done
+}
+
 # Debian layout. debian/copyright (DEP-5): the one Debian-specific path
 # dpkg tooling actually looks for, so it ships at the exact conventional
 # name and location rather than alongside the other LICENSE-* files.
@@ -154,6 +179,7 @@ install -Dm0755 "${SHIM}" \
 install -Dm0755 "${REASONING_SO}" \
     "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql-reasoning-http.so"
 stage_common "${STAGE_DEB}"
+stage_mcp "${STAGE_DEB}"
 install -Dm0644 "${REPO_ROOT}/packaging/debian-copyright" \
     "${STAGE_DEB}/usr/share/doc/${PKG_NAME}/copyright"
 
@@ -169,6 +195,7 @@ install -Dm0755 "${SHIM}" \
 install -Dm0755 "${REASONING_SO}" \
     "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so"
 stage_common "${STAGE_RPM}"
+stage_mcp "${STAGE_RPM}"
 # RPM has no equivalent single conventional copyright path; the same
 # per-component LICENSE-* files staged by stage_common cover it, under
 # the common /usr/share/licenses/<pkg>/ convention too.
@@ -198,6 +225,7 @@ fpm -s dir -t deb \
     --depends "libc6 (>= ${GLIBC_DEP})" \
     --depends "libcurl4" \
     --depends "libssl3" \
+    --depends "libmariadb3" \
     --depends "mariadb-server" \
     --after-install "${REPO_ROOT}/packaging/scripts/postinst.sh" \
     --before-remove "${REPO_ROOT}/packaging/scripts/postrm.sh" \
@@ -214,6 +242,7 @@ fpm -s dir -t rpm \
     --license "${PKG_LICENSE}" \
     --depends "libcurl.so.4()(64bit)" \
     --depends "libcrypto.so.3()(64bit)" \
+    --depends "libmariadb.so.3()(64bit)" \
     --depends "mariadb-server" \
     --after-install "${REPO_ROOT}/packaging/scripts/postinst.sh" \
     --before-remove "${REPO_ROOT}/packaging/scripts/postrm.sh" \

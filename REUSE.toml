@@ -29,3 +29,15 @@ path = ["include/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 Daniel Gardiner d/b/a FractalSQLabs"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["mcp/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Daniel Gardiner d/b/a FractalSQLabs"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["mcp/vendor/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2013-2023 Niels Lohmann"
+SPDX-License-Identifier = "MIT"

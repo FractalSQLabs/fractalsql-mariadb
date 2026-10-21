@@ -38,6 +38,12 @@ a query. Also the corpus top-k search: pass a real inline corpus for top-k,
 or an empty one (`''`) to run pure convergence with no corpus at all. It is
 a "precision" tool for finding the absolute global minimum.
 
+### Convergence Trace (`fractal_search_debug`)
+The same search with the corpus removed and the debug trace always on: no
+top-k, just the walk's own trace on one query point, so you can see where the
+search landed and how well it fit. Pass a `seed` for a byte-stable result --
+left out, the walk is non-deterministic.
+
 ### Scout Discovery (`fractal_search_explore`)
 An SFS population search blended with **Maximal Marginal Relevance (MMR)**
 re-ranking, so the results cover the data's distinct basins of attraction
@@ -127,7 +133,7 @@ examples, and notes.
 | `fractal_agent_schedule_workload` | `fractal_search` refine + nearest node → reasoning rationale | ✓ |
 | `fractal_agent_outlier_intercept` | distance-to-bad-state safety barrier → reasoning justification | ✓ |
 | `fractal_agent_patient_deterioration_triage` | cohort search + trajectory drift → reasoning triage | ✓ |
-| `fractal_agent_data_analyst` | NL → SQL → execute → reasoning analysis | ✓ |
+| `fractal_agent_data_analyst` | NL → SQL → reasoning analysis (SQL runs only with an explicit `auto_execute`) | ✓ |
 | `fractal_agent_recall_hybrid` | cohort-restricted vector recall | — |
 | `fractal_agent_recommend_diverse` | repulsion-diverse top-k | — |
 | `fractal_agent_feedback_audit` | diversify loop + collapse detection | — |
@@ -187,8 +193,11 @@ of data and state, turning raw vectors into actionable structural insights.
 - **Change-Point Localization (`fractal_change_point_detect`)**: Localizes
   where a series' mean or variance shifted, complementing DFA's overall
   characterization.
-- **Periodogram (`fractal_periodogram`)**: Exact power spectrum (direct DFT)
+- **Periodogram (`fractal_periodogram`)**: Exact power spectrum (direct DFT for short series, FFT for longer ones)
   for cadence detection such as network beaconing or retry loops.
+- **Spectral entropy (`fractal_spectrogram_entropy`)**: Per-window Shannon
+  entropy of the power spectrum (0 = ordered tone, ~0.9 = noise); pair with
+  `fractal_change_point_detect` to find when order is lost.
 - **Persistence (`fractal_tda_persistence_diagram`)**: Exact 0-dimensional
   persistence over a point cloud's Vietoris-Rips filtration, plus the graph
   cycle rank as an informational Betti-number estimate.
@@ -218,6 +227,12 @@ allocation over any scored item list with per-item bounds.
 - **Quantization (`fractal_vector_quantize_int8` / `_binary`)**: 4x/32x
   per-vector compression with Hamming pre-filtering
   (`fractal_vector_hamming_distance`) ahead of a full-precision re-rank.
+- **Canonical form (`fractal_vector` / `_from_text` / `_to_json`)**: A fixed
+  binary layout -- uint16 dimension, uint16 reserved, then float32
+  little-endian values -- carried as lowercase hex. Byte-stable across
+  architectures, charset-safe, and storable in a `VARCHAR` or a `BLOB`
+  column; every `fractal_vector_*` function accepts it as input as well as
+  the JSON/CSV text form.
 
 ---
 
@@ -271,6 +286,7 @@ detailed per-tier references.)
 
 **Discovery**
 - `fractal_search(vector_csv, query_csv, k, params)`: Sniper Mode convergence, or corpus top-k. → **[api-discovery.md](api-discovery.md)**
+- `fractal_search_debug(query_csv [, iterations, population_size, diffusion_factor, seed])`: The convergence trace, with no corpus. → **[api-discovery.md](api-discovery.md)**
 - `fractal_search_explore(corpus, query, params)`: Scout Mode diverse exploration. → **[api-discovery.md](api-discovery.md)**
 - `fractal_search_telemetry(table, col, query, k, OUT result)`: Ground-truth row retrieval. → **[api-discovery.md](api-discovery.md)**
 

@@ -13,7 +13,7 @@ stops short of: reasoning over what it retrieves, and when you enable it
 acting on the result, whether that's running a generated query or executing a
 decision an agent computed, all inside the same database process.
 
-By bringing reasoning and agency directly into the MariaDB server, FractalSQL
+By bringing reasoning and agency services directly beside the MariaDB server, FractalSQL
 enables **Sovereign Data Intelligence**: the ability to reason, plan, and act upon
 your data with the deployment topology under your control. Run fully on-prem or in
 your own containers with Ollama/vLLM for zero data egress, or point at your
@@ -35,7 +35,7 @@ and hands off to the next. You don't need to read everything; follow the path.
 
 1. **What is this and why do I care?**: you are here. Sovereign Data Intelligence, in one page.
 2. **How do I get the UDFs running in 5 minutes?** → [Getting Started](docs/getting-started.md) (`docker compose up -d`, or the native `.deb`/`.rpm`/`.msi`, then your first Scout search).
-3. **How do I apply this to my industry?** → [Starter Kits](docs/starter-kits.md): a problem → agent map using the 16 shipped agents, plus all eleven industry-vertical demo *scripts*, verified end to end (see [demo/README.md](demo/README.md#industry-vertical-demos)).
+3. **How do I apply this to my industry?** → [Starter Kits](docs/starter-kits.md): a problem → agent map using the 16 shipped agents, plus all forty-two industry-vertical demo *scripts*, verified end to end (see [demo/README.md](demo/README.md#industry-vertical-demos)).
 4. **How does a specific agent work and what are its inputs?** → [Agent Reference](docs/api-agency.md): the sixteen installable agents, each with a real `CALL` example.
 5. **How do I build a proprietary agent that isn't in the box?** → [Composition Guide](docs/composition-guide.md): the design patterns behind the shipped agents.
 
@@ -123,12 +123,12 @@ what the hash chain can and can't prove.
 
 ## 📊 Compatibility & License
 
-| MariaDB | Linux | Windows x64  | macOS |
-| --- | :---: |:------------:|:-----:|
-| 10.6 | ✓ |      ✓       | ✓ |   ✓   |
-| 10.11 | ✓ |      ✓       | ✓ |   ✓   |
-| 11.4 LTS | ✓ |      ✓       | ✓ |   ✓   |
-| 12.3 LTS | ✓ |      ✓       | ✓ |   ✓   |
+| MariaDB | Linux amd64 | Linux arm64 | Windows x64 | macOS |
+| --- | :---: | :---: | :---: | :---: |
+| 10.6 | ✓ | ✓ | ✓ | ✓ |
+| 10.11 | ✓ | ✓ | ✓ | ✓ |
+| 11.4 LTS | ✓ | ✓ | ✓ | ✓ |
+| 12.3 LTS | ✓ | ✓ | ✓ | ✓ |
 
 **License**: mixed, by component --
 
@@ -163,6 +163,7 @@ For enterprise editions, licensing, and support, contact
 - **[Reasoning Setup](docs/reasoning-setup.md)**: LLM provider configuration (Ollama, OpenAI, Bedrock, Azure, Vertex).
 - **[Text-to-SQL Setup](docs/text-to-sql-setup.md)**: pipeline details and the security model.
 - **[Vectorizer Setup](docs/vectorizer-setup.md)**: automatic embedding pipelines.
+- **[MCP Plugin](docs/mcp-plugin.md)**: use FractalSQL from Claude Desktop, Cursor, Windsurf, Claude Code, LangChain, LlamaIndex, CrewAI, or any other MCP client.
 - **[FractalSQL Daemon](docs/fractalsql-daemon.md)**: running `fractalsqld` by hand, its config file, the `fsqlctl` CLI, and what a daemon crash does (and doesn't) do to your server.
 - **[Docker Demo](docs/docker-demo.md)**: a one-command end-to-end demo.
 - **[Agent Blueprint Gallery](demo/README.md)**: the vertical demos and reference agents.
