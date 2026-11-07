@@ -482,13 +482,22 @@ ent_dlopen_verified_copy(const char *orig_path,
 /* key embedded here. New enterprise releases only need a fresh          */
 /* signature from the same long-lived private key, no rebuild required.  */
 /*                                                                      */
-/* FractalSQLabs's long-lived Ed25519 signing public key. The matching  */
-/* private key is held offline in the enterprise release process, never */
-/* in this repo. */
+/* FractalSQLabs's long-lived Ed25519 signing public key. */
 static const unsigned char FSQL_ENTERPRISE_PUBKEY[32] = {
     0xd5, 0xf6, 0x08, 0xa5, 0x8b, 0x1e, 0xb7, 0xe5, 0x9a, 0xcb, 0x8f, 0xab,
     0x80, 0x35, 0x9d, 0x58, 0x3f, 0x4e, 0xd1, 0xd1, 0xa2, 0x9c, 0x33, 0x6b,
     0xcb, 0x4b, 0x43, 0xcf, 0xf1, 0x07, 0x7f, 0xcb
+};
+
+/* The FractalSQLabs reasoning-plugin signing public key. A plugin release is
+ * signed with the matching private key; its detached <plugin>.sig (64 raw
+ * bytes) must verify against this key before the plugin is loaded. It is a
+ * different key from the enterprise-library key above. Compiled in; no setting
+ * can replace it. */
+static const unsigned char FSQL_REASONING_PLUGIN_PUBKEY[32] = {
+    0xbb, 0x24, 0x79, 0x25, 0x84, 0xe8, 0x9b, 0x1d, 0x1b, 0x48, 0x49, 0xba,
+    0x70, 0x1d, 0xa1, 0x71, 0xa3, 0x4f, 0x8a, 0x29, 0x47, 0x83, 0xd1, 0xd4,
+    0x74, 0xdf, 0x9b, 0x07, 0x44, 0xc5, 0x94, 0x53
 };
 
 typedef enum {
@@ -515,6 +524,7 @@ typedef enum {
  * out parameter may be NULL. */
 static ent_sig_result_t
 ent_verify_signature(const char *so_path,
+                     const unsigned char pubkey[32],
                      unsigned char **out_verified_bytes,
                      size_t *out_verified_len)
 {
@@ -567,7 +577,7 @@ ent_verify_signature(const char *so_path,
     fclose(f);
 
     pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                       FSQL_ENTERPRISE_PUBKEY, sizeof FSQL_ENTERPRISE_PUBKEY);
+                                       pubkey, 32);
     if (pkey == NULL) { free(so_bytes); return ENT_SIG_IOERROR; }
 
     mdctx = EVP_MD_CTX_new();
@@ -596,69 +606,48 @@ ent_verify_signature(const char *so_path,
     return result;
 }
 
-static int
-ent_hexval(int c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 bool
 fractal_plugin_verify(const char *path, char *err, size_t errsz)
 {
-    const char *allow = getenv("FRACTALSQL_REASONING_ALLOW_UNVERIFIED");
-    if (allow != NULL && allow[0] != '\0')
-        return true;                       /* operator opt-out */
+    /* A signature is required unless FSQL_REASONING_REQUIRE_SIGNATURE=0 is in the environment.
+     * With it off, a plugin that has no .sig still loads (one warning); a .sig that is present
+     * is always checked and a wrong one is always refused. */
+    const char *rq = getenv("FSQL_REASONING_REQUIRE_SIGNATURE");
+    const bool require = !(rq != NULL && rq[0] == '0');
     if (path == NULL || path[0] == '\0')
     {
+        if (!require) return true;         /* the loader reports the missing plugin itself */
         snprintf(err, errsz, "no reasoning plugin path configured");
         return false;
     }
 
-    const char *pin = getenv("FRACTALSQL_REASONING_PLUGIN_SHA256");
-    if (pin != NULL && pin[0] != '\0')
+    ent_sig_result_t sig = ent_verify_signature(path, FSQL_REASONING_PLUGIN_PUBKEY, NULL, NULL);
+    if (sig == ENT_SIG_OK) return true;
+    if (sig == ENT_SIG_INVALID)
     {
-        unsigned char want[32], got[EVP_MAX_MD_SIZE];
-        unsigned int  glen = 0;
-        bool          ok = (strlen(pin) == 64);
-        for (int i = 0; ok && i < 32; i++)
+        snprintf(err, errsz,
+                 "reasoning plugin \"%s\" failed signature verification -- refusing to load (the plugin or its "
+                 ".sig is corrupt or not from FractalSQLabs)", path);
+        return false;
+    }
+    if (!require)
+    {
+        static int warned = 0;
+        if (!warned)
         {
-            int hi = ent_hexval(pin[i * 2]), lo = ent_hexval(pin[i * 2 + 1]);
-            if (hi < 0 || lo < 0) ok = false; else want[i] = (unsigned char) ((hi << 4) | lo);
-        }
-        if (!ok) { snprintf(err, errsz, "FRACTALSQL_REASONING_PLUGIN_SHA256 must be 64 hex digits"); return false; }
-
-        FILE *f = fopen(path, "rb");
-        if (f == NULL) { snprintf(err, errsz, "reasoning plugin \"%s\" cannot be read for verification", path); return false; }
-        EVP_MD_CTX *md = EVP_MD_CTX_new();
-        unsigned char buf[8192];
-        size_t n;
-        bool hashed = (md != NULL && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1);
-        while (hashed && (n = fread(buf, 1, sizeof buf, f)) > 0)
-            if (EVP_DigestUpdate(md, buf, n) != 1) hashed = false;
-        fclose(f);
-        if (hashed) hashed = (EVP_DigestFinal_ex(md, got, &glen) == 1 && glen == 32);
-        if (md != NULL) EVP_MD_CTX_free(md);
-        if (!hashed || CRYPTO_memcmp(want, got, 32) != 0)
-        {
-            snprintf(err, errsz, "reasoning plugin \"%s\" does not match FRACTALSQL_REASONING_PLUGIN_SHA256 -- refusing to load", path);
-            return false;
+            warned = 1;
+            fprintf(stderr, "fractalsql: loading reasoning plugin \"%s\" without a signature "
+                            "(FSQL_REASONING_REQUIRE_SIGNATURE=0)\n", path);
         }
         return true;
     }
-
-    ent_sig_result_t sig = ent_verify_signature(path, NULL, NULL);
-    if (sig == ENT_SIG_OK) return true;
     if (sig == ENT_SIG_MISSING)
         snprintf(err, errsz,
-                 "reasoning plugin \"%s\" has no .sig and no FRACTALSQL_REASONING_PLUGIN_SHA256 pin -- refusing to load "
-                 "native code that is not verified (set FRACTALSQL_REASONING_ALLOW_UNVERIFIED to opt out)", path);
+                 "no signature found for reasoning plugin \"%s\" (expected \"%s.sig\"); place the .sig "
+                 "beside the plugin, or set FSQL_REASONING_REQUIRE_SIGNATURE=0 to load an unsigned plugin", path, path);
     else
         snprintf(err, errsz,
-                 "reasoning plugin \"%s\" failed signature verification -- refusing to load (the file or its .sig "
-                 "does not match the FractalSQLabs signing key)", path);
+                 "could not read reasoning plugin \"%s\" for signature verification -- refusing to load", path);
     return false;
 }
 
@@ -705,32 +694,30 @@ ent_signature_gate(const char *path,
     if (out_verified)
         *out_verified = false;
 
-    sig = ent_verify_signature(path, out_bytes, out_len);
+    sig = ent_verify_signature(path, FSQL_ENTERPRISE_PUBKEY, out_bytes, out_len);
 
     if (sig == ENT_SIG_INVALID)
     {
         fprintf(stderr,
                "fractalsql: enterprise library \"%s\" failed signature "
-               "verification -- refusing to load (the .so or its .sig "
-               "does not match the expected FractalSQLabs signing key; "
-               "the file may be corrupt or tampered)\n", path);
+               "verification -- refusing to load (the library or its .sig "
+               "is corrupt or not from FractalSQLabs)\n", path);
         return false;
     }
     if (sig == ENT_SIG_MISSING && ent_require_signature())
     {
         fprintf(stderr,
                "fractalsql: no signature found for enterprise library "
-               "\"%s\" (expected \"%s.sig\") and "
-               "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE is set\n", path, path);
+               "\"%s\" (expected \"%s.sig\"); place the .sig beside the library, or set "
+               "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0 to load an unsigned library\n", path, path);
         return false;
     }
     if (sig == ENT_SIG_MISSING)
     {
         fprintf(stderr,
                "fractalsql: no signature found for enterprise library "
-               "\"%s\" -- loading unverified (set "
-               "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=1 to refuse "
-               "unsigned enterprise libraries)\n", path);
+               "\"%s\" (expected \"%s.sig\"); loading it unsigned because "
+               "signature checks are off\n", path, path);
         return true;
     }
     if (sig == ENT_SIG_IOERROR)
@@ -755,14 +742,14 @@ ent_signature_gate(const char *path,
         if (ent_require_signature())
         {
             fprintf(stderr,
-                   "fractalsql: enterprise library \"%s\" could not be read "
-                   "for signature verification and the signature is "
-                   "required -- refusing to load it unverified\n", path);
+                   "fractalsql: could not read enterprise library \"%s\" for "
+                   "signature verification -- refusing to load\n", path);
             return false;
         }
         fprintf(stderr,
-               "fractalsql: enterprise library \"%s\" could not be read "
-               "for signature verification -- loading unverified\n", path);
+               "fractalsql: could not read enterprise library \"%s\" for "
+               "signature verification; loading it unsigned because "
+               "signature checks are off\n", path);
         return true;
     }
 

@@ -7,7 +7,7 @@
     -dMARIADB_MAJOR=10.6 | 10.11 | 11.4 | 12.3 (dotted, for display)
     -dMARIADB_MAJOR_TAG=10_6 | 10_11 | 11_4 | 12_3 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-mdb...
-    -dMSI_VERSION=2.0.11
+    -dMSI_VERSION=2.0.12
   plus the standard candle -arch x64|arm64, which populates
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 
@@ -129,6 +129,24 @@
                  Guid="F$(var.MARIADB_MAJOR_HEX)001-0000-4000-B000-00000000DA01">
         <File Id="fractalsql.dll"
               Source="$(var.STAGE_DIR)\fractalsql.dll"
+              KeyPath="yes" />
+      </Component>
+
+      <!-- Reasoning plugin and its detached Ed25519 signature, beside fractalsql.dll in
+           the plugin directory. The plugin loads only when the .sig sits next to it. -->
+      <Component Id="c_ReasoningHttpDll"
+                 Directory="PLUGINDIR"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)011-0000-4000-B000-00000000DA11">
+        <File Id="fractalsql_reasoning_http.dll"
+              Source="$(var.STAGE_DIR)\fractalsql-reasoning-http.dll"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_ReasoningHttpDllSig"
+                 Directory="PLUGINDIR"
+                 Guid="F$(var.MARIADB_MAJOR_HEX)012-0000-4000-B000-00000000DA12">
+        <File Id="fractalsql_reasoning_http.dll.sig"
+              Source="$(var.STAGE_DIR)\fractalsql-reasoning-http.dll.sig"
               KeyPath="yes" />
       </Component>
 

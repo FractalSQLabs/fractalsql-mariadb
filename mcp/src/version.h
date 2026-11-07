@@ -4,5 +4,5 @@
 // Plugin version is version-locked to the engine version it ships with
 //: bumped only by the same release commit that bumps the engine.
 
-#define FSQL_MCP_VERSION   "2.0.11"
+#define FSQL_MCP_VERSION   "2.0.12"
 #define FSQL_MCP_PROTOCOL_NAME  "fractalsql-mariadb-mcp"

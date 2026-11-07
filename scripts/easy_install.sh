@@ -1180,7 +1180,7 @@ uninstall_flow() {
         darwin)
             echo "  To remove the files:"
             echo "    launchctl unload ~/Library/LaunchAgents/com.fractalsqlabs.fractalsqld.plist"
-            echo "    rm ${PLUGIN_DIR}/fractalsql.so ${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+            echo "    rm ${PLUGIN_DIR}/fractalsql.so ${PLUGIN_DIR}/fractalsql-reasoning-http.so ${PLUGIN_DIR}/fractalsql-reasoning-http.so.sig"
             echo "    sudo rm -rf /usr/local/libexec/fractalsql /etc/fractalsql ~/Library/LaunchAgents/com.fractalsqlabs.fractalsqld.plist"
             ;;
     esac

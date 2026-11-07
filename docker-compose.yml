@@ -15,9 +15,6 @@ services:
     environment:
       FSQL_HMAC_KEY: ${FSQL_HMAC_KEY:?set FSQL_HMAC_KEY (openssl rand -hex 32)}
       FRACTALSQL_REASONING_PLUGIN: /usr/lib/fractalsql/fractalsql-reasoning-http.so
-      # Demo only: the plugin in this image is built locally and carries no .sig. A real deployment ships a
-      # signed plugin (or pins FRACTALSQL_REASONING_PLUGIN_SHA256) and leaves this unset.
-      FRACTALSQL_REASONING_ALLOW_UNVERIFIED: "1"
       FSQL_REASONING_HTTP_URL: http://${OLLAMA_HOST:-192.168.17.15}:11434/v1/chat/completions
       FSQL_REASONING_HTTP_ALLOW_PLAINTEXT: "1"
       FSQL_REASONING_HTTP_MODEL: gpt-oss:20b

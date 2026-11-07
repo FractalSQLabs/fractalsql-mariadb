@@ -32,9 +32,9 @@ bool fractal_enterprise_lib_loaded(void);
 
 /* Authenticity gate for the reasoning plugin, which is native code run in the
  * server (or daemon) process. Called before every fsql_load_reasoning(). Trusted when:
- * FRACTALSQL_REASONING_ALLOW_UNVERIFIED is set (operator opt-out); or the plugin's SHA-256
- * equals FRACTALSQL_REASONING_PLUGIN_SHA256; or <plugin>.sig is a valid detached Ed25519
- * signature by the FractalSQLabs release key (the one that signs the enterprise core).
+ * FSQL_REASONING_REQUIRE_SIGNATURE=0 is set (operator opt-out: a plugin with no .sig
+ * loads); or <plugin>.sig is a valid detached Ed25519 signature by the FractalSQLabs
+ * reasoning-plugin signing key. A wrong .sig is always refused.
  * Returns true when trusted; otherwise false with a message in err. */
 bool fractal_plugin_verify(const char *path, char *err, size_t errsz);
 

@@ -131,7 +131,7 @@ CREATE FUNCTION fractal_search_debug   RETURNS STRING SONAME 'fractalsql.so';
 -- fractal_edition() -> 'Community'
 CREATE FUNCTION fractal_edition RETURNS STRING SONAME 'fractalsql.so';
 
--- fractal_version() -> '2.0.11'
+-- fractal_version() -> '2.0.12'
 CREATE FUNCTION fractal_version RETURNS STRING SONAME 'fractalsql.so';
 
 -- ---------------------------------------------------------------------

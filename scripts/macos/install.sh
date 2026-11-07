@@ -88,7 +88,7 @@ fi
 # in .so, so it's staged here as fractalsql.so: every install_udf.sql
 # CREATE FUNCTION ... SONAME 'fractalsql.so' reference expects that
 # exact on-disk name, on every platform.
-for f in fractalsql.dylib fractalsql-reasoning-http.so fractalsqld \
+for f in fractalsql.dylib fractalsql-reasoning-http.so fractalsql-reasoning-http.so.sig fractalsqld \
          com.fractalsqlabs.fractalsqld.plist; do
     if [[ ! -f "${HERE}/${f}" ]]; then
         echo "error: ${f} not found in ${HERE}" >&2
@@ -109,6 +109,8 @@ fi
 ${PLUGIN_INSTALL} -d "${PLUGIN_DIR}"
 ${PLUGIN_INSTALL} -m 0755 "${HERE}/fractalsql.dylib" "${PLUGIN_DIR}/fractalsql.so"
 ${PLUGIN_INSTALL} -m 0755 "${HERE}/fractalsql-reasoning-http.so" "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+# The plugin loads only with its detached signature beside it.
+${PLUGIN_INSTALL} -m 0644 "${HERE}/fractalsql-reasoning-http.so.sig" "${PLUGIN_DIR}/fractalsql-reasoning-http.so.sig"
 
 # /etc and /usr/local/{libexec,var} are root-owned on a stock system on
 # both Intel and Apple Silicon (unlike plugin_dir, which Homebrew's own
@@ -160,7 +162,7 @@ install -m 0644 "${HERE}/com.fractalsqlabs.fractalsqld.plist" "${PLIST_DST}"
 echo
 echo "Installed:"
 echo "  ${PLUGIN_DIR}/fractalsql.so (shim, from fractalsql.dylib)"
-echo "  ${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+echo "  ${PLUGIN_DIR}/fractalsql-reasoning-http.so (+ .sig)"
 echo "  ${DAEMON_DIR}/fractalsqld (daemon)"
 echo "  ${CONF_DIR}/fractalsqld.conf, ${CONF_DIR}/fractalsql.conf, ${CONF_DIR}/hmac.key"
 echo "  ${PLIST_DST} (not yet loaded)"

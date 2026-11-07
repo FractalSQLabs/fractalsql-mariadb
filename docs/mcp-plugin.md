@@ -1001,10 +1001,10 @@ capped rather than rotated: `FRACTALSQL_LEDGER_MAX_BYTES` (default 1 GiB;
 operator archives the file and starts a new chain.
 
 **A reasoning plugin has to be verified.** A native plugin is loaded only
-if its detached `.sig` is a valid Ed25519 signature, or its SHA-256
-matches `FRACTALSQL_REASONING_PLUGIN_SHA256` (64 hex digits). A plugin
-with neither is refused. `FRACTALSQL_REASONING_ALLOW_UNVERIFIED` is the
-operator's explicit opt-out of that check; set it only when you have
+if its detached `.sig` (beside the plugin) is a valid Ed25519 signature by
+the FractalSQLabs reasoning-plugin signing key. A plugin without one, or with
+one that does not verify, is refused. `FSQL_REASONING_REQUIRE_SIGNATURE=0`
+turns that check off for a plugin with no `.sig`; set it only when you have
 another way to establish what you are loading.
 
 **What else is stored, and where.**
@@ -1104,8 +1104,7 @@ server.
 | `FSQL_LEDGER_ANCHOR_LOG` | `off` | `stderr` or `syslog`: publish the chain's head on every append |
 | `FRACTALSQL_LEDGER_MAX_BYTES` | `1073741824` | the size past which ledger appends are refused; `0` for unbounded |
 | `FRACTALSQL_AUDIT_REQUIRE_ACTOR` | unset | set to refuse a bare two-argument `fractal_audit_log` call that names no actor |
-| `FRACTALSQL_REASONING_PLUGIN_SHA256` | -- | the 64 hex digits the reasoning plugin's SHA-256 must match |
-| `FRACTALSQL_REASONING_ALLOW_UNVERIFIED` | unset | set to load a reasoning plugin that is neither signed nor pinned |
+| `FSQL_REASONING_REQUIRE_SIGNATURE` | `1` | set to `0` to load a reasoning plugin that has no `.sig` (a `.sig` that is present but wrong is always refused) |
 | `FRACTALSQL_HTTP_TOKEN` | -- | the bearer token sent to the reasoning and text-to-SQL provider (`FSQL_REASONING_HTTP_TOKEN` takes precedence) |
 | `FRACTALSQL_HTTP_ALLOW_PLAINTEXT` | unset | set to let the provider be reached over plaintext HTTP (`FSQL_REASONING_HTTP_ALLOW_PLAINTEXT` takes precedence) |
 | `FRACTALSQL_HTTP_THINK` | -- | the think mode the provider is asked for (`FSQL_REASONING_HTTP_THINK` takes precedence) |

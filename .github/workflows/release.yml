@@ -191,7 +191,7 @@ jobs:
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "2.0.11"
+              test "${VERSION}" = "2.0.12"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -341,6 +341,8 @@ jobs:
                   | grep -E 'usr/lib/mysql/plugin/fractalsql\.so$'
               dpkg-deb -c "${deb}" \
                   | grep -E 'usr/lib/mysql/plugin/fractalsql-reasoning-http\.so$'
+              dpkg-deb -c "${deb}" \
+                  | grep -E 'usr/lib/mysql/plugin/fractalsql-reasoning-http\.so\.sig$'
           done
           for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
               echo "=== ${rpm} ==="
@@ -348,6 +350,8 @@ jobs:
                   | grep -E '/usr/lib64/mysql/plugin/fractalsql\.so$'
               rpm -qlp "${rpm}" \
                   | grep -E '/usr/lib64/mysql/plugin/fractalsql-reasoning-http\.so$'
+              rpm -qlp "${rpm}" \
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql-reasoning-http\.so\.sig$'
           done
 
       # easy_install.sh is arch-independent (pure bash), so stamp it once
@@ -642,6 +646,8 @@ jobs:
           # this keeps the raw zip right).
           install -m 0755 "dist/${{ matrix.platform_tag }}/fractalsqld" "${STAGE}/fractalsqld"
           install -m 0755 "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so" "${STAGE}/"
+          # The plugin loads only with its detached signature beside it.
+          install -m 0644 "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so.sig" "${STAGE}/"
           install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist "${STAGE}/"
           cp LICENSE "${STAGE}/"
           cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
@@ -656,7 +662,7 @@ jobs:
           fi
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
-          fractalsql-mariadb 2.0.11 Community (${{ matrix.platform_tag }})
+          fractalsql-mariadb 2.0.12 Community (${{ matrix.platform_tag }})
 
           Unsigned, for macOS. Compatible with MariaDB 10.6 / 10.11 /
           11.4 LTS / 12.3 LTS via Homebrew.
@@ -687,6 +693,8 @@ jobs:
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql.so
                  sudo cp fractalsql-reasoning-http.so \\
                      /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so
+                 sudo cp fractalsql-reasoning-http.so.sig \\
+                     /opt/homebrew/opt/mariadb/lib/plugin/fractalsql-reasoning-http.so.sig
 
           3. Clear Gatekeeper quarantine:
                  sudo xattr -d com.apple.quarantine \\

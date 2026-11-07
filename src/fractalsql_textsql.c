@@ -293,7 +293,7 @@ typedef struct {
 
 static t2s_config g_cfg;     /* effective values */
 
-/* Verify the reasoning plugin (signature or pinned digest) before every load. */
+/* Verify the reasoning plugin (its detached signature) before every load. */
 static char g_plugin_verr[512];
 static int
 checked_load_reasoning(fsql_ctx *ctx)

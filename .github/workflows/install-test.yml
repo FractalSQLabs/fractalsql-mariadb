@@ -123,10 +123,6 @@ jobs:
           export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
           export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
           export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
-          # Test fixture: CI loads the unsigned reasoning plugin straight from the
-          # package, and plugin verification refuses a plugin that is neither signed
-          # nor pinned. A real deployment signs it or sets FRACTALSQL_REASONING_PLUGIN_SHA256.
-          export FRACTALSQL_REASONING_ALLOW_UNVERIFIED=1
 
           mariadbd --user=mysql &
           for i in \$(seq 1 120); do
@@ -178,6 +174,9 @@ jobs:
               || { echo "FAIL: fractalsql.so missing from \$PLUGIN_DIR"; ls -la "\$PLUGIN_DIR" || true; exit 1; }
           test -f "\$PLUGIN_DIR/fractalsql-reasoning-http.so" \
               || { echo "FAIL: fractalsql-reasoning-http.so missing from \$PLUGIN_DIR"; exit 1; }
+          # The package must ship the detached signature beside the plugin (64 raw bytes).
+          test "\$(wc -c < "\$PLUGIN_DIR/fractalsql-reasoning-http.so.sig")" -eq 64 \
+              || { echo "FAIL: fractalsql-reasoning-http.so.sig missing or not 64 bytes in \$PLUGIN_DIR"; exit 1; }
           ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
               || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
 
@@ -194,7 +193,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.11"
+          test "\$VERSION" = "2.0.12"
 
           # End-to-end fractal_search smoke. Trivial 4-row corpus, query
           # equals row 0; expect a JSON document with dim/n_corpus/top_k.
@@ -337,10 +336,6 @@ jobs:
           # with no systemd around, and systemd's own unit is what
           # creates /run/fractalsql (RuntimeDirectory=) on a real host
           # -- neither happened here, so start it by hand the same way.
-          # Test fixture: CI loads the unsigned reasoning plugin straight from the
-          # package, and plugin verification refuses a plugin that is neither signed
-          # nor pinned. A real deployment signs it or sets FRACTALSQL_REASONING_PLUGIN_SHA256.
-          export FRACTALSQL_REASONING_ALLOW_UNVERIFIED=1
           # (runuser inherits this environment)
           mkdir -p /run/fractalsql
           chown fractalsql:fractalsql /run/fractalsql
@@ -446,10 +441,6 @@ jobs:
           export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
           export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
           export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
-          # Test fixture: CI loads the unsigned reasoning plugin straight from the
-          # package, and plugin verification refuses a plugin that is neither signed
-          # nor pinned. A real deployment signs it or sets FRACTALSQL_REASONING_PLUGIN_SHA256.
-          export FRACTALSQL_REASONING_ALLOW_UNVERIFIED=1
 
           mariadbd --user=mysql &
           for i in \$(seq 1 120); do
@@ -497,6 +488,9 @@ jobs:
               || { echo "FAIL: fractalsql.so missing from \$PLUGIN_DIR"; ls -la "\$PLUGIN_DIR" || true; exit 1; }
           test -f "\$PLUGIN_DIR/fractalsql-reasoning-http.so" \
               || { echo "FAIL: fractalsql-reasoning-http.so missing from \$PLUGIN_DIR"; exit 1; }
+          # The package must ship the detached signature beside the plugin (64 raw bytes).
+          test "\$(wc -c < "\$PLUGIN_DIR/fractalsql-reasoning-http.so.sig")" -eq 64 \
+              || { echo "FAIL: fractalsql-reasoning-http.so.sig missing or not 64 bytes in \$PLUGIN_DIR"; exit 1; }
           ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
               || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "\$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
 
@@ -513,7 +507,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.11"
+          test "\$VERSION" = "2.0.12"
 
           RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
           echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
@@ -621,6 +615,7 @@ jobs:
           cp service/build/fractalsql.so "${STAGE}/fractalsql.dylib"
           install -m 0755 service/build/fractalsqld "${STAGE}/fractalsqld"
           install -m 0755 include/darwin-arm64/fractalsql-reasoning-http.so "${STAGE}/fractalsql-reasoning-http.so"
+          install -m 0644 include/darwin-arm64/fractalsql-reasoning-http.so.sig "${STAGE}/fractalsql-reasoning-http.so.sig"
           install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist "${STAGE}/"
           cp sql/install_udf.sql sql/install_agents.sql "${STAGE}/"
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
@@ -635,7 +630,7 @@ jobs:
           VERSION=$(mariadb -N -B -e "SELECT fractal_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
-          test "${VERSION}" = "2.0.11"
+          test "${VERSION}" = "2.0.12"
 
           RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
           echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
@@ -704,10 +699,6 @@ jobs:
           export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
           export FRACTALSQL_HTTP_URL="http://127.0.0.1:18080/v1/chat/completions"
           export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
-          # Test fixture: CI loads the unsigned reasoning plugin straight from the
-          # package, and plugin verification refuses a plugin that is neither signed
-          # nor pinned. A real deployment signs it or sets FRACTALSQL_REASONING_PLUGIN_SHA256.
-          export FRACTALSQL_REASONING_ALLOW_UNVERIFIED=1
           /usr/local/libexec/fractalsql/fractalsqld -c /etc/fractalsql/fractalsqld.conf &
           FSQD_PID=$!
           for i in $(seq 1 50); do
@@ -844,6 +835,7 @@ jobs:
           cp service/build/fractalsql.so /tmp/fsql-stage/fractalsql.dylib
           install -m 0755 service/build/fractalsqld /tmp/fsql-stage/fractalsqld
           install -m 0755 include/darwin-arm64/fractalsql-reasoning-http.so /tmp/fsql-stage/
+          install -m 0644 include/darwin-arm64/fractalsql-reasoning-http.so.sig /tmp/fsql-stage/
           install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist /tmp/fsql-stage/
           chmod +x scripts/macos/install.sh
           cp scripts/macos/install.sh /tmp/fsql-stage/
@@ -984,6 +976,8 @@ jobs:
           # be the wizard's wiring are only the fallback for keys the
           # conf omits.)
           Copy-Item "include\windows-x86_64\fractalsql-reasoning-http.dll" (Join-Path $pluginDir 'fractalsql-reasoning-http.dll')
+          # The plugin loads only with its detached signature beside it (the default requirement).
+          Copy-Item "include\windows-x86_64\fractalsql-reasoning-http.dll.sig" (Join-Path $pluginDir 'fractalsql-reasoning-http.dll.sig')
 
       # fractalsql.dll (the shim, just staged above) is only half of
       # it: every UDF call forwards to fractalsqld over a named pipe,
@@ -1061,12 +1055,6 @@ jobs:
               icacls $entry.Path /inheritance:r /grant:r $entry.Grant | Out-Null
               if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: icacls failed to restrict $($entry.Path)"; exit 1 }
           }
-
-          # Test fixture: CI loads the unsigned reasoning plugin from the build tree, and
-          # plugin verification refuses a plugin that is neither signed nor pinned. A real
-          # deployment signs it or sets FRACTALSQL_REASONING_PLUGIN_SHA256. A service reads the
-          # machine environment when it starts.
-          [Environment]::SetEnvironmentVariable('FRACTALSQL_REASONING_ALLOW_UNVERIFIED', '1', 'Machine')
 
           $daemonExe = (Resolve-Path 'fractalsqld.exe').Path
           & pwsh -File .\scripts\windows\fractalsqld-service.ps1 -Action install -Exe $daemonExe -Config $fsqldConf

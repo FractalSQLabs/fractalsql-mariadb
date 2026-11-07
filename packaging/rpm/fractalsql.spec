@@ -16,7 +16,7 @@
 # run the UDF bodies the shim forwards calls to.
 
 Name:           fractalsql-mariadb
-Version:        2.0.11
+Version:        2.0.12
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 
@@ -61,6 +61,8 @@ install -Dm0755 dist/amd64/fractalsqld \
     %{buildroot}%{libexecdir}/fractalsqld
 install -Dm0755 include/linux-x86_64/fractalsql-reasoning-http.so \
     %{buildroot}%{plugindir}/fractalsql-reasoning-http.so
+install -Dm0644 include/linux-x86_64/fractalsql-reasoning-http.so.sig \
+    %{buildroot}%{plugindir}/fractalsql-reasoning-http.so.sig
 install -Dm0644 sql/install_udf.sql \
     %{buildroot}%{sharedir}/install_udf.sql
 install -Dm0644 sql/install_agents.sql \
@@ -121,6 +123,7 @@ systemctl enable --now fractalsqld.service >/dev/null 2>&1 || true
 %doc THIRD-PARTY-NOTICES.md GPL-SOURCE-OFFER.txt
 %{plugindir}/fractalsql.so
 %{plugindir}/fractalsql-reasoning-http.so
+%{plugindir}/fractalsql-reasoning-http.so.sig
 %{libexecdir}/fractalsqld
 %{_unitdir}/fractalsqld.service
 %{sharedir}/install_udf.sql
@@ -128,6 +131,18 @@ systemctl enable --now fractalsqld.service >/dev/null 2>&1 || true
 %dir %attr(0750,fractalsql,fractalsql) %{confdir}
 
 %changelog
+* Sat Nov 07 2026 FractalSQLabs - 2.0.12-1
+- Safety: the reasoning plugin is now signed. It ships with a detached
+  Ed25519 signature (.sig) beside it and loads only when that file is
+  present and valid; a missing signature is refused unless
+  FSQL_REASONING_REQUIRE_SIGNATURE=0 is set, and a wrong one is always
+  refused. The enterprise library signature requirement is unchanged.
+- Removed FRACTALSQL_REASONING_ALLOW_UNVERIFIED and
+  FRACTALSQL_REASONING_PLUGIN_SHA256; use
+  FSQL_REASONING_REQUIRE_SIGNATURE=0 to load an unsigned plugin.
+- Packaging: the plugin's .sig is installed beside the plugin, and the
+  Windows installer now includes the reasoning plugin.
+
 * Wed Oct 21 2026 FractalSQLabs - 2.0.11-1
 - Text-to-SQL: fractal_sql_agent and the MCP text-to-SQL tool take a
   required p_auto_execute argument. FALSE generates and validates the

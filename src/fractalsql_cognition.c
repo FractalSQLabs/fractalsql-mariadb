@@ -431,7 +431,7 @@ static bool g_env_captured;        /* g_env_fb filled (under load lock) */
 static bool g_cfg_initialized;     /* g_cfg filled from the snapshot (until apply) */
 static bool g_provider_applied;    /* g_cfg last written by apply_provider */
 
-/* The reasoning plugin is native code -- verify it (signature or pinned digest)
+/* The reasoning plugin is native code -- verify it (its detached signature)
  * before every load. A refusal leaves its message here for the caller's error text. */
 static char g_plugin_verr[512];
 static int

@@ -142,7 +142,7 @@ reload` push these settings:
 | `enterprise_lib` | `FRACTALSQL_ENTERPRISE_LIB` | path to the enterprise core shared library |
 | `enterprise_ledger_path` | `FRACTALSQL_ENTERPRISE_LEDGER_PATH` | ledger file (default `fractalsql_ledger.dat`) |
 | `enterprise_ledger_key` | `FRACTALSQL_ENTERPRISE_LEDGER_KEY` | HMAC-SHA256 key (a secret; plaintext in the conf) |
-| `enterprise_require_signature` | `FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE` | `0`/`1` gate requiring a valid detached signature on load |
+| `enterprise_require_signature` | `FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE` | `0`/`1` gate requiring a valid detached signature on load (default `1`) |
 
 Reload semantics, verified in `src/fractalsql_enterprise.c`:
 
@@ -371,28 +371,26 @@ SELECT entry_hash_hex = '<anchored hex>'
 `0` or no matching row means the record was altered, or the chain was
 rewound past it, after the anchor was taken.
 
-**Detached signature verification (optional hardening).** The 8-symbol
-`dlsym` check in `ensure_enterprise_lib()` only proves a file has the right
-function *names*. A tampered file with the same names sails through it
-untouched. Set `enterprise_require_signature = 1` in `fractalsqld.conf`
-(or `FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=1`, the process-environment
-fallback) to additionally
-require a valid detached Ed25519 signature (a sibling `<path>.sig` file,
-64 raw bytes) against a fixed FractalSQLabs public key — verified via
-OpenSSL's EVP API before the library is loaded. Off by default: a missing
-`.sig` only logs a warning to `fractalsqld`'s log (there is no
-SQL-visible `WARNING` channel reachable from this lazy, first-call load
-path) and the library still loads, so this is backward compatible with
-unsigned releases. An **invalid** signature (present but wrong) is
-always refused regardless of the setting: unambiguous tamper evidence,
-unlike a merely absent file. A library that cannot be **read** for
-verification at all (an unreadable `.so`, an unreadable `.sig`, a
-permissions problem, a race with the operator re-signing) is refused
-on the same terms as a missing signature when the setting is on: the
-operator asked for a signed library, and a file nobody could read is
-not one. With the setting off, that library is still loaded — the load
-may well succeed where the read failed — and the log says it was
-loaded unverified. New enterprise releases only need a fresh
+**Detached signature verification.** The 8-symbol `dlsym` check in
+`ensure_enterprise_lib()` only proves a file has the right function *names*.
+A tampered file with the same names sails through it untouched. So the
+daemon also requires a valid detached Ed25519 signature (a sibling
+`<path>.sig` file, 64 raw bytes) against a fixed FractalSQLabs public key,
+verified via OpenSSL's EVP API before the library is loaded. This is on by
+default: a library with no `.sig` is refused, and the log says so:
+`no signature found for enterprise library "<path>" (expected "<path>.sig");
+place the .sig beside the library, or set FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0
+to load an unsigned library`. Set `FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0`
+in the daemon's environment (or `enterprise_require_signature = 0` in
+`fractalsqld.conf`) to load an unsigned library anyway. An **invalid** signature (present but wrong) is always refused,
+whatever the settings: unambiguous tamper evidence, unlike a merely absent
+file. A library that cannot be **read** for verification at all (an
+unreadable `.so`, an unreadable `.sig`, a permissions problem, a race with
+the operator re-signing) is refused on the same terms as a missing signature
+while the signature is required: the operator asked for a signed library,
+and a file nobody could read is not one. With the requirement off, that
+library is still loaded — the load may well succeed where the read failed —
+and the log says it was loaded unsigned. New enterprise releases only need a fresh
 signature from the same long-lived key; this extension never needs
 rebuilding, preserving the drop-in-`.so` design a hash pin would have broken.
 
@@ -474,13 +472,16 @@ bounded by size rather than turned over: `FRACTALSQL_LEDGER_MAX_BYTES`
 (default 1 GiB; `0` for unbounded) is the size past which appends are
 refused. The operator archives the file and starts a new chain.
 
-**A native plugin has to be verified before it is loaded.** A native
-library is loaded only if its detached `.sig` is a valid Ed25519
-signature, or its SHA-256 matches `FRACTALSQL_REASONING_PLUGIN_SHA256` (64
-hex digits). A plugin with neither is refused.
-`FRACTALSQL_REASONING_ALLOW_UNVERIFIED` is the operator's explicit
-opt-out; set it only when you have another way to establish what you are
-loading.
+**A native plugin has to be verified before it is loaded.** The reasoning
+plugin is loaded only if its detached `.sig` (`<plugin>.sig`, beside the
+plugin) is a valid Ed25519 signature by the FractalSQLabs reasoning-plugin
+signing key built into the daemon. A plugin without one is refused, and so is
+a plugin whose signature does not verify. The plugin and its `.sig` ship
+together in the release packages. The check is on by default;
+`FSQL_REASONING_REQUIRE_SIGNATURE=0` turns it off so that a plugin with no
+`.sig` loads (a `.sig` that is present but wrong is still refused). Turn it
+off only when you have another way to establish what you are loading, such as
+a plugin you built yourself.
 
 ---
 

@@ -441,8 +441,8 @@
 set -uo pipefail
 # Test fixtures ship an unsigned mock enterprise core; the product default (signature required) is exercised explicitly in gate 28.
 export FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE="${FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE:-0}"
-# Test fixtures load unsigned mock reasoning plugins; the product default (signature or pinned digest required) is bypassed explicitly here.
-export FRACTALSQL_REASONING_ALLOW_UNVERIFIED="${FRACTALSQL_REASONING_ALLOW_UNVERIFIED:-1}"
+# Test fixtures load unsigned mock reasoning plugins; the product default (a valid signature required) is bypassed explicitly here.
+export FSQL_REASONING_REQUIRE_SIGNATURE="${FSQL_REASONING_REQUIRE_SIGNATURE:-0}"
 
 # Captured before the arg-parsing loop below consumes "$@" via `shift` --
 # needed later to re-exec this same invocation under setarch (--tsan
@@ -463,7 +463,7 @@ cd "$HERE"
 
 TMPROOT="$(cd /tmp && pwd -P)"
 
-DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 29 31 32 33 34 35 36 39 40 41 42 43 44 45 47 48 49 50 51 52 53 54 55 56 58 59 60 61 62 63 66 68)
+DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 29 31 32 33 34 35 36 39 40 41 42 43 44 45 47 48 49 50 51 52 53 54 55 56 58 59 60 61 62 63 66 68 69)
 QUICK_GATES=(01 02)
 FUZZ_GATES=(30 67)
 FAULT_GATES=(37 38 57 64 65)
@@ -1109,6 +1109,7 @@ mdb_setup() {
   # .so lacking the exec bit (Linux never checks it, so only the darwin
   # runs would break -- with a bare NULL from the UDF, no logged cause).
   install -m 0755 "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so" "$PLUGDIR/fractalsql-reasoning-http.so" || return 2
+  install -m 0644 "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so.sig" "$PLUGDIR/fractalsql-reasoning-http.so.sig" || return 2
   local mock_port=$(( 18300 + $(echo "$v" | tr -d '.') % 100 ))
   python3 "$HERE/scripts/ci/mock_llm.py" "$mock_port" \
     >/tmp/fractalsql_bt_mockllm_${v//./_}.log 2>&1 &
@@ -4875,13 +4876,16 @@ gate_35_enterprise_mock() {
   # Path 2: no .sig at all + enterprise_require_signature=1 -- fatal.
   # A fresh path (vs. path 1 above) so this gets its own dlopen/verify
   # attempt rather than hitting path 1's cached "already attempted".
+  L=$(log_mark)
   printf 'enterprise_lib = %s\nenterprise_require_signature = 1\n' "$nosig_so" >> "$FSQD_CONF"
   rd=$(fsq_reload)
   [ "$rd" = "reloaded: configuration swapped in" ] \
     || fail "35 enterprise_mock: reload (nosig+require path) rc/err: $rd"
   local r2; r2=$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_truth_count(CONNECTION_ID());" 2>&1)
-  [ "$r2" = "NULL" ] && pass "35 enterprise_mock: a missing .sig refuses to load when enterprise_require_signature is set" \
-                      || fail "35 enterprise_mock: expected NULL, got: $r2"
+  [ "$r2" = "NULL" ] && log_from "$L" | grep -q "no signature found for enterprise library" \
+    && log_from "$L" | grep -q "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE" \
+    && pass "35 enterprise_mock: a missing .sig refuses to load when enterprise_require_signature is set, and the log names the standard opt-out" \
+    || fail "35 enterprise_mock: expected NULL + the refusal naming FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE, got: $r2 / log: $(log_from "$L" | tail -3)"
 
   # Path 3: no .sig, enterprise_require_signature back off -- loads
   # unverified (the backward-compatible default). This is the mock that
@@ -8561,6 +8565,24 @@ gate_67_mcp_fuzz() {
 #
 # It needs a live cluster (the read tool is an engine call) and the daemon
 # (the config-write checks edit the daemon's own configuration file).
+# Gate 69: every vendored reasoning plugin carries its detached signature. The host loads the
+# plugin only when <plugin>.sig (exactly 64 raw Ed25519 bytes) sits beside it, so a plugin vendored
+# without one (or with a truncated one) would ship a package whose reasoning tier refuses to start.
+# Needs no database: it is a static check of include/<platform>/.
+gate_69_plugin_sig_vendored() {
+  local n=0 bad=0 f
+  for f in "$HERE"/include/*/fractalsql-reasoning-http.so "$HERE"/include/*/fractalsql-reasoning-http.dll; do
+    [ -f "$f" ] || continue
+    n=$((n + 1))
+    if [ ! -f "${f}.sig" ] || [ "$(wc -c < "${f}.sig" | tr -d ' ')" -ne 64 ]; then
+      printf '      missing or not 64 bytes: %s.sig\n' "${f#"$HERE"/}"; bad=$((bad + 1))
+    fi
+  done
+  if [ "$n" -eq 0 ]; then skip "69 plugin_sig_vendored (no vendored plugins under include/)"; return; fi
+  if [ "$bad" -ne 0 ]; then fail "69 plugin_sig_vendored: $bad of $n vendored plugin(s) lack a valid .sig"; return; fi
+  pass "69 plugin_sig_vendored: all $n vendored plugins have a 64-byte .sig beside them"
+}
+
 gate_68_mcp_conformance() {
   if [[ ! -f "$HERE/mcp/tests/mcp_conformance.py" || ! -f "$HERE/mcp/src/main.cpp" ]]; then
     skip "68 mcp_conformance (mcp/ server code not present)"; return
@@ -8666,6 +8688,7 @@ run_major() {
     [ "$g" = "46" ] && gate_46_ledger_tsan_concurrent
     [ "$g" = "63" ] && gate_63_direct_calls
     [ "$g" = "64" ] && gate_64_direct_faults
+    [ "$g" = "69" ] && gate_69_plugin_sig_vendored
   done
 
   local need_db=0

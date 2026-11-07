@@ -95,8 +95,15 @@ done
 # ship. Links libcurl at runtime; the libcurl dependency is declared on
 # the package below rather than statically linked.
 REASONING_SO="include/${FSQL_PLATFORM}/fractalsql-reasoning-http.so"
+REASONING_SIG="${REASONING_SO}.sig"
 if [[ ! -f "${REASONING_SO}" ]]; then
     echo "missing ${REASONING_SO}: re-run the vendored-artifact deploy step" >&2
+    exit 1
+fi
+# The plugin loads only when its detached Ed25519 signature (exactly 64 bytes) sits beside it,
+# so a package must never carry the plugin without the signature.
+if [[ ! -f "${REASONING_SIG}" || "$(wc -c < "${REASONING_SIG}")" -ne 64 ]]; then
+    echo "missing or invalid ${REASONING_SIG} (needs 64 bytes): re-run the vendored-artifact deploy step" >&2
     exit 1
 fi
 
@@ -178,6 +185,8 @@ install -Dm0755 "${SHIM}" \
     "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql.so"
 install -Dm0755 "${REASONING_SO}" \
     "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql-reasoning-http.so"
+install -Dm0644 "${REASONING_SIG}" \
+    "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql-reasoning-http.so.sig"
 stage_common "${STAGE_DEB}"
 stage_mcp "${STAGE_DEB}"
 install -Dm0644 "${REPO_ROOT}/packaging/debian-copyright" \
@@ -194,6 +203,8 @@ install -Dm0755 "${SHIM}" \
     "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql.so"
 install -Dm0755 "${REASONING_SO}" \
     "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so"
+install -Dm0644 "${REASONING_SIG}" \
+    "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so.sig"
 stage_common "${STAGE_RPM}"
 stage_mcp "${STAGE_RPM}"
 # RPM has no equivalent single conventional copyright path; the same

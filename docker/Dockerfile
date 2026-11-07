@@ -245,11 +245,18 @@ RUN apt-get update \
 COPY --from=service-builder /build/service/build/fractalsqld /usr/local/bin/fractalsqld
 COPY include/linux-x86_64/fractalsql-reasoning-http.so  /usr/lib/fractalsql/fractalsql-reasoning-http.x86_64.so
 COPY include/linux-aarch64/fractalsql-reasoning-http.so /usr/lib/fractalsql/fractalsql-reasoning-http.aarch64.so
+# Each plugin's detached signature travels with it and is renamed the same way, so the
+# installed plugin finds <plugin>.sig beside it.
+COPY include/linux-x86_64/fractalsql-reasoning-http.so.sig  /usr/lib/fractalsql/fractalsql-reasoning-http.x86_64.so.sig
+COPY include/linux-aarch64/fractalsql-reasoning-http.so.sig /usr/lib/fractalsql/fractalsql-reasoning-http.aarch64.so.sig
 RUN set -e \
  && ARCH=$(uname -m) \
  && mv "/usr/lib/fractalsql/fractalsql-reasoning-http.${ARCH}.so" \
         /usr/lib/fractalsql/fractalsql-reasoning-http.so \
- && rm -f /usr/lib/fractalsql/fractalsql-reasoning-http.*.so
+ && mv "/usr/lib/fractalsql/fractalsql-reasoning-http.${ARCH}.so.sig" \
+        /usr/lib/fractalsql/fractalsql-reasoning-http.so.sig \
+ && rm -f /usr/lib/fractalsql/fractalsql-reasoning-http.*.so \
+          /usr/lib/fractalsql/fractalsql-reasoning-http.*.so.sig
 # Socket and config directory, owned by the runtime user so the container
 # can run as mysql with no capabilities. Named volumes copy this ownership.
 RUN install -d -m 0750 -o mysql -g mysql /run/fractalsql

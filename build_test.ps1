@@ -249,7 +249,7 @@ $MdbDir = (Resolve-Path -LiteralPath $MdbDir -ErrorAction Stop).Path
 $ErrorActionPreference = "Stop"
 # Test fixtures load unsigned mock plugins and an unsigned mock enterprise core; the product defaults are exercised explicitly where tested.
 if (-not $env:FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE) { $env:FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = "0" }
-if (-not $env:FRACTALSQL_REASONING_ALLOW_UNVERIFIED) { $env:FRACTALSQL_REASONING_ALLOW_UNVERIFIED = "1" }
+if (-not $env:FSQL_REASONING_REQUIRE_SIGNATURE) { $env:FSQL_REASONING_REQUIRE_SIGNATURE = "0" }
 # PowerShell 7.3+ can treat ANY native-command stderr write as a
 # terminating error under $ErrorActionPreference = 'Stop' -- regardless
 # of the writing program's own actual severity level. mariadbd.exe and

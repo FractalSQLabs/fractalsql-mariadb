@@ -30,7 +30,7 @@ REM
 REM Environment
 REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 ^| 12.3: selects UpgradeCode and install-folder name
 REM   MSI_ARCH      x64 ^| arm64: passed to candle -arch
-REM   MSI_VERSION   overrides Product Version (default 2.0.11, read from src\fractalsql.c's FSQL_VERSION if not set)
+REM   MSI_VERSION   overrides Product Version (default 2.0.12, read from src\fractalsql.c's FSQL_VERSION if not set)
 
 setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 
@@ -85,6 +85,14 @@ if exist "%STAGE%" rmdir /s /q "%STAGE%"
 mkdir "%STAGE%"
 
 copy /Y "%DLL%"                "%STAGE%\fractalsql.dll"     > nul
+REM The reasoning plugin ships with its detached Ed25519 signature; the plugin loads only with the .sig beside it.
+for %%F in (fractalsql-reasoning-http.dll fractalsql-reasoning-http.dll.sig) do if not exist "include\windows-x86_64\%%F" (
+    echo ==^> ERROR: include\windows-x86_64\%%F missing: re-run the vendored-artifact deploy step
+    popd
+    exit /b 1
+)
+copy /Y include\windows-x86_64\fractalsql-reasoning-http.dll     "%STAGE%\fractalsql-reasoning-http.dll"     > nul
+copy /Y include\windows-x86_64\fractalsql-reasoning-http.dll.sig "%STAGE%\fractalsql-reasoning-http.dll.sig" > nul
 copy /Y "%DAEMON%"             "%STAGE%\fractalsqld.exe"    > nul
 copy /Y LICENSES\Apache-2.0.txt "%STAGE%\fractalsqld-LICENSE" > nul
 copy /Y scripts\windows\fractalsqld-service.ps1 "%STAGE%\fractalsqld-service.ps1" > nul
