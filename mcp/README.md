@@ -215,8 +215,8 @@ tool can touch, and the account you configure is the boundary:
   filtering into **views**: MariaDB has no Row-Level Security, so grant
   `SELECT` on the tenant-filtered views instead of the base tables.
   Never trust the MCP boundary to restrict anything.
-- Run the admin/config tools (`fractalsql_set_config`,
-  `fractalsql_configure_reasoning`) against a separately-scoped server
+- Run the admin/config tools (`fractal_daemon_config_set`,
+  `fractal_configure_reasoning`) against a separately-scoped server
   instance, or at least a separately-privileged MariaDB account, from
   ordinary tool traffic — the server logs a one-time warning when one
   connection looks like it would serve both.

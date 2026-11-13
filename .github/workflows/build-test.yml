@@ -480,7 +480,7 @@ jobs:
     name: coverage (lcov)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
     runs-on: ubuntu-24.04  # not ubuntu-latest: MariaDB's apt repo has no release for Ubuntu 26.04 ('resolute')
-    timeout-minutes: 20
+    timeout-minutes: 45   # the coverage run includes the fault gates: gate 37 alone restarts the daemon 7 x N times
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -501,6 +501,10 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 install -qq -y mariadb-server libmariadb-dev libmariadb-dev-compat libssl-dev build-essential pkg-config
 
       - name: build_test.sh --coverage
+        env:
+          # Gate 37 sweeps an injected allocation failure over 1..N for each of seven UDFs, restarting the daemon every time (about
+          # 8 minutes at N=200 on an instrumented build). Halving N keeps the job inside its budget; gate 57 keeps its own ceiling.
+          FSQL_OOM_GATE37_MAX_N: '100'
         run: |
           set -euo pipefail
           chmod +x build_test.sh

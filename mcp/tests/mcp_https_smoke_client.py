@@ -38,7 +38,7 @@ shares, because this is the only HTTP client driver in the tree:
 MariaDB shape, not a copy: this server's TLS mode is selected by
 environment (FSQL_MCP_HTTP_TLS + FSQL_MCP_TLS_CERT / FSQL_MCP_TLS_KEY)
 rather than by a --https flag, and the HTTP transport is enabled with
---http PORT. The engine's version tool is fractalsql_get_version.
+--http PORT. The engine's version tool is fractal_version.
 
 Input (environment, all required unless noted):
   MCP_SERVER_EXE       the fractalsql-mariadb-mcp binary just built
@@ -318,7 +318,7 @@ def main() -> int:  # noqa: ANN201
             port, "POST", "/not-the-mcp-path", token=token, session=minted,
             body=json.dumps({"jsonrpc": "2.0", "id": 99,
                              "method": "tools/call",
-                             "params": {"name": "fractalsql_get_version",
+                             "params": {"name": "fractal_version",
                                         "arguments": {}}}))
         text = raw.decode("utf-8", "replace")
         check("TLS: an authenticated POST to a path the server does not "
@@ -331,7 +331,7 @@ def main() -> int:  # noqa: ANN201
         s, _, b = https_req(port, "POST", "/mcp", token=token, session=minted,
                             body=json.dumps({"jsonrpc": "2.0", "id": 2,
                                             "method": "tools/call",
-                                            "params": {"name": "fractalsql_get_version",
+                                            "params": {"name": "fractal_version",
                                                        "arguments": {}}}))
         edition = None
         if s == 200 and b.startswith("{"):

@@ -48,7 +48,9 @@ if not exist "%OPENSSL_DIR%\include\openssl\evp.h" (
 
 rem Connector/C: the vendored deps tree, or MARIADB_DIR.
 if "%MARIADB_DIR%"=="" set MARIADB_DIR=%REPO_DIR%\deps\mariadb\root
-if not exist "%MARIADB_DIR%\lib\libmariadb.lib" (
+if "%MARIADB_CLIENT_LIB%"=="" set MARIADB_CLIENT_LIB=libmariadb.lib
+if "%MARIADB_CLIENT_DLL%"=="" set MARIADB_CLIENT_DLL=%MARIADB_DIR%\lib\libmariadb.dll
+if not exist "%MARIADB_DIR%\lib\%MARIADB_CLIENT_LIB%" (
   echo FATAL: MariaDB Connector/C not found under %MARIADB_DIR% 1>&2
   exit /b 1
 )
@@ -62,14 +64,14 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
   /Fo"%OUTDIR%\\" ^
   /Fe"%OUTDIR%\fractalsql-mariadb-mcp.exe" ^
   /link /LIBPATH:"%OPENSSL_DIR%\lib" libssl.lib libcrypto.lib ws2_32.lib advapi32.lib crypt32.lib user32.lib ^
-  /LIBPATH:"%MARIADB_DIR%\lib" libmariadb.lib
+  /LIBPATH:"%MARIADB_DIR%\lib" "%MARIADB_CLIENT_LIB%"
 if errorlevel 1 (
   echo FATAL: ubsan mcp build failed 1>&2
   exit /b 1
 )
 
 rem The exe loads libmariadb.dll at runtime.
-copy /y "%MARIADB_DIR%\lib\libmariadb.dll" "%OUTDIR%\" >nul
+copy /y "%MARIADB_CLIENT_DLL%" "%OUTDIR%\" >nul
 if errorlevel 1 (
   echo FATAL: could not stage libmariadb.dll 1>&2
   exit /b 1

@@ -91,13 +91,14 @@ are third-party and not maintained by this repo; what this project guarantees
 is the standard MCP protocol surface, not any particular framework's wrapper
 around it.
 
-Sanity check: after registering, call `fractalsql_get_version` -- a healthy install
+Sanity check: after registering, call `fractal_version` -- a healthy install
 answers `{"edition": "Community", "version": "2.0.x", "daemon_version": "2.0.x"}`.
 
 ## The tools
 
 Every tool's name is the underlying SQL symbol, unprefixed, and every
-`inputSchema` mirrors that symbol's documented argument list 1:1 (defaults included).
+`inputSchema` mirrors that symbol's documented argument list (defaults included),
+with the same argument names the other engine editions publish.
 Vector arguments are always JSON arrays of numbers (`[0.1,0.2,0.3]`) or nested arrays
 for matrices/corpora; the adapter converts them to the engine's vector-string grammar
 through its own parameter binding -- a client never sees `'0.1,0.2,0.3'` strings and
@@ -139,7 +140,7 @@ fractal_search_telemetry {"table_name": "documents", "vector_col": "embedding",
 | `fractal_reason` | LLM dispatch (session plumbing is the adapter's job; you pass just `query` and optional `context`) |
 | `fractal_embed` | Text -> embedding, returned as a plain JSON array of numbers |
 | `fractal_text_to_sql` | NL -> one validated SQL statement; never auto-executed |
-| `fractal_schema_context` | Plain-text schema description, exactly what a reasoning call gets as context (no `query_hint` parameter here) |
+| `fractal_schema_context` | Plain-text schema description, exactly what a reasoning call gets as context (an optional `query_hint` is accepted for parity with the other engines; this engine does not use it yet) |
 
 ```
 fractal_text_to_sql {"question": "top 5 customers by revenue"}
@@ -271,10 +272,10 @@ queue simply keeps its old rows.
 
 | Tool | Talks to |
 |---|---|
-| `fractalsql_get_version` | the database (`fractal_version()`/`fractal_edition()`), plus the daemon's version when reachable |
-| `fractalsql_get_config` | the database (`fractal_t2s_config()`) AND the daemon conf file -- see below |
-| `fractalsql_set_config` | the daemon conf file + `fsqlctl reload` semantics |
-| `fractalsql_configure_reasoning` | the daemon conf file + `fsqlctl reload` semantics |
+| `fractal_version` | the database (`fractal_version()`/`fractal_edition()`), plus the daemon's version when reachable |
+| `fractal_daemon_config_get` | the database (`fractal_t2s_config()`) AND the daemon conf file -- see below |
+| `fractal_daemon_config_set` | the daemon conf file + `fsqlctl reload` semantics |
+| `fractal_configure_reasoning` | the daemon conf file + `fsqlctl reload` semantics |
 
 **The two-credential-realm note (`5.2` of the design spec):** these are the only tools
 in the suite that touch a process OTHER than the MariaDB connection. `fractalsqld`
@@ -310,7 +311,7 @@ writes:
   absolute path with no '..' segments`), and the client's reply is
   `reload failed: provider settings rejected (see the daemon log)`. The
   running configuration is left untouched.
-- **At this MCP layer, before the write.** `fractalsql_set_config` checks the
+- **At this MCP layer, before the write.** `fractal_daemon_config_set` checks the
   value first and refuses it with a `schema` error class and this message:
 
   ```
@@ -341,11 +342,11 @@ the daemon-wide values:
 
 | Tool | Effect |
 |---|---|
-| `fractalsql_session_config_set` | sets ONE key for THIS connection -> `{ok:true}` or `{ok:false, reason:"..."}` |
-| `fractalsql_session_config_get` | reads one key's EFFECTIVE value for this connection (its own override, else the daemon-wide one) |
-| `fractalsql_session_config_reset` | drops every override this connection holds -> `{dropped:N}` |
-| `fractalsql_session_config_list` | the connection's own overrides, as a JSON object |
-| `fractalsql_session_config_keys` | every key the engine knows, as `{name, type, session_overridable}` objects -- so a caller can discover the knobs instead of hard-coding them |
+| `fractal_config_set` | sets ONE key for THIS connection -> `{ok:true}` or `{ok:false, reason:"..."}` |
+| `fractal_config_get` | reads one key's EFFECTIVE value for this connection (its own override, else the daemon-wide one) |
+| `fractal_config_reset` | drops every override this connection holds -> `{dropped:N}` |
+| `fractal_config_list` | the connection's own overrides, as a JSON object |
+| `fractal_config_keys` | every key the engine knows, as `{name, type, session_overridable}` objects -- so a caller can discover the knobs instead of hard-coding them |
 
 A session may change the **tuning** keys and nothing else:
 `reasoning_model`, `embed_model`, `think`, `think_num_ctx`, `t2s_max_attempts`,
@@ -370,7 +371,7 @@ connection re-point the shared daemon:
 | `reasoning_allow_plaintext`, `enterprise_require_signature` | transport-posture flags the operator set deliberately |
 | `think_provider`, `t2s_allowed_statements` | routing and capability widening |
 
-A secret's value is never returned: `fractalsql_session_config_get` reports
+A secret's value is never returned: `fractal_config_get` reports
 `'<redacted>'` when it is configured and `'<unset>'` when it is not.
 
 **The `value` field is always a string.** A configuration value is text in the
@@ -380,7 +381,7 @@ config file and text in the overlay, so `"value"` is a STRING on every read (or
 client therefore never has to handle two shapes of the same field.
 
 **The read path refuses the enterprise tier's keys by name.**
-`fractalsql_session_config_get` refuses `enterprise_lib`,
+`fractal_config_get` refuses `enterprise_lib`,
 `enterprise_ledger_path`, `enterprise_ledger_key` and
 `enterprise_require_signature` with an "operator territory" error, even though
 the engine's SQL surface will hand the effective value of every non-secret key
@@ -580,8 +581,8 @@ Three keys are deliberately *not* live-reloadable:
   context's lifetime, so they need a daemon restart with a new
   environment. See [reasoning-setup.md](reasoning-setup.md#response-modes).
 
-The MCP admin tools drive exactly this channel: `fractalsql_set_config`
-and `fractalsql_configure_reasoning` write the conf file and then
+The MCP admin tools drive exactly this channel: `fractal_daemon_config_set`
+and `fractal_configure_reasoning` write the conf file and then
 request a reload, and their result says which of the two happened --
 `"reloaded": true`, or `"reloaded": false` with the daemon's own refusal
 reason, in which case the file edit is intact for a restart instead.
@@ -662,7 +663,7 @@ Two things are worth knowing before you go looking:
   fails with a connectivity-class error mentioning the daemon, check the
   daemon's health before suspecting the database.
 - **A path-shaped config value is refused before it is written.** If
-  `fractalsql_set_config` returns a `schema` error naming
+  `fractal_daemon_config_set` returns a `schema` error naming
   `'reasoning_plugin'` (or `enterprise_lib`, `enterprise_ledger_path`),
   the value was not an absolute path with no `..` segments. The conf
   file is untouched -- the refusal happens before the write. See the
@@ -1123,15 +1124,15 @@ configure, in [enterprise.md](enterprise.md) and
 
 | Symptom | What to do |
 |---|---|
-| `fractalsql_get_version` -> connectivity error / connection refused | MariaDB not reachable: check `MARIADB_HOST/PORT`, that the engine service is up, and the account. The error text is the client's own, sanitized. |
+| `fractal_version` -> connectivity error / connection refused | MariaDB not reachable: check `MARIADB_HOST/PORT`, that the engine service is up, and the account. The error text is the client's own, sanitized. |
 | every UDF/procedure call fails with `cannot connect`-style daemon text or a `BUSY`/`ARGS` shim error | `fractalsqld` is down or unreachable at `FSQLCTL_SOCKET`'s implicit path -- but note: the SHIM connects via the shim's own config (fractalsqld.conf of the mariadbd process), not `FSQLCTL_SOCKET` (admin tools only). See fractalsql-daemon.md's health chapter. |
-| `fractal_reason` -> connectivity error "the embed/reasoning tier is not configured" | Reasoning keys live in fractalsqld.conf; use `fractalsql_configure_reasoning` (or edit the conf + restart/reload). Local models may need up to 300s to cold-load -- set the daemon timeouts before judging a call failed. |
+| `fractal_reason` -> connectivity error "the embed/reasoning tier is not configured" | Reasoning keys live in fractalsqld.conf; use `fractal_configure_reasoning` (or edit the conf + restart/reload). Local models may need up to 300s to cold-load -- set the daemon timeouts before judging a call failed. |
 | `fractal_search_telemetry` -> `45000` SIGNAL about primary keys / schema-qualified names / no rows | As documented: the target table needs exactly one single-column `PRIMARY KEY`, a bare name, an existing vector column, non-empty results. |
 | Enterprise-tier tools -> `fractal_agent_diverse_portfolios: enterprise tier not loaded` (proc) or the NULL-dormant condition (UDFs) | That tool needs the enterprise library under `FRACTALSQL_ENTERPRISE_LIB` in the daemon's environment (enterprise.md). Nothing is broken; it needs a license. |
 | startup stderr: `tool-schema hash mismatch` | A packaged update changed the tool surface: regenerate via `--write-schema-lock` and commit in the same PR -- or, if you didn't expect it, treat the install as untrusted (set `FSQL_MCP_STRICT_SCHEMA_HASH=true` to hard-fail). |
 | startup stderr: version-skew warning (`version_skew`) | The engine on the other end of the connection is not the release this plugin was built against the documented SQL surface of -- pin/align versions. |
-| `fractalsql_set_config` -> "the daemon did NOT accept the reload: ..." | Read the returned reason (range/empty/startup-only). The daemon kept its previous config (all-or-nothing); the file edit is intact for a restart instead. |
+| `fractal_daemon_config_set` -> "the daemon did NOT accept the reload: ..." | Read the returned reason (range/empty/startup-only). The daemon kept its previous config (all-or-nothing); the file edit is intact for a restart instead. |
 | `server busy` | Concurrency caps from 10.7 -- lower parallelism, or raise `FSQL_MCP_MAX_CONCURRENT_*` deliberately. |
 | `fractal_search` returned NULL all of a sudden | Documented behavior: out-of-range SFS params make the WHOLE call NULL (e.g. `iterations > 10000`); fix the knobs. |
-| A result carries `reasoning_step_failed: ...` with `isError: false` | The agent's data half computed fine; the LLM endpoint failed and the session reports it instead of discarding the computation (partial-result honesty). Fix the reasoning endpoint/model config via `fractalsql_configure_reasoning` and re-call. Set `FSQL_MCP_AGENT_PARTIAL=off` to return to the engine's raise-first behavior. |
+| A result carries `reasoning_step_failed: ...` with `isError: false` | The agent's data half computed fine; the LLM endpoint failed and the session reports it instead of discarding the computation (partial-result honesty). Fix the reasoning endpoint/model config via `fractal_configure_reasoning` and re-call. Set `FSQL_MCP_AGENT_PARTIAL=off` to return to the engine's raise-first behavior. |
 | 401 behind a shared deployment right after rotating the token | Token files hot-reload by mtime; if you rotated the env var instead, that's a restart (no hot-reload for env secrets). |

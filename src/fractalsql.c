@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
  *
- * fractalsql-mariadb v2.0.12: Stochastic Fractal Search for MariaDB (UDF).
+ * fractalsql-mariadb v2.0.13: Stochastic Fractal Search for MariaDB (UDF).
  *
  * Compatible with MariaDB 10.6, 10.11, 11.4 LTS, and 12.3 LTS.
  * The UDF ABI has been stable across these majors.
@@ -96,7 +96,7 @@ clamp_to_int(long long v)
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
  * metadata's version silently drifting apart. */
-#define FSQL_VERSION "2.0.12"
+#define FSQL_VERSION "2.0.13"
 
 /* strncasecmp is POSIX (<strings.h>), not standard C. MSVC has no
  * <strings.h> at all, only the underscore-prefixed _strnicmp. Used by
@@ -107,7 +107,7 @@ clamp_to_int(long long v)
 #  include <strings.h>
 #endif
 
-/* Supply-side DoS guards, sized the same way as the redis/valkey blob
+/* Supply-side DoS guards, sized the same way as the blob
  * caps elsewhere in this codebase.
  *
  * The UDF gets two
@@ -902,7 +902,11 @@ fractal_search_debug(UDF_INIT *initid, UDF_ARGS *args, char *result,
 
     double *query = NULL;
     size_t  dim = 0;
-    int     iterations = 60;
+    /* The generation count used when the caller omits the argument.
+     * It matches the standard's fractal_search_debug signature
+     * (iterations int4 DEFAULT 30), so an omitted argument walks the
+     * same convergence depth on every engine. */
+    int     iterations = 30;
     int     pop_size = 50;
     int     diff_factor = 2;
     bool    has_seed = false;

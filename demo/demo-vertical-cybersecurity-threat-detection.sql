@@ -302,15 +302,15 @@ SELECT JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,
 -- host (fractal_search_trajectory over host 7's baseline->current_pos,
 -- resolved via the table's real PRIMARY KEY, no ctid/row_number needed),
 -- real trajectory_distance, real connection-rate DFA exponent, real
--- rationale. No trailing k/id_col arguments (see this file's header) --
--- the call ends right after heading_series.
+-- rationale. The trailing argument is k (no id_col; see this file's
+-- header) -- the call ends right after heading_series and k.
 -- --- Preset: fractal_agent_track_anomaly (raw trajectory+dfa form preserved in Section 4 + above) ---
 CALL fractal_agent_track_anomaly(
     'vcy_hosts', 'current_pos',
     (SELECT baseline FROM vcy_hosts WHERE id = 7),
     (SELECT current_pos FROM vcy_hosts WHERE id = 7),
     (SELECT CONCAT('[', GROUP_CONCAT(conn_rate ORDER BY t), ']') FROM vcy_conn_series),
-    @r);
+    5, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,

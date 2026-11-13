@@ -999,8 +999,11 @@ BEGIN
     CALL _fractalsql_agent_require_ident('fractal_agent_rebalance_sibling', JSON_ARRAY(p_alloc_table, p_alloc_emb_col),
         'identifier arguments must not be NULL');
 
+    -- A NULL seed is threaded through as an ABSENT seed, not as a fixed 0:
+    -- the optimiser then applies its own default seed, the same way a NULL
+    -- seed argument reaches the optimizer directly.
     SET v_opt = fractal_optimize_portfolio(p_mu, p_cov, p_cardinality,
-        JSON_OBJECT('seed', IFNULL(p_seed, 0)));
+        IF(p_seed IS NULL, '{}', JSON_OBJECT('seed', p_seed)));
     SET v_sharpe  = IFNULL(JSON_VALUE(v_opt, '$.sharpe'), 0.0);
     SET v_weights = JSON_EXTRACT(v_opt, '$.weights');
 
@@ -1036,6 +1039,7 @@ CREATE PROCEDURE fractal_agent_detour_classify(
     IN  p_baseline_vec  JSON,
     IN  p_current_vec   JSON,
     IN  p_gps_trace     JSON,
+    IN  p_k             INT,       -- NULL -> 5 (PostgreSQL's default)
     IN  p_boxcount_dim  INT,
     OUT p_result        JSON
 )
@@ -1053,7 +1057,7 @@ BEGIN
     CALL _fractalsql_agent_require_ident('fractal_agent_detour_classify', JSON_ARRAY(p_vehicle_table, p_emb_col),
         'identifier arguments must not be NULL');
 
-    CALL fractal_search_trajectory(p_vehicle_table, p_emb_col, p_baseline_vec, p_current_vec, 1, v_traj);
+    CALL fractal_search_trajectory(p_vehicle_table, p_emb_col, p_baseline_vec, p_current_vec, IFNULL(p_k, 5), v_traj);
     CALL _fractalsql_agent_require_rows('fractal_agent_detour_classify', 'no vehicle rows found', v_traj);
     CALL _fractalsql_agent_nearest1(v_traj, v_fleet_id, v_dist);
 
@@ -1087,6 +1091,7 @@ CREATE PROCEDURE fractal_agent_track_anomaly(
     IN  p_baseline_vec   JSON,
     IN  p_current_vec    JSON,
     IN  p_heading_series JSON,
+    IN  p_k              INT,       -- NULL -> 5 (PostgreSQL's default)
     OUT p_result         JSON
 )
 SQL SECURITY INVOKER
@@ -1103,7 +1108,7 @@ BEGIN
     CALL _fractalsql_agent_require_ident('fractal_agent_track_anomaly', JSON_ARRAY(p_track_table, p_emb_col),
         'identifier arguments must not be NULL');
 
-    CALL fractal_search_trajectory(p_track_table, p_emb_col, p_baseline_vec, p_current_vec, 1, v_traj);
+    CALL fractal_search_trajectory(p_track_table, p_emb_col, p_baseline_vec, p_current_vec, IFNULL(p_k, 5), v_traj);
     CALL _fractalsql_agent_require_rows('fractal_agent_track_anomaly', 'no track rows found', v_traj);
     CALL _fractalsql_agent_nearest1(v_traj, v_track_id, v_dist);
 
@@ -1260,6 +1265,7 @@ CREATE PROCEDURE fractal_agent_diverse_portfolios(
     IN  p_quality_frac       DOUBLE,
     IN  p_context            TEXT,
     IN  p_objective_mode     TEXT,
+    IN  p_seed               BIGINT,   -- NULL -> 0 (the optimiser's own default seed)
     OUT p_result             JSON
 )
 SQL SECURITY INVOKER
@@ -1283,7 +1289,8 @@ BEGIN
             p_mu, p_cov, p_cardinality,
             IFNULL(p_n_restarts, 8),
             8,                        -- max_front cap on the returned front
-            0, 0, 'gaussian');        -- seed / use_obl / diffusion_mode
+            IFNULL(p_seed, 0),        -- seed
+            0, 'gaussian');          -- use_obl / diffusion_mode
         IF v_opt IS NULL THEN
             CALL _fractalsql_agent_fail('fractal_agent_diverse_portfolios',
                 'enterprise tier not loaded (fractal_optimize_portfolio_multimodal_pareto returned NULL) -- set FRACTALSQL_ENTERPRISE_LIB and restart, see docs/enterprise.md');
@@ -1299,9 +1306,9 @@ BEGIN
         SET v_opt = fractal_optimize_portfolio_multimodal(
             p_mu, p_cov, p_cardinality,
             IFNULL(p_n_restarts, 8),
-            IFNULL(p_overlap_threshold, 0.3),
-            IFNULL(p_quality_frac, 0.8),
-            0);
+            IFNULL(p_overlap_threshold, 0.15),
+            IFNULL(p_quality_frac, 0.9),
+            IFNULL(p_seed, 0));
 
         IF v_opt IS NULL THEN
             CALL _fractalsql_agent_fail('fractal_agent_diverse_portfolios',

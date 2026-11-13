@@ -77,7 +77,7 @@ where it landed and how well it fit.
 ```sql
 fractal_search_debug(
     query_csv         TEXT,  -- the single query vector
-    iterations        INT,   -- optional: SFS generations, 1-10000 (default 60)
+    iterations        INT,   -- optional: SFS generations, 1-10000 (default 30)
     population_size   INT,   -- optional: particles per generation, 2-10000 (default 50)
     diffusion_factor  INT,   -- optional: SFS MDN, 1-32 (default 2)
     seed              INT    -- optional: walk seed (see below)
@@ -108,7 +108,7 @@ you, which is why its trace is always present.
 two calls may differ. Pin it for a byte-stable, reproducible trace:
 
 ```sql
-SELECT fractal_search_debug('[1,0]', 60, 50, 2, 12345);
+SELECT fractal_search_debug('[1,0]', 30, 50, 2, 12345);
 ```
 
 The core's seed is unsigned, so a negative value falls back to the default

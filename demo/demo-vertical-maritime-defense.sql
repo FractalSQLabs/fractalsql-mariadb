@@ -20,7 +20,7 @@
 --     though vessel 7's deviation UPDATE relocates its row.
 --   - fractal_agent_track_anomaly's real signature ends right after the
 --     heading series: (track_table, emb_col, baseline_vec, current_vec,
---     heading_series, OUT p_result) -- no trailing k or id_col.
+--     heading_series, k, OUT p_result) -- no trailing id_col.
 --
 -- Prerequisites:
 --   1. SOURCE sql/install_udf.sql;      (the base UDF set)
@@ -221,8 +221,8 @@ SELECT fractal_dimension_dfa(
 -- fleet vessel (fractal_search_trajectory over vessel 7's
 -- baseline->current, its own PRIMARY KEY resolved internally), the
 -- real trajectory_distance, the real heading-series DFA exponent, plus
--- a real rationale. No trailing k/id_col -- the call ends right after
--- heading_series (see this file's header).
+-- a real rationale. The trailing arg is k (no id_col) -- the call ends
+-- right after heading_series and k (see this file's header).
 -- --- Preset: fractal_agent_track_anomaly (raw trajectory+dfa form preserved above) ---
 CALL fractal_agent_track_anomaly(
     'vmd_vessels', 'current_pos',
@@ -234,7 +234,7 @@ CALL fractal_agent_track_anomaly(
             SELECT t, (RAND() - 0.5) * (CASE WHEN t BETWEEN 60 AND 90 THEN 0.35 ELSE 0.03 END) AS step FROM seq
         ) s
     ) c),
-    @r);
+    5, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,

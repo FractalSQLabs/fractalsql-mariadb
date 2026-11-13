@@ -140,15 +140,15 @@ EXPECTED_SAFETY = {
     "fractal_vectorizer_pause": ("destructive", False),
     "fractal_vectorizer_process_queue": ("destructive", False),
     "fractal_vectorizer_resume": ("destructive", False),
-    "fractalsql_configure_reasoning": ("destructive", False),
-    "fractalsql_get_config": ("read", False),
-    "fractalsql_get_version": ("read", False),
-    "fractalsql_session_config_get": ("read", False),
-    "fractalsql_session_config_keys": ("read", False),
-    "fractalsql_session_config_list": ("read", False),
-    "fractalsql_session_config_reset": ("destructive", False),
-    "fractalsql_session_config_set": ("destructive", False),
-    "fractalsql_set_config": ("destructive", False),
+    "fractal_configure_reasoning": ("destructive", False),
+    "fractal_daemon_config_get": ("read", False),
+    "fractal_version": ("read", False),
+    "fractal_config_get": ("read", False),
+    "fractal_config_keys": ("read", False),
+    "fractal_config_list": ("read", False),
+    "fractal_config_reset": ("destructive", False),
+    "fractal_config_set": ("destructive", False),
+    "fractal_daemon_config_set": ("destructive", False),
 }
 
 
@@ -269,18 +269,18 @@ def main() -> int:  # noqa: ANN201
         capture_output=True, text=True)
     listed = r.stdout
     check("phase1: --list-tools works with no database and lists tools",
-          r.returncode == 0 and "fractalsql_get_version" in listed)
+          r.returncode == 0 and "fractal_version" in listed)
     # The tool whitelist (--tool) and the category filter (--category)
     # are the two narrowing knobs; each must REMOVE tools from the
     # listed surface, not merely reorder it.
     r = subprocess.run(
-        [mcp_exe, "--list-tools", "--tool", "fractalsql_get_version"],
+        [mcp_exe, "--list-tools", "--tool", "fractal_version"],
         env=dict(os.environ, MARIADB_HOST="", MARIADB_PORT="",
                  MARIADB_DATABASE="", MARIADB_USER="", MARIADB_PASSWORD=""),
         capture_output=True, text=True)
     narrowed = r.stdout
     check("phase1: --tool narrows the tool surface to the whitelist",
-          r.returncode == 0 and "fractalsql_get_version" in narrowed
+          r.returncode == 0 and "fractal_version" in narrowed
           and "fractal_reason" not in narrowed)
     r = subprocess.run(
         [mcp_exe, "--list-tools", "--category", "admin"],
@@ -459,7 +459,7 @@ def main() -> int:  # noqa: ANN201
         annotated = {t["name"] for t in listed
                      if (t.get("annotations") or {}).get("destructiveHint") is True}
         heavy = [n for n in ["fractal_ledger_reset_hard", "fractal_ledger_compact",
-                             "fractal_vectorizer_drop", "fractalsql_set_config"]
+                             "fractal_vectorizer_drop", "fractal_daemon_config_set"]
                  if n in annotated]
         check("15.2/6: destructiveHint present on the heavy/destructive tools",
               len(heavy) >= 3)
@@ -566,9 +566,9 @@ def main() -> int:  # noqa: ANN201
                   t["name"] for t in agent_partial})
 
         # -- sanity check (plugin docs' one-liner) ---------------------
-        r = call("fractalsql_get_version", {})
+        r = call("fractal_version", {})
         sc = (r.get("result") or {}).get("structuredContent") if r else None
-        check("sanity check: fractalsql_get_version returns a real "
+        check("sanity check: fractal_version returns a real "
               "edition/version",
               sc is not None and not (r["result"].get("isError"))
               and sc.get("edition") == "Community")
@@ -819,7 +819,7 @@ def main() -> int:  # noqa: ANN201
         # operator-only refusal on the read path, and the shape of the
         # "overrides" object (every override the connection holds must
         # be in it -- a session may hold several at once).
-        r = call("fractalsql_session_config_keys", {}, timeout=60)
+        r = call("fractal_config_keys", {}, timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         keys = (sc or {}).get("keys") if isinstance(sc, dict) else None
         check("session config: keys() lists the engine's whole key surface",
@@ -827,14 +827,14 @@ def main() -> int:  # noqa: ANN201
               and all(isinstance(k, dict) and "name" in k
                       and "session_overridable" in k for k in keys))
 
-        r = call("fractalsql_session_config_set",
+        r = call("fractal_config_set",
                  {"key": "think", "value": "high"}, timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         check("session config: set() accepts a tuning key",
               isinstance(sc, dict) and sc.get("ok") is True
               and sc.get("key") == "think")
 
-        r = call("fractalsql_session_config_get", {"key": "think"}, timeout=60)
+        r = call("fractal_config_get", {"key": "think"}, timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         check("session config: get() returns the session's own override",
               isinstance(sc, dict) and sc.get("key") == "think"
@@ -845,9 +845,9 @@ def main() -> int:  # noqa: ANN201
         # read would turn "8192" into the number 8192 and the same
         # tool's "value" field would change type depending on what the
         # operator typed.
-        r = call("fractalsql_session_config_set",
+        r = call("fractal_config_set",
                  {"key": "think_num_ctx", "value": "8192"}, timeout=60)
-        r = call("fractalsql_session_config_get", {"key": "think_num_ctx"},
+        r = call("fractal_config_get", {"key": "think_num_ctx"},
                  timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         val = sc.get("value") if isinstance(sc, dict) else None
@@ -855,7 +855,7 @@ def main() -> int:  # noqa: ANN201
               "STRING it was set to",
               isinstance(val, str) and val == "8192")
 
-        r = call("fractalsql_session_config_list", {}, timeout=60)
+        r = call("fractal_config_list", {}, timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         ov = (sc or {}).get("overrides") if isinstance(sc, dict) else None
         check("session config: list() shows the connection's overrides",
@@ -865,7 +865,7 @@ def main() -> int:  # noqa: ANN201
         # A daemon-wide key is refused BY NAME, with the reason, and
         # the refusal arrives as {ok:false, reason:...} -- not as an
         # exception and not as a silent no-op.
-        r = call("fractalsql_session_config_set",
+        r = call("fractal_config_set",
                  {"key": "reasoning_plugin", "value": "/opt/evil.so"},
                  timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
@@ -878,19 +878,19 @@ def main() -> int:  # noqa: ANN201
         # enterprise tier's library, ledger and signature posture are
         # the operator's, and this surface is not how an operator reads
         # them.
-        r = call("fractalsql_session_config_get", {"key": "enterprise_lib"},
+        r = call("fractal_config_get", {"key": "enterprise_lib"},
                  timeout=60)
         res = (r.get("result") or {}) if r else {}
         text = str((res.get("content") or [{}])[0].get("text", ""))
         check("session config: get() refuses an operator-only key by name",
               res.get("isError") is True and "operator territory" in text)
 
-        r = call("fractalsql_session_config_reset", {}, timeout=60)
+        r = call("fractal_config_reset", {}, timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         check("session config: reset() drops the connection's overrides",
               isinstance(sc, dict) and isinstance(sc.get("dropped"), int)
               and sc.get("dropped") >= 2)
-        r = call("fractalsql_session_config_list", {}, timeout=60)
+        r = call("fractal_config_list", {}, timeout=60)
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         ov = (sc or {}).get("overrides") if isinstance(sc, dict) else None
         check("session config: after the reset the connection holds no "
@@ -909,10 +909,10 @@ def main() -> int:  # noqa: ANN201
         # fractal_reason itself still fails loudly, then RESTORE the
         # mock provider and re-prove a normal reason call.
         broken = "http://127.0.0.1:9/v1/chat/completions"
-        r = call("fractalsql_get_config", {"key": "reasoning_url"}, timeout=60)
+        r = call("fractal_daemon_config_get", {"key": "reasoning_url"}, timeout=60)
         original = ((r.get("result") or {})
                     .get("structuredContent") or {}).get("value")
-        r = call("fractalsql_set_config",
+        r = call("fractal_daemon_config_set",
                  {"key": "reasoning_url", "value": broken}, timeout=60)
         # The setup assertion must require the RELOAD to have actually
         # happened. set_config reports a refused reload as isError:false with
@@ -963,12 +963,12 @@ def main() -> int:  # noqa: ANN201
         # which is exactly the value the running daemon was configured
         # with (mdb_setup / Mdb-Setup exported it).
         if isinstance(original, str) and original:
-            call("fractalsql_set_config",
+            call("fractal_daemon_config_set",
                  {"key": "reasoning_url", "value": original}, timeout=60)
         else:
             fallback = os.environ.get("FRACTALSQL_HTTP_URL")
             if fallback:
-                call("fractalsql_set_config",
+                call("fractal_daemon_config_set",
                      {"key": "reasoning_url", "value": fallback}, timeout=60)
         r = call("fractal_reason", {"query": "post-restore sanity"},
                  timeout=60)
@@ -993,7 +993,7 @@ def main() -> int:  # noqa: ANN201
         if conf_path and os.path.isfile(conf_path):
             before = open(conf_path, encoding="utf-8", errors="replace").read()
         for bad in ("relative/plugin.so", "/opt/fractalsql/../etc/plugin.so"):
-            r = call("fractalsql_set_config",
+            r = call("fractal_daemon_config_set",
                      {"key": "reasoning_plugin", "value": bad}, timeout=60)
             txt = ""
             sc = None
@@ -1056,7 +1056,7 @@ def main() -> int:  # noqa: ANN201
         # would inject a config key the surface refuses by name.
         if conf_path:
             before = open(conf_path, encoding="utf-8", errors="replace").read()
-            r = call("fractalsql_set_config",
+            r = call("fractal_daemon_config_set",
                      {"key": "reasoning_model",
                       "value": "m\nenterprise_require_signature = 0"})
             after = open(conf_path, encoding="utf-8", errors="replace").read()
@@ -1085,7 +1085,7 @@ def restore_daemon_plugin(mcp_exe, server_cwd, env, original: str) -> None:
 
     Runs on its own short-lived server instance: the drain server has
     already exited by the time the restore is due, and the admin tier
-    (fractalsql_set_config) is the only path to the daemon's live
+    (fractal_daemon_config_set) is the only path to the daemon's live
     config. The restore is verified by a follow-up reasoning call that
     must succeed -- a restore that was accepted by the conf write but
     refused by the daemon's reload would otherwise go unnoticed, and
@@ -1131,7 +1131,7 @@ def restore_daemon_plugin(mcp_exe, server_cwd, env, original: str) -> None:
                   "initialize handshake", False)
             return
 
-        r = call("fractalsql_set_config",
+        r = call("fractal_daemon_config_set",
                  {"key": "reasoning_plugin", "value": original}, 2)
         sc = ((r.get("result") or {}).get("structuredContent") or {}) if r else {}
         if not check("shutdown drain cleanup: the daemon accepted the restore "
@@ -1213,8 +1213,8 @@ def run_read_only_latch_phase(mcp_exe, server_cwd, base_env) -> None:
                                   "clientInfo": {"name": "smoke-ro", "version": "1"}})
             proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
             proc.stdin.flush()
-            got["read"] = rpc(2, "tools/call", {"name": "fractalsql_get_version", "arguments": {}})
-            got["refused"] = rpc(3, "tools/call", {"name": "fractalsql_set_config", "arguments": {}})
+            got["read"] = rpc(2, "tools/call", {"name": "fractal_version", "arguments": {}})
+            got["refused"] = rpc(3, "tools/call", {"name": "fractal_daemon_config_set", "arguments": {}})
         finally:
             try:
                 proc.stdin.close()
@@ -1254,7 +1254,7 @@ def run_shutdown_drain_phase(mcp_exe, server_cwd, base_env) -> None:
 
     The MariaDB equivalent is the daemon's own live-reloadable
     `reasoning_plugin` conf key: the phase edits the daemon's config
-    file and asks the daemon to reload it (fractalsql_set_config, the
+    file and asks the daemon to reload it (fractal_daemon_config_set, the
     admin tier's own lever -- the same one the S-FT-004 case above
     uses), and the daemon's NEXT reasoning call loads the slow fixture
     instead of the real HTTP plugin. The reasoning call then sits inside
@@ -1412,7 +1412,7 @@ def run_shutdown_drain_phase(mcp_exe, server_cwd, base_env) -> None:
 
         # What is the daemon using right now? Read it back through the
         # admin tier so the restore puts back exactly this.
-        before = call_structured("fractalsql_get_config",
+        before = call_structured("fractal_daemon_config_get",
                                  {"key": "reasoning_plugin"}, 2)
         original = str(before.get("value") or "")
         if not original:
@@ -1432,7 +1432,7 @@ def run_shutdown_drain_phase(mcp_exe, server_cwd, base_env) -> None:
         # the admin tier's own tool, which writes the conf file AND
         # asks the daemon to reload it -- the same live-reload path the
         # S-FT-004 case above exercises.
-        swap = call_structured("fractalsql_set_config",
+        swap = call_structured("fractal_daemon_config_set",
                                {"key": "reasoning_plugin", "value": slow_plugin}, 3)
         swapped = swap.get("reloaded") is True
         if not check("shutdown drain: the daemon accepted the live swap to "

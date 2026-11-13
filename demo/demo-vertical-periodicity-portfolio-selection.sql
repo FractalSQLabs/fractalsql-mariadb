@@ -150,7 +150,7 @@ SELECT fractal_diversify_disable(CONNECTION_ID());
 -- === 5. Enterprise edition: structurally different schedules ===
 -- --- Enterprise edition: structurally distinct candidates (reports "enterprise tier not loaded" on the Community edition) ---
 CALL fractal_agent_diverse_portfolios(CONCAT('[', @pps_mu, ']'), CONCAT('[', @pps_cov, ']'), 3, 4, 0.15, 0.9,
-    '{"portfolio": "markdown-schedules"}', 'sharpe', @pps_div);
+    '{"portfolio": "markdown-schedules"}', 'sharpe', NULL, @pps_div);
 SELECT JSON_EXTRACT(@pps_div, '$.optimization') AS optimization, JSON_VALUE(@pps_div, '$.rationale') AS rationale;
 
 

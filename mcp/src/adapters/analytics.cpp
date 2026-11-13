@@ -60,13 +60,13 @@ namespace fsqlmcp
             "Regime-change detection: recent-window DFA exponent vs. baseline -> {drift, "
             "recent_alpha, baseline_alpha}. Requires n >= win + 16 and win >= 16.",
             { Vec( "series", true, "the time series" ),
-              Int( "win", false, "window size (>= 16)", 16 ) },
+              Int( "win", false, "window size (>= 16)", 48 ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 return db.callScalarBind( "SELECT fractal_dimension_drift(?, ?)",
                     { SqlValue( packVector( a.at( "series" ), "series" ) ),
                       SqlValue( static_cast<std::int64_t>(
-                          a.contains( "win" ) && a.at( "win" ).is_number_integer() ? a.at( "win" ).get<int>() : 16 ) ) } );
+                          a.contains( "win" ) && a.at( "win" ).is_number_integer() ? a.at( "win" ).get<int>() : 48 ) ) } );
             }, true ) );
 
         t.push_back( mkTool( "fractal_change_point_detect", "analytics", "pure", ToolClass::Cheap,
@@ -167,17 +167,19 @@ namespace fsqlmcp
             "states to one fingerprint (a period-2 wobble can read as a period-1 stream) - see "
             "fractal_agent_detect_loop for the composition that watches for it.",
             { Vec( "vector", true, "the state vector" ),
-              Int( "n_bits", false, "", 64 ),
-              Num( "seed", false, "", 42.0 ) },
+              Int( "n_bits", false, "SimHash bits", 128 ),
+              Int( "seed", false, "SimHash seed", 0.0 ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 return db.callScalarBind( "SELECT fractal_state_fingerprint(?, ?, ?)",
                     { SqlValue( packVector( a.at( "vector" ), "vector" ) ),
                       SqlValue( static_cast<std::int64_t>(
                           a.contains( "n_bits" ) && a.at( "n_bits" ).is_number_integer()
-                            ? a.at( "n_bits" ).get<int>() : 64 ) ),
+                            ? a.at( "n_bits" ).get<int>() : 128 ) ),
+                      // The published seed is an integer; the UDF's third
+                      // argument is a real, so it is widened here.
                       SqlValue( a.contains( "seed" ) && a.at( "seed" ).is_number()
-                                  ? a.at( "seed" ).get<double>() : 42.0 ) } );
+                                  ? a.at( "seed" ).get<double>() : 0.0 ) } );
             }, true ) );
 
         t.push_back( mkTool( "fractal_cycle_detect", "analytics", "pure", ToolClass::Cheap,
@@ -237,13 +239,13 @@ namespace fsqlmcp
             "Hamming distance between two QUANTIZED vectors (the packed-byte outputs of "
             "fractal_vector_quantize_binary; equal byte counts required) - cheap pre-filter "
             "ahead of a full-precision re-rank.",
-            { Vec( "a_bytes", true, "first vector's packed bytes" ),
-              Vec( "b_bytes", true, "second vector's packed bytes" ) },
+            { Vec( "a", true, "first vector's packed bytes" ),
+              Vec( "b", true, "second vector's packed bytes" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 return db.callScalarBind( "SELECT fractal_vector_hamming_distance(?, ?)",
-                    { SqlValue( packFlat( a.at( "a_bytes" ), "a_bytes" ) ),
-                      SqlValue( packFlat( a.at( "b_bytes" ), "b_bytes" ) ) } );
+                    { SqlValue( packFlat( a.at( "a" ), "a" ) ),
+                      SqlValue( packFlat( a.at( "b" ), "b" ) ) } );
             }, true ) );
 
         t.push_back( mkTool( "fractal_vector", "analytics", "pure", ToolClass::Cheap,
@@ -287,13 +289,13 @@ namespace fsqlmcp
             "branch_density, fractal_dimension}.",
             { Mat( "node_coords", true, "node coordinate rows" ),
               Vec( "edges", true, "flat index pairs: [from,to, from,to, ...]" ),
-              Vec( "edge_arc_length", true, "one true arc length per edge (>= straight-line length for tortuosity)" ) },
+              Vec( "arc_length", true, "one true arc length per edge (>= straight-line length for tortuosity)" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 return db.callScalarBind( "SELECT fractal_vascular_network(?, ?, ?)",
                     { SqlValue( packFlat( flattenMatrix( a.at( "node_coords" ), "node_coords" ), "node_coords" ) ),
                       SqlValue( packFlat( a.at( "edges" ), "edges" ) ),
-                      SqlValue( packFlat( a.at( "edge_arc_length" ), "edge_arc_length" ) ) } );
+                      SqlValue( packFlat( a.at( "arc_length" ), "arc_length" ) ) } );
             }, true ) );
 
         t.push_back( mkTool( "fractal_cortical_folding", "analytics", "pure", ToolClass::Cheap,
@@ -371,10 +373,10 @@ namespace fsqlmcp
             { Vec( "mu", true, "expected returns per asset" ),
               Vec( "cov", true, "covariance, flattened 1-D row-major" ),
               Int( "k", true, "max nonzero assets (>= 1)" ),
-              Int( "n_restarts", true, "restarts (>= 1)" ),
-              Num( "overlap_threshold", true, "[0,1]" ),
-              Num( "quality_frac", true, "[0,1]" ),
-              Int( "seed", true, "RNG seed" ) },
+              Int( "n_restarts", false, "restarts (>= 1)", 8 ),
+              Num( "overlap_threshold", false, "[0,1]", 0.15 ),
+              Num( "quality_frac", false, "[0,1]", 0.9 ),
+              Int( "seed", false, "RNG seed" ) },
             [ &db, rejectDormant ]( const Json& a, CallCtx& )
             {
                 Json result = db.callScalarBind(
@@ -382,10 +384,14 @@ namespace fsqlmcp
                     { SqlValue( packVector( a.at( "mu" ), "mu" ) ),
                       SqlValue( packVector( a.at( "cov" ), "cov" ) ),
                       SqlValue( a.at( "k" ).get<std::int64_t>() ),
-                      SqlValue( a.at( "n_restarts" ).get<std::int64_t>() ),
-                      SqlValue( a.at( "overlap_threshold" ).get<double>() ),
-                      SqlValue( a.at( "quality_frac" ).get<double>() ),
-                      SqlValue( a.at( "seed" ).get<std::int64_t>() ) } );
+                      SqlValue( a.contains( "n_restarts" ) && a.at( "n_restarts" ).is_number_integer()
+                          ? a.at( "n_restarts" ).get<std::int64_t>() : std::int64_t( 8 ) ),
+                      SqlValue( a.contains( "overlap_threshold" ) && a.at( "overlap_threshold" ).is_number()
+                          ? a.at( "overlap_threshold" ).get<double>() : 0.15 ),
+                      SqlValue( a.contains( "quality_frac" ) && a.at( "quality_frac" ).is_number()
+                          ? a.at( "quality_frac" ).get<double>() : 0.9 ),
+                      SqlValue( a.contains( "seed" ) && a.at( "seed" ).is_number_integer()
+                          ? a.at( "seed" ).get<std::int64_t>() : std::int64_t( 0 ) ) } );
                 return rejectDormant( result, "fractal_optimize_portfolio_multimodal" );
             }, true ) );
 
@@ -434,11 +440,11 @@ namespace fsqlmcp
             { Vec( "mu", true, "expected returns per asset" ),
               Vec( "cov", true, "covariance, flattened 1-D row-major" ),
               Int( "k", true, "max nonzero assets (>= 1)" ),
-              Int( "n_restarts", true, "restarts (>= 1)" ),
-              Int( "max_front", true, "1 <= max_front <= n_restarts" ),
-              Int( "seed", true, "RNG seed" ),
-              Int( "use_obl", false, "0 (default) or 1", 0 ),
-              StrEnum( "diffusion_mode", false, "'gaussian' (default) or 'levy'" ) },
+              Int( "n_restarts", false, "restarts (>= 1)", 8 ),
+              Int( "max_front", false, "1 <= max_front <= n_restarts", 8 ),
+              Int( "seed", false, "RNG seed" ),
+              Bool_( "use_obl", false, "opposition-based learning", false ),
+              StrEnum( "diffusion_mode", false, "'gaussian' (default) or 'levy'", "gaussian" ) },
             [ &db, rejectDormant ]( const Json& a, CallCtx& )
             {
                 Json result = db.callScalarBind(
@@ -446,12 +452,15 @@ namespace fsqlmcp
                     { SqlValue( packVector( a.at( "mu" ), "mu" ) ),
                       SqlValue( packVector( a.at( "cov" ), "cov" ) ),
                       SqlValue( a.at( "k" ).get<std::int64_t>() ),
-                      SqlValue( a.at( "n_restarts" ).get<std::int64_t>() ),
-                      SqlValue( a.at( "max_front" ).get<std::int64_t>() ),
-                      SqlValue( a.at( "seed" ).get<std::int64_t>() ),
+                      SqlValue( a.contains( "n_restarts" ) && a.at( "n_restarts" ).is_number_integer()
+                          ? a.at( "n_restarts" ).get<std::int64_t>() : std::int64_t( 8 ) ),
+                      SqlValue( a.contains( "max_front" ) && a.at( "max_front" ).is_number_integer()
+                          ? a.at( "max_front" ).get<std::int64_t>() : std::int64_t( 8 ) ),
+                      SqlValue( a.contains( "seed" ) && a.at( "seed" ).is_number_integer()
+                          ? a.at( "seed" ).get<std::int64_t>() : std::int64_t( 0 ) ),
                       SqlValue( static_cast<std::int64_t>(
-                          a.contains( "use_obl" ) && a.at( "use_obl" ).is_number_integer()
-                            ? a.at( "use_obl" ).get<int>() : 0 ) ),
+                          a.contains( "use_obl" ) && a.at( "use_obl" ).is_boolean()
+                            ? ( a.at( "use_obl" ).get<bool>() ? 1 : 0 ) : 0 ) ),
                       SqlValue( a.contains( "diffusion_mode" ) && !a.at( "diffusion_mode" ).is_null()
                                   ? a.at( "diffusion_mode" ).get<std::string>() : std::string( "gaussian" ) ) } );
                 return rejectDormant( result, "fractal_optimize_portfolio_multimodal_pareto" );
@@ -497,13 +506,13 @@ namespace fsqlmcp
             "ascending (squared Euclidean, O(n) per call, no index) - intended for a curated "
             "store, not a full corpus scan.",
             { Vec( "surrogate_vector", true, "the query feature vector" ),
-              Int( "k", false, "neighbors to return", 5 ),
+              Int( "k", false, "neighbors to return", 10 ),
               RowLimit() },
             [ &db, &rowCfg ]( const Json& a, CallCtx& )
             {
                 limitKCheck( a, rowCfg );
                 const int k = std::min<int>(
-                    a.contains( "k" ) && a.at( "k" ).is_number_integer() ? a.at( "k" ).get<int>() : 5,
+                    a.contains( "k" ) && a.at( "k" ).is_number_integer() ? a.at( "k" ).get<int>() : 10,
                     effectiveLimit( a, rowCfg ) );
                 Json result = db.callProc( "fractal_mine_topology_negatives",
                     { SqlValue( packVector( a.at( "surrogate_vector" ), "surrogate_vector" ) ),

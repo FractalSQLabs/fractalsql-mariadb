@@ -592,7 +592,7 @@ historically similar allocation, not just the raw optimizer output.
 | `p_alloc_table` | `VARCHAR(128)` | table of historical allocations |
 | `p_alloc_emb_col` | `VARCHAR(64)` | that table's embedding column |
 | `p_baseline_vec` | `JSON` | the baseline allocation vector to compare drift against |
-| `p_seed` | `BIGINT` | RNG seed passed through to the optimizer, for reproducibility |
+| `p_seed` | `BIGINT` | RNG seed passed through to the optimizer, for reproducibility (NULL -> the optimizer's own default seed) |
 | `p_context` | `TEXT` | optional label passed to the reason call (NULL ok) |
 | `p_result` (OUT) | `JSON` | `{"sharpe":.., "weights":[..], "nearest_alloc_id":.., "nearest_distance":.., "rationale":".."}` |
 
@@ -626,11 +626,12 @@ that detour's path was.
 | `p_baseline_vec` | `JSON` | the planned-route embedding |
 | `p_current_vec` | `JSON` | the actual-route embedding |
 | `p_gps_trace` | `JSON` | the raw GPS point sequence, for box-counting |
+| `p_k` | `INT` | how many trajectory neighbours to search (NULL -> 5) |
 | `p_boxcount_dim` | `INT` | dimension parameter for `fractal_dimension_boxcount` |
 | `p_result` (OUT) | `JSON` | `{"nearest_fleet_id":.., "trajectory_distance":.., "trace_complexity":.., "rationale":".."}` |
 
 **How it works.** (1) `fractal_search_trajectory(vehicle_table, emb_col,
-baseline_vec, current_vec, 1)` for the real route deviation. (2)
+baseline_vec, current_vec, k)` for the real route deviation. (2)
 `fractal_dimension_boxcount(gps_trace, boxcount_dim)` for the trace's real
 fractal complexity. (3) `fractal_reason` classifies the combination.
 
@@ -638,7 +639,7 @@ fractal complexity. (3) `fractal_reason` classifies the combination.
 ```sql
 CALL fractal_agent_detour_classify(
     'bt_vehicles', 'emb', '[1,0,0]', '[0.7,0.7,0]',
-    '[[0,0],[1,0.1],[2,0.4],[3,0.2],[4,1.1]]', 2, @result);
+    '[[0,0],[1,0.1],[2,0.4],[3,0.2],[4,1.1]]', 5, 2, @result);
 SELECT @result;
 ```
 
@@ -665,10 +666,11 @@ path AND shows erratic heading behavior.
 | `p_baseline_vec` | `JSON` | the expected-track embedding |
 | `p_current_vec` | `JSON` | the actual-track embedding |
 | `p_heading_series` | `JSON` | the raw heading-angle series over time |
+| `p_k` | `INT` | how many trajectory neighbours to search (NULL -> 5) |
 | `p_result` (OUT) | `JSON` | `{"nearest_fleet_id":.., "trajectory_distance":.., "dfa_exponent":.., "rationale":".."}` |
 
 **How it works.** (1) `fractal_search_trajectory(track_table, emb_col,
-baseline_vec, current_vec, 1)` for real deviation. (2)
+baseline_vec, current_vec, k)` for real deviation. (2)
 `fractal_dimension_dfa(heading_series)` for the real DFA scaling exponent
 on heading. (3) `fractal_reason` triages the combination.
 
@@ -677,7 +679,7 @@ on heading. (3) `fractal_reason` triages the combination.
 CALL fractal_agent_track_anomaly(
     'bt_tracks', 'emb', '[1,0,0]', '[0.6,0.8,0]',
     '[0.1,0.15,0.09,0.2,0.31,0.05, ... /* >=24 points, see Notes */]',
-    @result);
+    5, @result);
 SELECT @result;
 ```
 
@@ -699,9 +701,9 @@ directly, no table lookup.
 | --- | --- | --- |
 | `p_point_cloud` | `JSON` | the sensor/node point cloud |
 | `p_drift_series` | `JSON` | a coverage-metric series over time |
-| `p_boxcount_dim` | `INT` | dimension parameter for `fractal_dimension_boxcount` |
-| `p_drift_win` | `INT` | window size for `fractal_dimension_drift` |
-| `p_drift_threshold` | `DOUBLE` | drift exponent above which coverage is flagged degrading |
+| `p_boxcount_dim` | `INT` | dimension parameter for `fractal_dimension_boxcount` (`NULL` defaults to 2) |
+| `p_drift_win` | `INT` | window size for `fractal_dimension_drift` (`NULL` defaults to 48) |
+| `p_drift_threshold` | `DOUBLE` | drift exponent above which coverage is flagged degrading (`NULL` defaults to 0.5) |
 | `p_context` | `TEXT` | optional label passed to the reason call (NULL ok) |
 | `p_result` (OUT) | `JSON` | `{"morph_dimension":.., "lacunarity":.., "drift_detected":true\|false, "rationale":".."}` |
 
@@ -716,7 +718,7 @@ the alert.
 CALL fractal_agent_network_coverage_alert(
     '[[0,0,0],[1,0,0],[0,1,0],[1,1,1]]',
     '[0.9,0.91,0.88,0.7,0.5,0.3, ... /* series */]',
-    3, 16, 0.6, NULL, @result);
+    3, 48, 0.5, NULL, @result);
 SELECT @result;
 ```
 
@@ -733,8 +735,8 @@ regime-change read: the array-in counterpart to `anomaly_triage`.
 | Argument | Type | What it is |
 | --- | --- | --- |
 | `p_series` | `JSON` | the series to analyze |
-| `p_win` | `INT` | window size for `fractal_dimension_drift` |
-| `p_drift_threshold` | `DOUBLE` | drift exponent above which a regime change is flagged |
+| `p_win` | `INT` | window size for `fractal_dimension_drift` (`NULL` defaults to 64) |
+| `p_drift_threshold` | `DOUBLE` | drift exponent above which a regime change is flagged (`NULL` defaults to 0.5) |
 | `p_context` | `TEXT` | optional label passed to the reason call (NULL ok) |
 | `p_result` (OUT) | `JSON` | `{"dfa_exponent":.., "drift_detected":true\|false, "recent_alpha":.., "baseline_alpha":.., "rationale":".."}` |
 
@@ -746,7 +748,7 @@ the combination.
 **Example**
 ```sql
 CALL fractal_agent_regime_triage(
-    '[50.1,51.2,49.8,50.5, ... /* >=24 points */]', 16, 0.6, NULL, @result);
+    '[50.1,51.2,49.8,50.5, ... /* >=24 points */]', 64, 0.5, NULL, @result);
 SELECT @result;
 ```
 
@@ -772,19 +774,20 @@ Dormant on a Community deployment.
 | `p_cov` | `JSON` | covariance matrix, **flattened 1-D row-major n×n**, e.g. `'[1.0,0.0,0.0,1.0]'` |
 | `p_cardinality` | `INT` | how many assets to hold |
 | `p_n_restarts` | `INT` | independent search restarts to attempt, 1-64 (`NULL` defaults to 8) |
-| `p_overlap_threshold` | `DOUBLE` | max allowed asset overlap between any two returned candidates, 0.0-1.0 (`NULL` defaults to 0.3); sharpe mode only — the pareto front has no overlap filter |
-| `p_quality_frac` | `DOUBLE` | a candidate must reach at least this fraction of the best Sharpe found, 0.0 exclusive-1.0 (`NULL` defaults to 0.8); sharpe mode only |
+| `p_overlap_threshold` | `DOUBLE` | max allowed asset overlap between any two returned candidates, 0.0-1.0 (`NULL` defaults to 0.15); sharpe mode only — the pareto front has no overlap filter |
+| `p_quality_frac` | `DOUBLE` | a candidate must reach at least this fraction of the best Sharpe found, 0.0 exclusive-1.0 (`NULL` defaults to 0.9); sharpe mode only |
 | `p_context` | `TEXT` | optional label passed to the reason call (`NULL` ok) |
 | `p_objective_mode` | `TEXT` | optimization objective: `'sharpe'` (default, also used for `NULL`) or `'pareto'` |
+| `p_seed` | `BIGINT` | RNG seed passed through to the optimizer, for reproducibility (NULL -> the optimizer's own default seed) |
 | `p_result` (OUT) | `JSON` | sharpe mode: `{"optimization":{"n_found":..,"candidates":[{"sharpe":..,"weights":[..]},...]}, "rationale":".."}`; pareto mode: candidates carry `{"return":..,"risk":..,"sharpe":..}` instead |
 
 **How it works.** (1) In `sharpe` mode,
 `fractal_optimize_portfolio_multimodal(mu, cov, cardinality, n_restarts,
-overlap_threshold, quality_frac, 0)`: runs the SFS Sharpe maximizer
+overlap_threshold, quality_frac, seed)`: runs the SFS Sharpe maximizer
 `n_restarts` times with different derived seeds, then greedy
 diverse-selects the results by asset overlap and a quality floor. In
 `pareto` mode, `fractal_optimize_portfolio_multimodal_pareto(mu, cov,
-cardinality, n_restarts, 8, 0, 0, 'gaussian')`: same independent restarts,
+cardinality, n_restarts, 8, seed, 0, 'gaussian')`: same independent restarts,
 but scores each by decomposed return/risk and reduces them to a
 non-dominated Pareto front (see
 [`enterprise.md`](enterprise.md) for both UDFs' full parameter stories). (2)
@@ -795,14 +798,14 @@ non-dominated Pareto front (see
 -- 2 assets, hold 1; cov is the 2x2 identity flattened row-major. Needs
 -- FRACTALSQL_ENTERPRISE_LIB set and fractalsqld restarted, see enterprise.md.
 CALL fractal_agent_diverse_portfolios(
-    '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.3, 0.8,
-    '{"portfolio": "agents-demo-diverse"}', 'sharpe', @result);
+    '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.15, 0.9,
+    '{"portfolio": "agents-demo-diverse"}', 'sharpe', NULL, @result);
 SELECT @result;
 
 -- Pareto mode: a return/risk front instead of sharpe-ranked candidates.
 CALL fractal_agent_diverse_portfolios(
     '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, NULL, NULL,
-    '{"portfolio": "agents-demo-diverse-pareto"}', 'pareto', @result);
+    '{"portfolio": "agents-demo-diverse-pareto"}', 'pareto', NULL, @result);
 SELECT @result;
 ```
 

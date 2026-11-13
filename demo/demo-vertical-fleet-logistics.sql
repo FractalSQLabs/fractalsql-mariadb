@@ -271,7 +271,7 @@ ORDER BY jt.dist;
 -- current_pos, resolved via the table's real PRIMARY KEY, no
 -- ctid/row_number needed), the real trajectory_distance, the real
 -- GPS-trace box-counting complexity, plus a real rationale. Trailing
--- arg is boxcount_dim only, no k or id_col (see this file's header).
+-- args are k then boxcount_dim, no id_col (see this file's header).
 -- --- Preset: fractal_agent_detour_classify (raw trajectory+boxcount form preserved above) ---
 CALL fractal_agent_detour_classify(
     'vfl_vehicles', 'current_pos',
@@ -286,7 +286,7 @@ CALL fractal_agent_detour_classify(
               SELECT t, 2 AS ord, (RAND()-0.5)*0.3 AS step FROM seq
           ) s
     ) c),
-    2, @r);
+    5, 2, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.trace_complexity') AS trace_complexity,

@@ -1597,7 +1597,7 @@ static const char *const t2s_denied_call_prefixes[] = {
     "fractal_audit_log", "fractal_ledger_", "fractal_lock_destructive",
     "fractal_store_", "fractal_diversify_", "fractal_feedback_report",
     "fractal_isolate_background", "fractal_sql_agent", "fractal_agent_",
-    "fractal_vectorizer_", "fractalsql_set_config",
+    "fractal_vectorizer_", "fractal_daemon_config_set",
     "load_file", "sleep", "benchmark", "get_lock", "release_lock",
     "sys_exec", "sys_eval", "master_pos_wait", "master_gtid_wait",
     NULL

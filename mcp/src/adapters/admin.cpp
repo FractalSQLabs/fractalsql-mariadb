@@ -172,7 +172,7 @@ namespace fsqlmcp
             return it == conf.end() ? "" : it->second;
         };
 
-        ToolSpec getVersion = mkTool( "fractalsql_get_version", "admin", "pure", ToolClass::Cheap,
+        ToolSpec getVersion = mkTool( "fractal_version", "admin", "pure", ToolClass::Cheap,
             "Confirms the FractalSQL install is alive and which edition is active: "
             "{edition ('Community'/'Enterprise'), version} from the engine's own "
             "fractal_edition()/fractal_version() UDFs. The plugin's version-skew guard "
@@ -209,7 +209,7 @@ namespace fsqlmcp
 
         t.push_back( std::move( getVersion ) );
 
-        t.push_back( mkTool( "fractalsql_get_config", "admin", "pure", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_daemon_config_get", "admin", "pure", ToolClass::Cheap,
             "Reads back a config key's resolved value, or the whole non-secret surface when no "
             "key is given. IMPORTANT (5.2): this tool reads TWO credential realms -- the "
             "text-to-sql keys come from the database connection's own fractal_t2s_config() "
@@ -276,7 +276,7 @@ namespace fsqlmcp
                               { "source", "fractalsqld.conf" } };
             }, true, false ) );
 
-        t.push_back( mkTool( "fractalsql_set_config", "admin", "stateful", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_daemon_config_set", "admin", "stateful", ToolClass::Cheap,
             "Edits ONE key of the daemon's config file and asks the daemon to reload it. TWO "
             "credential realms in one tool (5.2): the file write is local filesystem (the "
             "config's authoritative home), the reload rides the FSQ protocol authenticated by "
@@ -378,7 +378,7 @@ namespace fsqlmcp
                 return outcome;
             }, false, true, false, true ) );
 
-        t.push_back( mkTool( "fractalsql_configure_reasoning", "admin", "stateful", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_configure_reasoning", "admin", "stateful", ToolClass::Cheap,
             "Sets the LLM provider configuration (provider_url, embed_url, model, embed_model, "
             "allow_plaintext, think_mode) in the daemon's config file and reloads it. "
             "destructiveHint: this re-points every subsequent reasoning/embedding/agent call at "
@@ -393,7 +393,7 @@ namespace fsqlmcp
               Str( "embed_url", false, "e.g. http://host:11434/v1/embeddings" ),
               Str( "model", false, "reasoning/chat model name" ),
               Str( "embed_model", false, "embedding model name" ),
-              Bool_( "allow_plaintext", false, "required to point the daemon at plaintext http://", false ),
+              Bool_( "allow_plaintext", false, "required to point the daemon at plaintext http://" ),
               StrEnum( "think_mode", false, "'none' (default) | 'off' | 'low' | 'medium' | 'high'" ) },
             [ &ecfg, reloadAndReport ]( const Json& a, CallCtx& ctx )
             {
@@ -472,7 +472,7 @@ namespace fsqlmcp
         // The engine's scalar UDF results arrive as {"value": <text>} when
         // the text is not itself JSON (db.cpp's parseJsonOrValue); unwrapScalar
         // (file scope, above) turns that back into the plain text.
-        t.push_back( mkTool( "fractalsql_session_config_set", "admin", "stateful", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_config_set", "admin", "stateful", ToolClass::Cheap,
             "Sets ONE configuration key for THIS CONNECTION only, layered over the daemon-wide "
             "value -- no config-file edit and no daemon reload. A session may change the TUNING "
             "keys (reasoning_model, embed_model, think, think_num_ctx, t2s_max_attempts, "
@@ -483,11 +483,28 @@ namespace fsqlmcp
             "what LLM traffic this session asks for (10.4) -- every call is logged with the "
             "key's old and new value.",
             { Str( "key", true, "the configuration key to override for this connection" ),
-              Str( "value", true, "the new value (as a string)" ) },
+              Str( "value", true, "the new value (as a string)" ),
+              Bool_( "allow_secrets", false,
+                     "Must be true to write a secret-bearing key (reasoning_token, "
+                     "enterprise_ledger_key) through this boundary: an explicit operator "
+                     "intent, never a default. This engine's session overlay refuses "
+                     "those keys by name regardless, so the flag states the intent; it "
+                     "does not widen what a session may write.", false ) },
             [ &db ]( const Json& a, CallCtx& ctx )
             {
                 const std::string key = a.at( "key" ).get<std::string>();
                 const std::string value = a.at( "value" ).get<std::string>();
+                // A secret-bearing key needs the caller's explicit intent --
+                // the same rule the other engines publish this flag for.
+                if( conffile::isSecretKey( key )
+                    && !( a.contains( "allow_secrets" ) && !a.at( "allow_secrets" ).is_null()
+                          && a.at( "allow_secrets" ).is_boolean() && a.at( "allow_secrets" ).get<bool>() ) )
+                    return Json{ { "ok", false }, { "key", key },
+                                 { "reason", "'" + key + "' is a secret-bearing configuration key: pass "
+                                              "allow_secrets=true to make the operator's explicit intent "
+                                              "explicit. This engine's session overlay refuses secret and "
+                                              "enterprise keys by name either way -- they are set in the "
+                                              "daemon's own config file, not from a session." } };
                 // The config-writes switch: a key this deployment's setting
                 // does not allow is refused BEFORE the engine is asked, so
                 // the connection's overrides stay exactly as they were.
@@ -528,9 +545,9 @@ namespace fsqlmcp
                 }
                 return Json{ { "ok", false }, { "key", key },
                              { "reason", text.empty() ? std::string( "refused" ) : text } };
-            }, false, true ) );
+            }, false, true, false, true ) );
 
-        t.push_back( mkTool( "fractalsql_session_config_get", "admin", "pure", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_config_get", "admin", "pure", ToolClass::Cheap,
             "Reads one configuration key's EFFECTIVE value for THIS CONNECTION: the session's own "
             "override when it has one, otherwise the daemon-wide value. A secret's value is never "
             "returned -- the result is '<redacted>' (configured) or '<unset>' (not configured). The "
@@ -563,7 +580,7 @@ namespace fsqlmcp
                 return Json{ { "key", key }, { "value", Json( *raw ) } };
             }, true ) );
 
-        t.push_back( mkTool( "fractalsql_session_config_reset", "admin", "stateful", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_config_reset", "admin", "stateful", ToolClass::Cheap,
             "Drops every configuration override THIS CONNECTION holds, so it falls back to the "
             "daemon-wide values. Returns the number of overrides dropped.",
             {},
@@ -576,7 +593,7 @@ namespace fsqlmcp
                 return Json{ { "dropped", dropped } };
             }, false ) );
 
-        t.push_back( mkTool( "fractalsql_session_config_list", "admin", "pure", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_config_list", "admin", "pure", ToolClass::Cheap,
             "Lists the configuration overrides THIS CONNECTION holds, as a JSON object. An empty "
             "object means the connection is running entirely on the daemon-wide configuration.",
             {},
@@ -588,7 +605,7 @@ namespace fsqlmcp
                 return Json{ { "overrides", res.is_object() ? res : Json::object() } };
             }, true ) );
 
-        t.push_back( mkTool( "fractalsql_session_config_keys", "admin", "pure", ToolClass::Cheap,
+        t.push_back( mkTool( "fractal_config_keys", "admin", "pure", ToolClass::Cheap,
             "Lists every configuration key this engine knows, as a JSON array of "
             "{name, type, session_overridable} objects -- so a caller can discover which knobs a "
             "session may change instead of hard-coding the list.",

@@ -16,7 +16,7 @@
 # run the UDF bodies the shim forwards calls to.
 
 Name:           fractalsql-mariadb
-Version:        2.0.12
+Version:        2.0.13
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MariaDB (10.6 / 10.11 / 11.4 LTS / 12.3 LTS)
 
@@ -131,6 +131,15 @@ systemctl enable --now fractalsqld.service >/dev/null 2>&1 || true
 %dir %attr(0750,fractalsql,fractalsql) %{confdir}
 
 %changelog
+* Fri Nov 13 2026 FractalSQLabs - 2.0.13-1
+- MCP: the admin tools use the standard names (fractal_version,
+  fractal_config_get/set/reset/list/keys, fractal_daemon_config_get/set,
+  fractal_configure_reasoning); the old fractalsql_* names are gone.
+  fractal_config_set takes allow_secrets for secret-bearing keys.
+- fractal_search_debug defaults to 30 iterations (was 60).
+- The agent procedures accept a NULL seed or k and apply their defaults.
+- Refreshed agent and vertical demo kits and documentation, and an expanded
+  test suite (redaction, fuzz replay, Valgrind, MCP conformance and faults).
 * Sat Nov 07 2026 FractalSQLabs - 2.0.12-1
 - Safety: the reasoning plugin is now signed. It ships with a detached
   Ed25519 signature (.sig) beside it and loads only when that file is

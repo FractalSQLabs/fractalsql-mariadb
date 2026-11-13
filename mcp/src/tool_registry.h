@@ -257,7 +257,7 @@ namespace fsqlmcp
             "fractal_agent_feedback_audit",
             "fractal_agent_recommend_diverse",
             "fractal_session_close",
-            "fractalsql_session_config_reset",
+            "fractal_config_reset",
             "fractal_lock_destructive",
             "fractal_store_vectors",
             "fractal_store_series",
@@ -317,10 +317,10 @@ namespace fsqlmcp
             "fractal_detect_collapse",
             // The per-connection configuration overlay: its overrides live
             // under the connection's own session id.
-            "fractalsql_session_config_set",
-            "fractalsql_session_config_get",
-            "fractalsql_session_config_reset",
-            "fractalsql_session_config_list"
+            "fractal_config_set",
+            "fractal_config_get",
+            "fractal_config_reset",
+            "fractal_config_list"
         };
         for( const char* k : kNames ) if( n == k ) return true;
         return false;

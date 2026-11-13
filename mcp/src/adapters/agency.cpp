@@ -109,13 +109,13 @@ namespace fsqlmcp
                   Str( "time_col", true, "time-ordering column" ),
                   Str( "filter_col", true, "entity filter column" ),
                   Str( "filter_val", true, "entity filter value" ),
-                  Int( "baseline_window", true, "baseline window size (integer >= 1)" ) },
-                [ &db, strReq, intReq ]( const Json& a, CallCtx& )
+                  Int( "baseline_window", false, "baseline window size (integer >= 1; 32 is the tested-safe value)", 32 ) },
+                [ &db, strReq, intArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_anomaly_triage",
                         { strReq( a, "log_table" ), strReq( a, "metric_col" ), strReq( a, "time_col" ),
                           strReq( a, "filter_col" ), strReq( a, "filter_val" ),
-                          intReq( a, "baseline_window" ) },
+                          intArg( a, "baseline_window", 32 ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -126,16 +126,16 @@ namespace fsqlmcp
                 "series needs at least win+16 points, and 24+ overall for a meaningful exponent." + kLlm + kPartialNote;
             t.push_back( mkTool( "fractal_agent_regime_triage", "agency", "no-retry", ToolClass::Expensive, d.c_str(),
                 { Vec( "series", true, "the metric series (>=24 points to be safe)" ),
-                  Int( "win", false, "", 16 ),
-                  Num( "drift_threshold", false, "", 0.1 ),
+                  Int( "win", false, "DFA window", 64 ),
+                  Num( "drift_threshold", false, "drift threshold", 0.5 ),
                   Str( "context", false, "optional JSON context passed to the LLM", "{}" ) },
                 [ &db, intArg, ctxArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_regime_triage",
                         { SqlValue( packVector( a.at( "series" ), "series" ) ),
-                          intArg( a, "win", 16 ),
+                          intArg( a, "win", 64 ),
                           SqlValue( a.contains( "drift_threshold" ) && a.at( "drift_threshold" ).is_number()
-                                      ? a.at( "drift_threshold" ).get<double>() : 0.1 ),
+                                      ? a.at( "drift_threshold" ).get<double>() : 0.5 ),
                           ctxArg( a ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
@@ -152,11 +152,15 @@ namespace fsqlmcp
                   Vec( "heading_series", true, "heading series (>=24 points to be safe)" ) },
                 [ &db, strReq ]( const Json& a, CallCtx& )
                 {
+                    // The procedure takes k; the published tool surface does
+                    // not expose it, so the adapter supplies the default k
+                    // of 5.
                     return db.callProc( "fractal_agent_track_anomaly",
                         { strReq( a, "track_table" ), strReq( a, "emb_col" ),
                           SqlValue( packVector( a.at( "baseline_vec" ), "baseline_vec" ) ),
                           SqlValue( packVector( a.at( "current_vec" ), "current_vec" ) ),
-                          SqlValue( packVector( a.at( "heading_series" ), "heading_series" ) ) },
+                          SqlValue( packVector( a.at( "heading_series" ), "heading_series" ) ),
+                          SqlValue( static_cast<std::int64_t>( 5 ) ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -171,15 +175,22 @@ namespace fsqlmcp
                   Vec( "baseline_vec", true, "baseline position vector" ),
                   Vec( "current_vec", true, "current position vector" ),
                   Vec( "gps_trace", true, "raw GPS point sequence, e.g. [[0,0],[1,0.1],[2,0.4]]" ),
-                  Int( "boxcount_dim", true, "box-counting dimension (>= 1)" ) },
+                  Int( "k", false, "Neighbors.", 5 ),
+                  Int( "boxcount_dim", false, "box-counting dimension (>= 1)", 2 ) },
                 [ &db, strReq, intReq ]( const Json& a, CallCtx& )
                 {
+                    // Both optional arguments take their default when the
+                    // caller leaves them out; the procedure's own NULL
+                    // means the same thing.
                     return db.callProc( "fractal_agent_detour_classify",
                         { strReq( a, "vehicle_table" ), strReq( a, "emb_col" ),
                           SqlValue( packVector( a.at( "baseline_vec" ), "baseline_vec" ) ),
                           SqlValue( packVector( a.at( "current_vec" ), "current_vec" ) ),
                           SqlValue( a.at( "gps_trace" ).dump() ),
-                          intReq( a, "boxcount_dim" ) },
+                          SqlValue( a.contains( "k" ) && a.at( "k" ).is_number_integer()
+                              ? a.at( "k" ).get<std::int64_t>() : std::int64_t( 5 ) ),
+                          SqlValue( a.contains( "boxcount_dim" ) && a.at( "boxcount_dim" ).is_number_integer()
+                              ? a.at( "boxcount_dim" ).get<std::int64_t>() : std::int64_t( 2 ) ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -192,19 +203,19 @@ namespace fsqlmcp
             t.push_back( mkTool( "fractal_agent_network_coverage_alert", "agency", "no-retry", ToolClass::Expensive, d.c_str(),
                 { Vec( "point_cloud", true, "sensor-grid point cloud (array of row vectors)" ),
                   Vec( "drift_series", true, "telemetry drift series" ),
-                  Int( "boxcount_dim", true, "box-counting dimension (>= 1)" ),
-                  Int( "drift_win", false, "", 16 ),
-                  Num( "drift_threshold", false, "", 0.1 ),
-                  Str( "context", false, "", "{}" ) },
-                [ &db, intReq, intArg, ctxArg ]( const Json& a, CallCtx& )
+                  Int( "boxcount_dim", false, "box-counting dimension (>= 1)", 2 ),
+                  Int( "drift_win", false, "drift window", 48 ),
+                  Num( "drift_threshold", false, "drift threshold", 0.5 ),
+                  Str( "context", false, "optional JSON context passed to the LLM", "{}" ) },
+                [ &db, intArg, ctxArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_network_coverage_alert",
                         { SqlValue( a.at( "point_cloud" ).dump() ),
                           SqlValue( packVector( a.at( "drift_series" ), "drift_series" ) ),
-                          intReq( a, "boxcount_dim" ),
-                          intArg( a, "drift_win", 16 ),
+                          intArg( a, "boxcount_dim", 2 ),
+                          intArg( a, "drift_win", 48 ),
                           SqlValue( a.contains( "drift_threshold" ) && a.at( "drift_threshold" ).is_number()
-                                      ? a.at( "drift_threshold" ).get<double>() : 0.1 ),
+                                      ? a.at( "drift_threshold" ).get<double>() : 0.5 ),
                           ctxArg( a ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
@@ -218,14 +229,21 @@ namespace fsqlmcp
                 { Vec( "mu", true, "expected returns per asset" ),
                   Vec( "cov", true, "covariance matrix, flattened 1-D row-major (n*n values)" ),
                   Int( "cardinality", true, "max nonzero assets (>= 1)" ),
-                  Str( "context", false, "", "{}" ) },
-                [ &db, intReq, ctxArg ]( const Json& a, CallCtx& )
+                  Str( "context", false, "optional JSON context passed to the LLM" ) },
+                [ &db, intReq ]( const Json& a, CallCtx& )
                 {
+                    // The context is optional and carries no published
+                    // default: an absent one is passed as NULL and the
+                    // engine's own '{}' fallback applies (the same result
+                    // the other engines produce).
+                    const SqlValue ctx = a.contains( "context" ) && !a.at( "context" ).is_null()
+                                           ? SqlValue( a.at( "context" ).get<std::string>() )
+                                           : SqlValue( nullptr );
                     return db.callProc( "fractal_agent_allocate",
                         { SqlValue( packVector( a.at( "mu" ), "mu" ) ),
                           SqlValue( packVector( a.at( "cov" ), "cov" ) ),
                           intReq( a, "cardinality" ),
-                          ctxArg( a ) },
+                          ctx },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -241,9 +259,9 @@ namespace fsqlmcp
                   Str( "alloc_table", true, "allocation-snapshots table" ),
                   Str( "alloc_emb_col", true, "embedding column in alloc_table" ),
                   Vec( "baseline_vec", true, "baseline allocation vector" ),
-                  Int( "seed", false, "RNG seed passed through to the optimizer", 0 ),
+                  Int( "seed", false, "RNG seed passed through to the optimizer" ),
                   Str( "context", false, "", "{}" ) },
-                [ &db, intReq, strReq, intArg, ctxArg ]( const Json& a, CallCtx& )
+                [ &db, intReq, strReq, ctxArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_rebalance_sibling",
                         { SqlValue( packVector( a.at( "mu" ), "mu" ) ),
@@ -251,7 +269,8 @@ namespace fsqlmcp
                           intReq( a, "cardinality" ),
                           strReq( a, "alloc_table" ), strReq( a, "alloc_emb_col" ),
                           SqlValue( packVector( a.at( "baseline_vec" ), "baseline_vec" ) ),
-                          intArg( a, "seed", 0 ),
+                          ( a.contains( "seed" ) && !a.at( "seed" ).is_null() && a.at( "seed" ).is_number_integer() )
+                            ? SqlValue( a.at( "seed" ).get<std::int64_t>() ) : SqlValue( nullptr ),
                           ctxArg( a ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
@@ -263,16 +282,17 @@ namespace fsqlmcp
                 "tier not loaded' error on a Community install. Multi-restart diverse-candidate "
                 "optimizer (sharpe or pareto objective_mode) -> one LLM tradeoff summary over all "
                 "candidates. cov flattened 1-D row-major. NULL objective_mode/default knobs follow "
-                "the documented defaults (n_restarts=8, overlap_threshold=0.3, quality_frac=0.8)." + kLlm + kPartialNote;
+                "the documented defaults (n_restarts=8, overlap_threshold=0.15, quality_frac=0.9)." + kLlm + kPartialNote;
             t.push_back( mkTool( "fractal_agent_diverse_portfolios", "agency", "no-retry", ToolClass::Expensive, d.c_str(),
                 { Vec( "mu", true, "expected returns per asset" ),
                   Vec( "cov", true, "covariance matrix, flattened 1-D row-major" ),
                   Int( "cardinality", true, "max nonzero assets (>= 1)" ),
-                  Int( "n_restarts", false, "restarts, 1-64 (default 8)" ),
-                  Num( "overlap_threshold", false, "" ),
-                  Num( "quality_frac", false, "" ),
-                  Str( "context", false, "", "{}" ),
-                  StrEnum( "objective_mode", false, "'sharpe' (default) or 'pareto'" ) },
+                  Int( "n_restarts", false, "independent restarts, 1-64", 8 ),
+                  Num( "overlap_threshold", false, "max allowed asset overlap between two candidates, 0.0-1.0", 0.15 ),
+                  Num( "quality_frac", false, "a candidate must reach this fraction of the best Sharpe, 0.0-1.0", 0.9 ),
+                  Str( "context", false, "optional JSON context passed to the LLM", "{}" ),
+                  StrEnum( "objective_mode", false, "'sharpe' or 'pareto'", "sharpe" ),
+                  Int( "seed", false, "RNG seed passed through to the optimiser" ) },
                 [ &db, intReq, optDouble ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_diverse_portfolios",
@@ -280,13 +300,15 @@ namespace fsqlmcp
                           SqlValue( packVector( a.at( "cov" ), "cov" ) ),
                           intReq( a, "cardinality" ),
                           ( a.contains( "n_restarts" ) && !a.at( "n_restarts" ).is_null() )
-                            ? SqlValue( a.at( "n_restarts" ).get<std::int64_t>() ) : SqlValue( nullptr ),
+                            ? SqlValue( a.at( "n_restarts" ).get<std::int64_t>() ) : SqlValue( 8 ),
                           optDouble( a, "overlap_threshold" ),
                           optDouble( a, "quality_frac" ),
                           ( a.contains( "context" ) && !a.at( "context" ).is_null()
                               ? SqlValue( a.at( "context" ).get<std::string>() ) : SqlValue( std::string( "{}" ) ) ),
                           ( a.contains( "objective_mode" ) && !a.at( "objective_mode" ).is_null()
-                              ? SqlValue( a.at( "objective_mode" ).get<std::string>() ) : SqlValue( std::string( "sharpe" ) ) ) },
+                              ? SqlValue( a.at( "objective_mode" ).get<std::string>() ) : SqlValue( std::string( "sharpe" ) ) ),
+                          ( a.contains( "seed" ) && !a.at( "seed" ).is_null()
+                              ? SqlValue( a.at( "seed" ).get<std::int64_t>() ) : SqlValue( nullptr ) ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -301,13 +323,15 @@ namespace fsqlmcp
                   Str( "cap_table", true, "capability-embedding table" ),
                   Str( "cap_emb_col", true, "its embedding column" ),
                   Int( "budget", true, "token budget (>= 0)" ),
-                  Int( "cost_per_route", true, "cost per route (>= 0)" ) },
+                  Int( "cost_per_route", false, "cost per route (>= 0)", 150 ) },
                 [ &db, strReq, intReq ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_route_task",
                         { SqlValue( packVector( a.at( "task_emb" ), "task_emb" ) ),
                           strReq( a, "cap_table" ), strReq( a, "cap_emb_col" ),
-                          intReq( a, "budget" ), intReq( a, "cost_per_route" ) },
+                          intReq( a, "budget" ),
+                          SqlValue( a.contains( "cost_per_route" ) && a.at( "cost_per_route" ).is_number_integer()
+                              ? a.at( "cost_per_route" ).get<std::int64_t>() : std::int64_t( 150 ) ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -322,17 +346,20 @@ namespace fsqlmcp
                 { Vec( "task_vec", true, "the task's location vector" ),
                   Str( "node_table", true, "node table" ),
                   Str( "node_emb_col", true, "embedding column" ),
-                  Int( "iterations", true, "SFS iterations (default 30)", 30 ),
-                  Int( "population", true, "SFS population (the knob that matters)", 50 ),
-                  Int( "k", true, "", 1 ),
+                  Int( "iterations", false, "SFS iterations (default 30)", 30 ),
+                  Int( "population", false, "SFS population (the knob that matters)", 50 ),
+                  Int( "k", false, "", 5 ),
                   Str( "context", false, "", "{}" ) },
                 [ &db, strReq, intReq, intArg, ctxArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_schedule_workload",
                         { SqlValue( packVector( a.at( "task_vec" ), "task_vec" ) ),
                           strReq( a, "node_table" ), strReq( a, "node_emb_col" ),
-                          intReq( a, "iterations" ), intReq( a, "population" ),
-                          intArg( a, "k", 1 ), ctxArg( a ) },
+                          SqlValue( a.contains( "iterations" ) && a.at( "iterations" ).is_number_integer()
+                              ? a.at( "iterations" ).get<std::int64_t>() : std::int64_t( 30 ) ),
+                          SqlValue( a.contains( "population" ) && a.at( "population" ).is_number_integer()
+                              ? a.at( "population" ).get<std::int64_t>() : std::int64_t( 50 ) ),
+                          intArg( a, "k", 5 ), ctxArg( a ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -349,14 +376,20 @@ namespace fsqlmcp
                   Str( "history_table", true, "history table of known states" ),
                   Str( "emb_col", true, "embedding column" ),
                   Num( "threshold", true, "intercept threshold (default 0.3)", 0.3 ),
-                  StrEnum( "metric", true, "'cosine' (default) or 'l2'" ) },
+                  StrEnum( "metric", false, "'cosine' (default) or 'l2'", "cosine" ) },
                 [ &db, strReq ]( const Json& a, CallCtx& )
                 {
+                    // The metric is optional with 'cosine' as its default; the
+                    // procedure still rejects anything other than 'cosine'
+                    // or 'l2', so the default is what makes the omission
+                    // work.
+                    const std::string metric = a.contains( "metric" ) && !a.at( "metric" ).is_null()
+                                                ? a.at( "metric" ).get<std::string>() : std::string( "cosine" );
                     return db.callProc( "fractal_agent_outlier_intercept",
                         { SqlValue( packVector( a.at( "state_vec" ), "state_vec" ) ),
                           strReq( a, "history_table" ), strReq( a, "emb_col" ),
                           SqlValue( a.at( "threshold" ).get<double>() ),
-                          strReq( a, "metric" ) },
+                          SqlValue( metric ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -488,7 +521,7 @@ namespace fsqlmcp
             t.push_back( mkTool( "fractal_agent_recommend_diverse", "agency", "stateful", ToolClass::Expensive, d.c_str(),
                 { Str( "catalog_table", true, "catalog table" ), Str( "emb_col", true, "embedding column" ),
                   Vec( "query_vec", true, "query vector" ),
-                  Int( "k", false, "", 5 ) },
+                  Int( "k", false, "neighbours to return", 10 ) },
                 [ &db, &rowCfg, strReq ]( const Json& a, CallCtx& )
                 {
                     const int limit = effectiveLimit( a, rowCfg );
@@ -496,7 +529,7 @@ namespace fsqlmcp
                         { strReq( a, "catalog_table" ), strReq( a, "emb_col" ),
                           SqlValue( packVector( a.at( "query_vec" ), "query_vec" ) ),
                           SqlValue( static_cast<std::int64_t>( std::min<int>(
-                              a.contains( "k" ) && a.at( "k" ).is_number_integer() ? a.at( "k" ).get<int>() : 5,
+                              a.contains( "k" ) && a.at( "k" ).is_number_integer() ? a.at( "k" ).get<int>() : 10,
                               limit ) ) ) },
                         { "result" }, MergeMode::Single );
                     return truncateResult( std::move( result ), limit );
@@ -519,15 +552,15 @@ namespace fsqlmcp
                   Vec( "query_vec", true, "query vector" ),
                   Str( "warmup_table", true, "warmup table" ),
                   Str( "warmup_vec_col", true, "warmup embedding column" ),
-                  Int( "warmup_count", false, "", 20 ),
-                  Int( "k", false, "", 3 ) },
+                  Int( "warmup_count", false, "warm-up rows to search", 8 ),
+                  Int( "k", false, "neighbours to return", 3 ) },
                 [ &db, strReq, intArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_agent_feedback_audit",
                         { strReq( a, "catalog_table" ), strReq( a, "emb_col" ),
                           SqlValue( packVector( a.at( "query_vec" ), "query_vec" ) ),
                           strReq( a, "warmup_table" ), strReq( a, "warmup_vec_col" ),
-                          intArg( a, "warmup_count", 20 ), intArg( a, "k", 3 ) },
+                          intArg( a, "warmup_count", 8 ), intArg( a, "k", 3 ) },
                         { "result" }, MergeMode::Single );
                 }, false ) );
         }
@@ -563,13 +596,13 @@ namespace fsqlmcp
                 { Str( "query", true, "the query text" ),
                   Str( "table_name", true, "table to search" ),
                   Str( "vector_col", true, "embedding column" ),
-                  Str( "meta_filter", false, "accepted for signature parity; currently unused" ) },
+                  Str( "meta_filter", false, "accepted for signature parity; currently unused", "{}" ) },
                 [ &db, strReq ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_rag_agent",
                         { strReq( a, "query" ), strReq( a, "table_name" ), strReq( a, "vector_col" ),
                           ( a.contains( "meta_filter" ) && !a.at( "meta_filter" ).is_null() )
-                            ? SqlValue( a.at( "meta_filter" ).get<std::string>() ) : SqlValue( nullptr ) },
+                            ? SqlValue( a.at( "meta_filter" ).get<std::string>() ) : SqlValue( std::string( "{}" ) ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -618,14 +651,17 @@ namespace fsqlmcp
             // embedded label is the caller's own data, not a credential.
             // trajectory_predict below crosses nothing and stays closed-world.
             t.push_back( mkTool( "fractal_agent_plan_explore", "agency", "no-retry", ToolClass::Expensive, d.c_str(),
-                { Vec( "initial_state", true, "initial state vector" ),
+                { Str( "initial_state", true, "state label (text, not a raw vector)" ),
                   Str( "strategy_table", true, "strategy table" ),
                   Str( "vector_col", true, "embedding column" ),
                   Int( "max_branches", true, "branches to explore (>= 1)", 3 ) },
                 [ &db, strReq, intReq ]( const Json& a, CallCtx& )
                 {
+                    // initial_state is a state LABEL: the procedure embeds
+                    // this text and starts the MCTS from the vector nearest
+                    // to it (the same shape the other engines publish).
                     return db.callProc( "fractal_agent_plan_explore",
-                        { SqlValue( packVector( a.at( "initial_state" ), "initial_state" ) ),
+                        { SqlValue( a.at( "initial_state" ).get<std::string>() ),
                           strReq( a, "strategy_table" ), strReq( a, "vector_col" ),
                           intReq( a, "max_branches" ) },
                         { "result" }, MergeMode::Single );
@@ -676,7 +712,7 @@ namespace fsqlmcp
                 { Str( "agent_id", true, "agent id attached to the result" ),
                   Vec( "state_log", true, "JSON array of consecutive state vectors" ),
                   Int( "n_bits", false, "", 64 ),
-                  Num( "seed", false, "", 42.0 ),
+                  Int( "seed", false, "", 42 ),
                   Int( "hamming_threshold", false, "", 0 ) },
                 [ &db, strReq ]( const Json& a, CallCtx& )
                 {
@@ -685,8 +721,8 @@ namespace fsqlmcp
                           SqlValue( a.at( "state_log" ).dump() ),
                           ( a.contains( "n_bits" ) && a.at( "n_bits" ).is_number_integer()
                               ? SqlValue( a.at( "n_bits" ).get<std::int64_t>() ) : SqlValue( std::int64_t( 64 ) ) ),
-                          ( a.contains( "seed" ) && a.at( "seed" ).is_number()
-                              ? SqlValue( a.at( "seed" ).get<double>() ) : SqlValue( 42.0 ) ),
+                          ( a.contains( "seed" ) && a.at( "seed" ).is_number_integer()
+                              ? SqlValue( a.at( "seed" ).get<std::int64_t>() ) : SqlValue( std::int64_t( 42 ) ) ),
                           ( a.contains( "hamming_threshold" ) && a.at( "hamming_threshold" ).is_number_integer()
                               ? SqlValue( a.at( "hamming_threshold" ).get<std::int64_t>() ) : SqlValue( std::int64_t( 0 ) ) ) },
                         { "result" }, MergeMode::Single );

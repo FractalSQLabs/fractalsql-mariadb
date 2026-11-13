@@ -23,6 +23,12 @@
  *   FSQL_SYS_FAIL_AT=K   the Kth socket or thread call of the whole process
  *                        fails with errno FSQL_SYS_ERRNO (EIO by default).
  *                        Read once at load time (boot-path trials).
+ *   FSQL_OOM_ONLY_SO=<substring>  count and fail only allocations whose CALLER lives in a shared object whose
+ *                        path contains the substring (dladdr on the return address): the extension's own
+ *                        allocations, not the engine's. With FSQL_OOM_CTL, SIGUSR2 (disarm) also writes
+ *                        "<allocations counted> <failures injected>" to <ctl file>.res, which is how a driver
+ *                        learns how many allocation sites a statement has.
+ *   FSQL_OOM_LINEBUF=1   line-buffer stdout (a driver that talks to a CLI over a pipe)
  *   FSQL_OOM_CTL=<file>  for a long-lived process: SIGUSR1 reads "N M K E"
  *                        from the file (any may be 0 or missing for "no
  *                        fault"), restarts the counters at zero and arms the
@@ -60,6 +66,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <execinfo.h>
 
 static void *(*real_malloc)(size_t)          = NULL;
 static void *(*real_calloc)(size_t, size_t)  = NULL;
@@ -95,6 +102,8 @@ static long g_sys_count   = 0;
 static int  g_sys_errno   = EIO;
 static int  g_workers_only = 0;   /* FSQL_OOM_WORKERS_ONLY: spare the main thread */
 static const char *g_ctl_path = NULL;
+static const char *g_only_so = NULL;   /* FSQL_OOM_ONLY_SO */
+static long g_fired = 0;               /* failures injected since the last arming */
 
 /* True on the process's main thread, which is spared when FSQL_OOM_WORKERS_ONLY
  * is set: a server's reader loop has no recovery from a failed allocation, but
@@ -132,18 +141,47 @@ oom_arm(int sig)
         }
     }
     __atomic_store_n(&g_count, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_fired, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_io_count, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_sys_count, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_sys_errno, e > 0 ? (int) e : EIO, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_fail_at, n, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_io_fail_at, m, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_sys_fail_at, k, __ATOMIC_SEQ_CST);
+    if (g_only_so) {                          /* ack: "<ctl>.armed" exists once the new arming is in force */
+        char path[600];
+        size_t pl = strlen(g_ctl_path);
+        if (pl + 7 < sizeof path) {
+            memcpy(path, g_ctl_path, pl); memcpy(path + pl, ".armed", 7);
+            int afd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (afd >= 0) close(afd);
+        }
+    }
 }
 
 static void
 oom_disarm(int sig)
 {
     (void) sig;
+    if (g_ctl_path && g_only_so) {            /* report: "<counted> <injected>" (async-signal-safe: open/write/close) */
+        char path[600], out[48];
+        size_t pl = strlen(g_ctl_path);
+        if (pl + 5 < sizeof path) {
+            memcpy(path, g_ctl_path, pl); memcpy(path + pl, ".res", 5);
+            long c = __atomic_load_n(&g_count, __ATOMIC_SEQ_CST), f = __atomic_load_n(&g_fired, __ATOMIC_SEQ_CST);
+            char tmp[24]; int ti = 0, oi = 0;
+            long v[2] = { c, f };
+            for (int k = 0; k < 2; k++) {
+                long x = v[k]; ti = 0;
+                if (x == 0) tmp[ti++] = '0';
+                while (x > 0) { tmp[ti++] = (char) ('0' + x % 10); x /= 10; }
+                while (ti > 0) out[oi++] = tmp[--ti];
+                out[oi++] = k ? '\n' : ' ';
+            }
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) { (void) !write(fd, out, (size_t) oi); close(fd); }
+        }
+    }
     __atomic_store_n(&g_fail_at, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_io_fail_at, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_sys_fail_at, 0, __ATOMIC_SEQ_CST);
@@ -165,10 +203,35 @@ void fsql_oom_disarm(void) { fsql_oom_arm(0, 0); }
 long fsql_oom_allocs(void) { return __atomic_load_n(&g_count, __ATOMIC_SEQ_CST); }
 long fsql_oom_ios(void) { return __atomic_load_n(&g_io_count, __ATOMIC_SEQ_CST); }
 
+/* FSQL_OOM_BT=1: print a backtrace to stderr when the process dies on SIGABRT/SIGSEGV/SIGBUS, to find
+ * which code a failed allocation took down (a value starting with / is a file to append to). Off by default. */
+static const char *g_bt_path = NULL;   /* FSQL_OOM_BT=<path>: append there instead of stderr */
+
+static void
+oom_bt(int sig)
+{
+    void *fr[48];
+    int   n = backtrace(fr, 48);
+    int   fd = g_bt_path ? open(g_bt_path, O_WRONLY | O_CREAT | O_APPEND, 0644) : 2;
+    if (fd < 0) fd = 2;
+    static const char hdr[] = "oom_preload backtrace:\n";
+    (void) !write(fd, hdr, sizeof hdr - 1);
+    backtrace_symbols_fd(fr, n, fd);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 __attribute__((constructor))
 static void
 oom_preload_init(void)
 {
+    const char *bt = getenv("FSQL_OOM_BT");
+    if (bt && *bt && strcmp(bt, "0") != 0) {
+        void *warm[2];
+        if (bt[0] == '/') g_bt_path = bt;
+        (void) backtrace(warm, 2);       /* load libgcc now, not inside the handler */
+        signal(SIGABRT, oom_bt); signal(SIGSEGV, oom_bt); signal(SIGBUS, oom_bt);
+    }
     const char *v = getenv("FSQL_OOM_FAIL_AT");
     if (v && *v) {
         long n = strtol(v, NULL, 10);
@@ -188,6 +251,9 @@ oom_preload_init(void)
     if (v && *v && strtol(v, NULL, 10) > 0) g_sys_errno = (int) strtol(v, NULL, 10);
     v = getenv("FSQL_OOM_WORKERS_ONLY");
     g_workers_only = (v && *v && strcmp(v, "0") != 0);
+    if (getenv("FSQL_OOM_LINEBUF")) setvbuf(stdout, NULL, _IOLBF, 0);   /* an interactive driver reads answers as they come */
+    g_only_so = getenv("FSQL_OOM_ONLY_SO");
+    if (g_only_so && !*g_only_so) g_only_so = NULL;
     g_ctl_path = getenv("FSQL_OOM_CTL");
     if (g_ctl_path && *g_ctl_path) {
         signal(SIGUSR1, oom_arm);
@@ -199,13 +265,24 @@ oom_preload_init(void)
  * Every call that reaches here -- including ones that will go on to
  * pass through -- still counts, so the Nth allocation ACROSS THE WHOLE
  * PROCESS is what fails, not the Nth call to any one specific wrapper. */
+/* True when the allocation's caller is in the shared object FSQL_OOM_ONLY_SO names (always true without it). */
 static int
-should_fail(void)
+caller_in_target(void *ra)
+{
+    if (!g_only_so) return 1;
+    Dl_info di;
+    return dladdr(ra, &di) && di.dli_fname && strstr(di.dli_fname, g_only_so) != NULL;
+}
+
+static int
+should_fail(void *ra)
 {
     long at = __atomic_load_n(&g_fail_at, __ATOMIC_SEQ_CST);
     if (at <= 0 || spared_thread()) return 0;
+    if (!caller_in_target(ra)) return 0;
     long c = __atomic_add_fetch(&g_count, 1, __ATOMIC_SEQ_CST);
-    return c == at;
+    if (c == at) { __atomic_add_fetch(&g_fired, 1, __ATOMIC_SEQ_CST); return 1; }
+    return 0;
 }
 
 void *
@@ -215,7 +292,7 @@ malloc(size_t size)
         real_malloc = (void *(*)(size_t)) dlsym(RTLD_NEXT, "malloc");
         if (real_malloc == NULL) return preinit_alloc(size);
     }
-    if (should_fail()) { errno = ENOMEM; return NULL; }
+    if (should_fail(__builtin_return_address(0))) { errno = ENOMEM; return NULL; }
     return real_malloc(size);
 }
 
@@ -230,7 +307,7 @@ calloc(size_t nmemb, size_t size)
             return p;
         }
     }
-    if (should_fail()) { errno = ENOMEM; return NULL; }
+    if (should_fail(__builtin_return_address(0))) { errno = ENOMEM; return NULL; }
     return real_calloc(nmemb, size);
 }
 
@@ -251,7 +328,7 @@ realloc(void *ptr, size_t size)
         if (p && ptr) memcpy(p, ptr, size);
         return p;
     }
-    if (should_fail()) { errno = ENOMEM; return NULL; }   /* `ptr` is left valid, per realloc(3) */
+    if (should_fail(__builtin_return_address(0))) { errno = ENOMEM; return NULL; }   /* `ptr` is left valid, per realloc(3) */
     return real_realloc(ptr, size);
 }
 
@@ -259,11 +336,13 @@ char *
 strdup(const char *s)
 {
     size_t n = strlen(s) + 1;
-    /* Through our own malloc(), not real_malloc() directly: one
-     * counted allocation, same as every other wrapper here, so a
-     * strdup lands in the same N-th-allocation-wide numbering the
-     * test driver sweeps rather than a separate, uncounted one. */
-    char *p = (char *) malloc(n);
+    /* One counted allocation, attributed to strdup's own caller (not to this shim). */
+    if (real_malloc == NULL) {
+        real_malloc = (void *(*)(size_t)) dlsym(RTLD_NEXT, "malloc");
+        if (real_malloc == NULL) return NULL;
+    }
+    if (should_fail(__builtin_return_address(0))) { errno = ENOMEM; return NULL; }
+    char *p = (char *) real_malloc(n);
     if (p) memcpy(p, s, n);
     return p;
 }

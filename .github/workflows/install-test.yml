@@ -193,7 +193,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.12"
+          test "\$VERSION" = "2.0.13"
 
           # End-to-end fractal_search smoke. Trivial 4-row corpus, query
           # equals row 0; expect a JSON document with dim/n_corpus/top_k.
@@ -232,7 +232,7 @@ jobs:
           (printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractalsql_get_version","arguments":{}}}'; sleep 3) \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractal_version","arguments":{}}}'; sleep 3) \
               | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci timeout 30 fractalsql-mariadb-mcp 2>/dev/null \
               | grep -q '"isError":false'
           echo "ok: Debian MCP server installed + answered a live tool call (mdb\${MDB_VER})"
@@ -507,7 +507,7 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.12"
+          test "\$VERSION" = "2.0.13"
 
           RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
           echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
@@ -541,7 +541,7 @@ jobs:
           (printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractalsql_get_version","arguments":{}}}'; sleep 3) \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractal_version","arguments":{}}}'; sleep 3) \
               | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci timeout 30 fractalsql-mariadb-mcp 2>/dev/null \
               | grep -q '"isError":false'
           echo "ok: RPM MCP server installed + answered a live tool call (mdb\${MDB_VER})"
@@ -630,7 +630,7 @@ jobs:
           VERSION=$(mariadb -N -B -e "SELECT fractal_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
-          test "${VERSION}" = "2.0.12"
+          test "${VERSION}" = "2.0.13"
 
           RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
           echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
@@ -652,7 +652,7 @@ jobs:
           (printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractalsql_get_version","arguments":{}}}'; sleep 3) \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractal_version","arguments":{}}}'; sleep 3) \
               | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci "${STAGE}/fractalsql-mariadb-mcp" 2>/tmp/mcp.err \
               | grep -q '"isError":false' || { echo "FAIL: no successful tool call"; cat /tmp/mcp.err; exit 1; }
           echo "ok: macOS MCP server built, found its locks beside the binary, answered a live tool call"

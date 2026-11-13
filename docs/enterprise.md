@@ -112,8 +112,8 @@ Know the limit: the latch is keyed by **the session id the caller passes**, and 
 MariaDB UDF cannot tell which connection is calling it. It therefore protects the
 calls that use the locked id (everything the MCP server itself sends), and it does
 **not** stop a caller who passes a different `session_id`. MariaDB has no
-per-function privileges for UDFs, so there is no equivalent of PostgreSQL's
-`REVOKE EXECUTE` or SQLite's `SQLITE_DIRECTONLY` here; to keep other people away
+per-function privileges for UDFs, so there is no per-function `REVOKE EXECUTE` or
+equivalent here; to keep other people away
 from the ledger, restrict who can connect, or do not install the destructive
 ledger functions for that deployment. If the engine is older than the plugin and
 lacks the function, the MCP server logs a warning and keeps its own refusal in

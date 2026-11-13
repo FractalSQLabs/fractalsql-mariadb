@@ -27,6 +27,12 @@ REM MariaDB Connector/C: the repo's own vendored server deps tree carries the
 REM client headers + libmariadb.lib alongside the server build; MARIADB_DIR can
 REM override (e.g. a real Connector/C install).
 if "%MARIADB_DIR%"=="" set "MARIADB_DIR=%~dp0..\..\..\deps\mariadb\root"
+REM The import library's NAME and the client DLL's PATH can be overridden
+REM separately: a MariaDB tree that carries the client under the legacy
+REM mariadbclient.lib name would fail the link step with LNK1181 otherwise,
+REM and the DLL does not live in lib\ in every distribution.
+if "%MARIADB_CLIENT_LIB%"=="" set "MARIADB_CLIENT_LIB=libmariadb.lib"
+if "%MARIADB_CLIENT_DLL%"=="" set "MARIADB_CLIENT_DLL=%MARIADB_DIR%\lib\libmariadb.dll"
 
 REM Suite-standard output tree (the mcp_smoke gate locates the binary
 REM here; the old mcp\build output moved with this server's first
@@ -54,7 +60,7 @@ cl.exe /nologo /std:c++17 /EHsc /O2 /W3 /utf-8 /Zm500 /MT /D_CRT_SECURE_NO_WARNI
     /Fe"%outdir%\fractalsql-mariadb-mcp.exe" ^
     /Fo"%outdir%\\" ^
     /link /LIBPATH:"%OPENSSL_DIR%\lib" libssl.lib libcrypto.lib ws2_32.lib advapi32.lib crypt32.lib user32.lib ^
-          /LIBPATH:"%MARIADB_DIR%\lib" libmariadb.lib
+          /LIBPATH:"%MARIADB_DIR%\lib" "%MARIADB_CLIENT_LIB%"
 if errorlevel 1 (
     echo EXITCODE=%ERRORLEVEL%
     exit /b 1
@@ -63,7 +69,11 @@ if errorlevel 1 (
 REM The exe links libmariadb.dll at runtime -- stage it next to the exe
 REM so dist\windows-mcp\ is runnable as-is (the mcp_smoke gate spawns
 REM the exe directly from that tree).
-copy /Y "%MARIADB_DIR%\lib\libmariadb.dll" "%outdir%\" >nul
+copy /Y "%MARIADB_CLIENT_DLL%" "%outdir%\" >nul
+if errorlevel 1 (
+  echo could not stage "%MARIADB_CLIENT_DLL%" 1>&2
+  exit /b 1
+)
 
 echo EXITCODE=%ERRORLEVEL%
 endlocal

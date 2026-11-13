@@ -384,6 +384,10 @@
 #   ./build_test.sh --quick
 #   ./build_test.sh --mdb 10.6
 #   ./build_test.sh --cross          # DEFAULT against every installed major
+#   ./build_test.sh --profile        # Linux: valgrind memcheck over the UDF shim, the fractalsqld daemon (the engine) and
+#                                    # the MCP server: mariadbd and the daemon under valgrind with the demo kits, the MCP
+#                                    # probes, and the running MCP server; tests/valgrind_run.sh. Fails on a memcheck error or
+#                                    # definite/indirect leak with a frame in our code. Not in any gate set.
 #   ./build_test.sh --fuzz           # gates 30 and 67 -- libFuzzer smoke (extension parsers,
 #                                    # then the MCP server's request handling), no cluster
 #   ./build_test.sh --fault          # DEFAULT, then the OOM-injection sweep (37), the
@@ -394,7 +398,8 @@
 #                                    # with --fault), after gate 01. Combine with --asan,
 #                                    # --ubsan or --tsan to run the server itself sanitized.
 #   ./build_test.sh --list
-#   ./build_test.sh --coverage       # gcov-instrumented build; DEFAULT gates;
+#   ./build_test.sh --coverage       # gcov-instrumented build; the DEFAULT gates plus the fault gates (as --fault);
+#                                    # the report must reach FSQL_COV_MIN (default 80)% lines, functions and branches;
 #                                    # lcov/genhtml report after (needs lcov+genhtml on PATH)
 #   ./build_test.sh --asan           # ASan-instrumented fractalsql.so, LD_PRELOADed
 #                                    # into mariadbd (skips the cluster gates on
@@ -432,8 +437,10 @@
 #                           30). This is a pre-push SMOKE run, not a
 #                           campaign -- bump it locally for real
 #                           crash-finding, same binaries either way.
-#   FSQL_OOM_MAX_N          allocation-count sweep ceiling per UDF in
-#                           gate 37 (default 200). Each N restarts
+#   FSQL_OOM_GATE37_MAX_N   allocation-count sweep ceiling per UDF in
+#                           gate 37 alone (default: FSQL_OOM_MAX_N, else
+#                           200; gate 57 reads FSQL_OOM_MAX_N, default 45).
+#                           Each N restarts
 #                           fractalsqld fresh (see tests/oom_preload.c),
 #                           so this is real wall-time too, just smaller
 #                           per-step than gate 30's.
@@ -463,7 +470,7 @@ cd "$HERE"
 
 TMPROOT="$(cd /tmp && pwd -P)"
 
-DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 29 31 32 33 34 35 36 39 40 41 42 43 44 45 47 48 49 50 51 52 53 54 55 56 58 59 60 61 62 63 66 68 69)
+DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 29 31 32 33 34 35 36 39 40 41 42 43 44 45 47 48 49 50 51 52 53 54 55 56 58 59 60 61 62 63 66 68 69 70 71 72 73 74 75 76)
 QUICK_GATES=(01 02)
 FUZZ_GATES=(30 67)
 FAULT_GATES=(37 38 57 64 65)
@@ -729,6 +736,22 @@ run_coverage_report() {
       print ""
     }' /tmp/fractalsql_bt_coverage.info
 
+  # The floor: lines, functions and branches each at or above FSQL_COV_MIN (default 80) -- enforced for the full measurement only
+  # (--coverage over the default and fault gates); a partial run just reports.
+  if [ "${COV_FULL:-0}" -eq 1 ]; then
+    local floor="${FSQL_COV_MIN:-80}" pct
+    pct="$(awk -F: '
+      /^LF:/ { lf += $2 } /^LH:/ { lh += $2 } /^FNF:/ { fnf += $2 } /^FNH:/ { fnh += $2 }
+      /^BRDA:/ { split($2, p, ","); if (substr(p[2], 1, 1) != "e") { brf++; if (p[4] != "-" && p[4]+0 > 0) brh++ } }
+      END { printf "%.1f %.1f %.1f", (lf ? 100*lh/lf : 100), (fnf ? 100*fnh/fnf : 100), (brf ? 100*brh/brf : 100) }' /tmp/fractalsql_bt_coverage.info)"
+    local m name v i=0
+    for name in lines functions branches; do
+      i=$((i + 1)); v="$(printf '%s' "$pct" | cut -d' ' -f$i)"
+      if awk -v v="$v" -v t="$floor" 'BEGIN { exit !(v + 0 >= t + 0) }'; then pass "coverage: $name $v% (floor $floor%)"
+      else fail "coverage: $name $v% is below the $floor% floor"; fi
+    done
+  fi
+
   if command -v genhtml >/dev/null 2>&1; then
     genhtml /tmp/fractalsql_bt_coverage.info --output-directory coverage_html \
             --rc branch_coverage=1 --rc no_exception_branch=1 >/tmp/fractalsql_bt_genhtml.log 2>&1 \
@@ -810,6 +833,7 @@ while [ $# -gt 0 ]; do
     --fuzz)    MODE="fuzz" ;;
     --fault)   MODE="fault" ;;
     --coverage) COVERAGE=1 ;;
+    --profile)  exec "$HERE/tests/valgrind_run.sh" ;;
     --asan)    ASAN=1 ;;
     --ubsan)   UBSAN=1 ;;
     --tsan)    TSAN=1 ;;
@@ -819,6 +843,11 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# --coverage measures the whole suite: the default gates AND the fault gates (37, 57, 63/64, 65), whose allocation- and file-failure
+# injection reaches the error paths the default gates cannot. (A run restricted to one gate, or to --quick/--fuzz/--cross, only reports.)
+COV_FULL=0
+if [ "$COVERAGE" -eq 1 ] && [ -z "$ONE_GATE" ] && { [ "$MODE" = default ] || [ "$MODE" = fault ]; }; then MODE="fault"; COV_FULL=1; fi
 
 # ASan and TSan runtimes cannot link into the same binary (the compiler
 # rejects it); catch this here with a clear message instead of letting
@@ -978,7 +1007,7 @@ daemon_start() {
     "$FSQD_SOCK" "$key" "$(id -u)" > "$FSQD_CONF"
   # The reasoning_plugin key rides in the conf, not only in the daemon's
   # boot environment, so the MCP gate's shutdown-drain phase can SWAP it
-  # live (the admin tier's fractalsql_set_config -> daemon RELOAD) to
+  # live (the admin tier's fractal_daemon_config_set -> daemon RELOAD) to
   # point the daemon at a deterministically-slow reasoning fixture, and
   # put it back afterwards. The boot-environment fallback still applies
   # for a key the conf does not carry, so writing it here changes
@@ -4341,7 +4370,7 @@ gate_37_oom_injection() {
   local tag="${CUR_VER//./_}"
   local main_log="/tmp/fractalsql_bt_fsqd_${tag}.log"
   local oom_so="$TMPROOT/fractalsql_bt_oom_preload_${tag}.so"
-  local max_n="${FSQL_OOM_MAX_N:-200}"
+  local max_n="${FSQL_OOM_GATE37_MAX_N:-${FSQL_OOM_MAX_N:-200}}"
 
   # wc -c's output is right-padded with spaces on BSD/macOS ("   18306")
   # but not on GNU/Linux -- tr strips it either way so log_from's
@@ -4382,7 +4411,10 @@ gate_37_oom_injection() {
     for n in $(seq 1 "$max_n"); do
       daemon_stop
       local L; L=$(log_mark)
-      LD_PRELOAD="$oom_so" FSQL_OOM_FAIL_AT="$n" daemon_start >/dev/null 2>&1
+      # Only allocations made by this repository's own code (the daemon, the core linked into it, the vendored plugin) are counted
+      # and failed: OpenSSL, which the signature check reaches, does not survive an allocation failing inside its own lazy
+      # initialisation (a NULL lock in libcrypto), and that is not something this gate can fix or should be judged by.
+      LD_PRELOAD="$oom_so" FSQL_OOM_ONLY_SO="fractalsql" FSQL_OOM_FAIL_AT="$n" daemon_start >/dev/null 2>&1
       if [ -S "$FSQD_SOCK" ]; then
         "${MARIADB[@]}" --connect-timeout=3 -N -e "$sql" >/dev/null 2>&1
       fi
@@ -6203,7 +6235,7 @@ gate_45_domain_agents() {
         (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t SEPARATOR ','), ']') FROM (
             WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 200)
             SELECT t, ROUND(SIN(t/9.0) + t/200.0, 6) AS v FROM seq) q),
-        2, @r);
+        5, 2, @r);
     SELECT @r;")"
   printf '%s' "$l1" | grep -Eq '"nearest_fleet_id" *: *"[123]"' \
     && pass "45 domain_agents: detour_classify (L) resolves the nearest fleet peer" \
@@ -6216,7 +6248,7 @@ gate_45_domain_agents() {
     || fail "45 domain_agents: detour_classify rationale missing the reasoning canary: $l1"
   g45_expect_err "detour_classify (L) rejects NULL identifier arguments" \
     "identifier arguments must not be NULL" \
-    "CALL fractal_agent_detour_classify(NULL,'emb','[1,0]','[0,1]','[1,2]',2,@r);"
+    "CALL fractal_agent_detour_classify(NULL,'emb','[1,0]','[0,1]','[1,2]',5,2,@r);"
   # NOTE the message asserted here is the SHARED scanner's
   # ("_fractalsql_scan_corpus: no non-NULL vector rows found"), not
   # detour_classify's own "no vehicle rows found". The engine's own
@@ -6228,7 +6260,7 @@ gate_45_domain_agents() {
   # of this assertion -- a clean, specific error either way.
   g45_expect_err "detour_classify (L) raises a clean error when the fleet table has no rows" \
     "no non-NULL vector rows found" \
-    "CALL fractal_agent_detour_classify('g45_empty','emb','[1,0]','[0,1]','[1,2]',2,@r);"
+    "CALL fractal_agent_detour_classify('g45_empty','emb','[1,0]','[0,1]','[1,2]',5,2,@r);"
 
   # --- Engine M: fractal_agent_track_anomaly -----------------------
   # Trajectory search + DFA over the heading series + reason.
@@ -6239,7 +6271,7 @@ gate_45_domain_agents() {
         (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t SEPARATOR ','), ']') FROM (
             WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 120)
             SELECT t, ROUND(0.1 + 0.02*SIN(t/7.0), 6) AS v FROM seq) q),
-        @r);
+        5, @r);
     SELECT @r;")"
   printf '%s' "$m1" | grep -Eq '"nearest_fleet_id" *: *"[123]"' \
     && pass "45 domain_agents: track_anomaly (M) resolves the nearest tracked peer" \
@@ -6252,13 +6284,13 @@ gate_45_domain_agents() {
     || fail "45 domain_agents: track_anomaly rationale missing the reasoning canary: $m1"
   g45_expect_err "track_anomaly (M) rejects NULL identifier arguments" \
     "identifier arguments must not be NULL" \
-    "CALL fractal_agent_track_anomaly(NULL,'emb','[1,0]','[0,1]','[1,2,3]',@r);"
+    "CALL fractal_agent_track_anomaly(NULL,'emb','[1,0]','[0,1]','[1,2,3]',5,@r);"
   # Same shared-scanner-first ordering as detour_classify above: the
   # engine's own "no track rows found" is unreachable behind
   # _fractalsql_scan_corpus's error.
   g45_expect_err "track_anomaly (M) raises a clean error when the track table has no rows" \
     "no non-NULL vector rows found" \
-    "CALL fractal_agent_track_anomaly('g45_empty','emb','[1,0]','[0,1]','[1,2,3]',@r);"
+    "CALL fractal_agent_track_anomaly('g45_empty','emb','[1,0]','[0,1]','[1,2,3]',5,@r);"
 
   # --- Engine N: fractal_agent_network_coverage_alert --------------
   # No table arguments: the point cloud and the drift series are
@@ -6332,10 +6364,10 @@ gate_45_domain_agents() {
   # even with no enterprise tier loaded.
   g45_expect_err "diverse_portfolios (P) rejects an unknown objective_mode" \
     "objective_mode must be 'sharpe' or 'pareto'" \
-    "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'nonsense',@r);"
+    "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'nonsense',NULL,@r);"
   g45_expect_err "diverse_portfolios (P) raises a clean error when the enterprise tier is not loaded" \
     "enterprise tier not loaded" \
-    "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'sharpe',@r);"
+    "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'sharpe',NULL,@r);"
 
   # --- the Universal Agent procedures ------------------------------
   # fractal_search_agent: embed -> scan -> Scout search -> refetch
@@ -8351,11 +8383,11 @@ rb_direct_runs() {
                   FSQL_DIRECT_OOM_CAP=40 FSQL_DIRECT_NO_VARIANTS=1 \
                   FRACTALSQL_ENTERPRISE_LIB="$lib" FRACTALSQL_ENTERPRISE_LEDGER_PATH="$W/ledger.bin" \
                   FRACTALSQL_ENTERPRISE_LEDGER_KEY="direct-key" \
-                  ${BT_TIMEOUT_BIN:+$BT_TIMEOUT_BIN ${BT_DIRECT_TIMEOUT:-300}} "$HERE/service/build/udf_direct" "$phase" tests/robustness/seed_calls.sql "$stride" 2>&1 </dev/null)
+                  ${BT_TIMEOUT_BIN:+$BT_TIMEOUT_BIN ${BT_DIRECT_TIMEOUT:-1200}} "$HERE/service/build/udf_direct" "$phase" tests/robustness/seed_calls.sql "$stride" 2>&1 </dev/null)
       else
         out=$(env ${RB_DIRECT_PRELOAD:+LD_PRELOAD="$RB_DIRECT_PRELOAD"} \
                   FSQL_SCRIPTED_PLUGIN="$scr" FSQL_SCRIPTED_REPLY="$W/reply" \
-                  ${BT_TIMEOUT_BIN:+$BT_TIMEOUT_BIN ${BT_DIRECT_TIMEOUT:-300}} "$HERE/service/build/udf_direct" "$phase" tests/robustness/seed_calls.sql "$stride" 2>&1 </dev/null)
+                  ${BT_TIMEOUT_BIN:+$BT_TIMEOUT_BIN ${BT_DIRECT_TIMEOUT:-1200}} "$HERE/service/build/udf_direct" "$phase" tests/robustness/seed_calls.sql "$stride" 2>&1 </dev/null)
       fi
       rc=$?
       if [ "$rc" -ne 0 ]; then
@@ -8383,7 +8415,7 @@ gate_63_direct_calls() {
   # gate inside the job's time budget (a run that still overruns fails by name instead of eating the job).
   if [ "$TSAN" -eq 1 ]; then
     export FSQL_DIRECT_LEDGER_RESET="${FSQL_DIRECT_LEDGER_RESET:-25}"
-    export BT_DIRECT_TIMEOUT="${BT_DIRECT_TIMEOUT:-300}"
+    export BT_DIRECT_TIMEOUT="${BT_DIRECT_TIMEOUT:-1200}"
   fi
   RB_DIRECT_PRELOAD="" rb_direct_runs 63 "${FSQL_DIRECT_STRIDE:-3}" seed mutate cancel config session provider replies
 }
@@ -8583,6 +8615,887 @@ gate_69_plugin_sig_vendored() {
   pass "69 plugin_sig_vendored: all $n vendored plugins have a 64-byte .sig beside them"
 }
 
+# 70 redact_unit: tests/redact_unit.c, the header-level unit test of src/fsql_audit_redact.h (hash and truncate modes, buffer limits, every JSON
+# shape the walker handles, malformed documents, escapes with surrogate pairs, allocation failure in the walker). The SQL gates reach that
+# code only through the enterprise audit path, so without this its branches are dead in a --coverage run. Built with the sanitizers under
+# --asan/--ubsan, and with gcov under --coverage (an object named src/_redact_unit.o, so its counters ADD to the build's).
+gate_70_redact_unit() {
+  local cc="${FSQL_CC:-cc}"
+  command -v "$cc" >/dev/null 2>&1 || { skip "70 redact_unit (no C compiler on PATH)"; return; }
+  [[ -f "$HERE/tests/redact_unit.c" ]] || { skip "70 redact_unit (tests/redact_unit.c not present)"; return; }
+  local obj="$HERE/src/_redact_unit.o" covflags=() sanflags=()
+  [[ "$COVERAGE" -eq 1 ]] && covflags+=(--coverage)
+  [[ "$ASAN" -eq 1 ]] && sanflags+=(-fsanitize=address -fno-omit-frame-pointer)
+  [[ "$UBSAN" -eq 1 ]] && sanflags+=(-fsanitize=undefined -fno-sanitize-recover=undefined)
+  local log="$TMPROOT/fractalsql_bt_redact_unit_build.log" bin="$TMPROOT/fractalsql_bt_redact_unit"
+  rm -f "$obj"
+  if ! env -u LD_PRELOAD "$cc" -std=c11 -O1 -g -Wno-unused-function ${covflags[@]+"${covflags[@]}"} ${sanflags[@]+"${sanflags[@]}"} \
+        -I"$HERE/src" -c "$HERE/tests/redact_unit.c" -o "$obj" >"$log" 2>&1 \
+     || ! env -u LD_PRELOAD "$cc" ${covflags[@]+"${covflags[@]}"} ${sanflags[@]+"${sanflags[@]}"} "$obj" -o "$bin" >>"$log" 2>&1; then
+    tail -5 "$log" | sed 's/^/         /'; fail "70 redact_unit: the unit test did not build (see $log)"; rm -f "$obj"; return
+  fi
+  local out rc
+  # LeakSanitizer does not exist on macOS: asking for it there makes the ASan runtime itself refuse to start.
+  local leaks=1; [[ "$(uname -s)" == Darwin ]] && leaks=0
+  out="$(env -u LD_PRELOAD ASAN_OPTIONS=detect_leaks=$leaks "$bin" 2>&1)"; rc=$?
+  rm -f "$obj" "$bin"
+  if [[ "$COVERAGE" -ne 1 ]]; then rm -f "${obj%.o}.gcno" "${obj%.o}.gcda"; fi
+  if [[ $rc -eq 0 ]]; then pass "70 redact_unit: $(tail -1 <<< "$out")"
+  else printf '%s\n' "$out" | tail -12 | sed 's/^/         /'; fail "70 redact_unit: see the output above"; fi
+}
+
+# 71 ledger_env: the audit-ledger settings read from the SERVER's environment once per process -- the ledger size cap (FRACTALSQL_LEDGER_MAX_BYTES), the
+# head anchor log (FSQL_LEDGER_ANCHOR_LOG), audit redaction (FSQL_AUDIT_REDACT), the signature policy (FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE) and the
+# temp directory (TMPDIR). Each round restarts the server with a different set and drives the audit and ledger functions with the mock enterprise core
+# loaded. Asserts the server survives every round, the chain that was kept verifies, a cap that is hit refuses an append, and an unsigned library is
+# refused when a signature is required and loaded when the operator opts out.
+gate_71_ledger_env() {
+  local tag="${CUR_VER//./_}"
+  local mock_so="$TMPROOT/fractalsql_bt_ledger_env_${tag}.so" ledger_path="$HERE/.gate71_ledger.dat" round out out2 alive
+  rm -f "$ledger_path" "$mock_so"
+  cc -shared -fPIC -std=c99 -I"$HERE/include/$(fsql_ent_platform_dir)" -I"$HERE/include" tests/mock_enterprise_core.c -o "$mock_so" 2>/tmp/fractalsql_bt_gate71_build.log \
+    || { cat /tmp/fractalsql_bt_gate71_build.log >&2; fail "71 ledger_env: mock .so failed to build"; return; }
+  for round in "FRACTALSQL_LEDGER_MAX_BYTES=300 FSQL_LEDGER_ANCHOR_LOG=stderr FSQL_AUDIT_REDACT=hash FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0" \
+               "FRACTALSQL_LEDGER_MAX_BYTES=abc FSQL_LEDGER_ANCHOR_LOG=syslog FSQL_AUDIT_REDACT=truncate FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=1" \
+               "FRACTALSQL_LEDGER_MAX_BYTES=0 FSQL_LEDGER_ANCHOR_LOG=bogus FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0 TMPDIR=" \
+               "FSQL_LEDGER_ANCHOR_LOG=STDERR FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0 FRACTALSQL_ENTERPRISE_LEDGER_KEY=gate71-ledger-key" \
+               "FSQL_LEDGER_ANCHOR_LOG=Syslog FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0 FSQL_AUDIT_REDACT=truncate" \
+               "FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0 FRACTALSQL_AUDIT_REQUIRE_ACTOR=1"; do
+    mdb_teardown >/dev/null 2>&1
+    rm -f "$ledger_path"
+    export FRACTALSQL_ENTERPRISE_LIB="$mock_so" FRACTALSQL_ENTERPRISE_LEDGER_PATH="$ledger_path"
+    local kv; for kv in $round; do export "$kv"; done
+    mdb_setup "$MDB_MAJOR" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then fail "71 ledger_env [$round]: the server did not start"; for kv in $round; do unset "${kv%%=*}"; done; continue; fi
+    out=$("${MARIADB[@]}" 2>&1 <<'SQL'
+SELECT IFNULL(fractal_audit_log('env.test', '{"q":"customer secret text","n":1}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":2}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '[1,2,3]'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":4}', CONNECTION_ID(), 'alice'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":5}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":6}'), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 2), '<NULL>');
+SELECT IFNULL(fractal_ledger_flush(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');
+SQL
+)
+    case "$round" in
+      *AUDIT_REQUIRE_ACTOR=1*)
+        # with an actor required, an append that names no session is refused; with one it goes through; and a session under the destructive latch
+        # is refused whatever it names
+        out2=$("${MARIADB[@]}" 2>&1 <<'SQL'
+SELECT IFNULL(fractal_audit_log('a', '{"n":1}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":2}', CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":3}', CONNECTION_ID(), 'carol'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":4}', NULL, 'carol'), '<NULL>');
+SELECT IFNULL(fractal_lock_destructive(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":5}', CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 2), '<NULL>');
+SQL
+)
+        grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out2" \
+          && fail "71 ledger_env: the audit actor requirement or the destructive latch killed the connection -- $out2" \
+          || pass "71 ledger_env: an audit append without a session is refused when an actor is required, and a latched session is refused" ;;
+      *LEDGER_KEY=*)
+        # audit entries of every awkward shape: padded and scalar payloads, a payload that forges the reserved actor key, one past the blob limit,
+        # actor labels that are long, quoted, non-ASCII or need escaping past the stack buffer
+        out2=$("${MARIADB[@]}" 2>&1 <<'SQL'
+SELECT IFNULL(fractal_audit_log('e', '   {"a":1}   '), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '  {}  '), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '"scalar"'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '42'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"_actor":"forged"}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"x":{"_actor":1}}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT('{"p":"', REPEAT('x', 67108900), '"}')), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":1}', CONNECTION_ID(), REPEAT('a', 300)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":2}', CONNECTION_ID(), 'a"b\\c'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":3}', CONNECTION_ID(), REPEAT('"', 200)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":4}', CONNECTION_ID(), REPEAT(CHAR(1), 100)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":5}', CONNECTION_ID(), REPEAT('é', 100)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":6}', CONNECTION_ID(), ''), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":7}', 999999, 'alice'), '<NULL>');
+SELECT IFNULL(fractal_audit_log(REPEAT('t', 5000), '{"n":8}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{bad'), '<NULL>');
+SELECT IFNULL(fractal_audit_log(CONCAT('t', CHAR(8), CHAR(12), CHAR(10), CHAR(13), CHAR(9), CHAR(1), CHAR(31), '"\\/'), '{}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT(CHAR(9), CHAR(10), '{"a":1}', CHAR(13), CHAR(10))), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT('{', CHAR(9), CHAR(10), CHAR(13), ' }')), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT(' ', CHAR(9), '[1]', CHAR(10))), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":1e5}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":-0.5E+3}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":0}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":1.}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":01}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":-}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":1e}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":1e+}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '[1,2,]'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":tru}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":true,"b":false,"c":null}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":"\\u00e9\\n\\t\\"\\\\\\/"}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":"\\u00zz"}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":"\\x"}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '"abc'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '['), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', ']'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":[1,{"b":[2,3]},"x"]}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":1}{"b":2}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"a":1} x'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', REPEAT('[', 2000)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT(REPEAT('[', 500), REPEAT(']', 500))), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT('{"s":"', CHAR(1), '"}')), '<NULL>');
+SELECT LENGTH(IFNULL(fractal_audit_unpack('abc'), '<NULL>'));
+SELECT LENGTH(IFNULL(fractal_audit_unpack(REPEAT('x', 30000)), '<NULL>'));
+SELECT LENGTH(IFNULL(fractal_audit_unpack(REPEAT('x', 3000000)), '<NULL>'));
+SELECT IFNULL(fractal_audit_unpack(''), '<NULL>');
+SELECT IFNULL(fractal_audit_unpack(NULL), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 0), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 17), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), -1), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 99), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), NULL), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(NULL), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(999999), '<NULL>');
+SELECT IFNULL(fractal_ledger_load(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_load(NULL), '<NULL>');
+SELECT IFNULL(fractal_ledger_flush(NULL), '<NULL>');
+SELECT IFNULL(fractal_ledger_compact(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_reset_soft(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_shadow_count(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_reset_hard(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 2), '<NULL>');
+SQL
+)
+        grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out2" \
+          && fail "71 ledger_env: an awkward audit payload or actor killed the connection -- $out2" \
+          || pass "71 ledger_env: padded, scalar, forged-actor, oversized and awkward-actor audit entries are handled"
+        # the head file records how many rows each chain held; every shape of damaged or old-format record must be read without harm
+        local hv headf="$ledger_path.head"
+        for hv in "2 6" "  2   6  " "2" "2 x" "2 6 junk" "kind=2 rows=6" "kind=2 rows=6 mac=00" "kind=2 rows=6 mac=zz" "kind=x rows=1" "rows=" "kind=" "mac=" "kind=2 rows=6 extra=1" "garbage" "" "kind=2 rows=999999999999"; do
+          printf '%s\n' "$hv" > "$headf" 2>/dev/null
+          "${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 2), '<NULL>'); SELECT IFNULL(fractal_audit_log('h', '{\"n\":1}'), '<NULL>');" >/dev/null 2>&1
+        done
+        # the ledger file itself, damaged in every way a crash or a bad disk can: cut at many lengths (inside the magic, a header, a blob, between
+        # records), a bad magic, garbage and zeros appended, unreadable, replaced by a directory. Each damage is followed by every ledger call.
+        local dmg fresh_ledger
+        fresh_ledger() {
+          rm -rf "$ledger_path" "$ledger_path.head" "$ledger_path.head.tmp"
+          "${MARIADB[@]}" -N -e "SELECT fractal_audit_log('d','{\"n\":1}'); SELECT fractal_audit_log('d','{\"n\":2}'); SELECT fractal_audit_log('d','{\"n\":3}');" >/dev/null 2>&1
+        }
+        for dmg in "cut:0" "cut:1" "cut:4" "cut:8" "cut:12" "cut:16" "cut:24" "cut:33" "cut:40" "cut:64" "cut:-1" "cut:-3" "cut:-9" "cut:-40" "magic" "garbage" "zeros" "unreadable" "directory" "magic_only"; do
+          fresh_ledger
+          case "$dmg" in
+            cut:-*) truncate -s "$dmg" "$ledger_path" 2>/dev/null; truncate -s "$(( $(wc -c < "$ledger_path") ))" "$ledger_path" 2>/dev/null ;;
+            cut:*)  truncate -s "${dmg#cut:}" "$ledger_path" 2>/dev/null ;;
+            magic)  printf 'XXXXXXXXXXXXXXXX' | dd of="$ledger_path" bs=1 conv=notrunc 2>/dev/null ;;
+            garbage) printf '\001\002\003\004\005\006\007' >> "$ledger_path" ;;
+            zeros)  head -c 200 /dev/zero >> "$ledger_path" ;;
+            unreadable) chmod 000 "$ledger_path" ;;
+            directory) rm -f "$ledger_path"; mkdir "$ledger_path" ;;
+            magic_only) head -c 8 "$ledger_path" > "$ledger_path.keep"; mv "$ledger_path.keep" "$ledger_path" ;;
+          esac
+          "${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 2), '<NULL>'); SELECT IFNULL(fractal_audit_log('d','{\"n\":9}'), '<NULL>'); SELECT IFNULL(fractal_ledger_flush(CONNECTION_ID()), '<NULL>'); SELECT IFNULL(fractal_ledger_load(CONNECTION_ID()), '<NULL>'); SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID()), '<NULL>'); SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');" >/dev/null 2>&1
+          [ "$dmg" = "unreadable" ] && chmod 600 "$ledger_path" 2>/dev/null
+          [ "$dmg" = "directory" ] && rm -rf "$ledger_path"
+        done
+        alive=$("${MARIADB[@]}" -N -e "SELECT 1;" 2>&1)
+        [ "$alive" = "1" ] && pass "71 ledger_env: twenty ways of damaging the ledger file are survived by every ledger call" \
+                           || fail "71 ledger_env: the server did not survive the ledger file damage"
+        alive=$("${MARIADB[@]}" -N -e "SELECT 1;" 2>&1)
+        [ "$alive" = "1" ] && pass "71 ledger_env: sixteen shapes of head-file record are read without harm" \
+                           || fail "71 ledger_env: the server did not survive the head-file variants" ;;
+    esac
+    alive=$("${MARIADB[@]}" -N -e "SELECT 1;" 2>&1)
+    if [ "$alive" != "1" ] || grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out"; then
+      fail "71 ledger_env [$round]: the server did not survive -- $out"
+    else
+      pass "71 ledger_env [$round]: the server survives the audit and ledger calls"
+    fi
+    case "$round" in
+      *REQUIRE_SIGNATURE=1*)
+        # verify is community-side, so it still answers; the audit appends are what the enterprise gate refuses (NULL)
+        [ "$(grep -c '<NULL>' <<< "$out")" -ge 6 ] \
+          && pass "71 ledger_env: an unsigned enterprise library is refused when a signature is required (every audit append is refused)" \
+          || fail "71 ledger_env: an unsigned library was used although a signature is required: $out" ;;
+      *)
+        grep -q '"ok":true' <<< "$out" && pass "71 ledger_env: the chain that was kept verifies" \
+          || fail "71 ledger_env [$round]: expected an ok verify, got: $out" ;;
+    esac
+    for kv in $round; do unset "${kv%%=*}"; done
+  done
+  unset FRACTALSQL_ENTERPRISE_LIB FRACTALSQL_ENTERPRISE_LEDGER_PATH
+  rm -rf "$ledger_path" "$ledger_path.head" "$ledger_path.head.tmp" "$ledger_path.csv" "$mock_so"
+  mdb_teardown >/dev/null 2>&1
+  mdb_setup "$MDB_MAJOR" >/dev/null 2>&1
+  return 0
+}
+
+# 72 allowlist_matrix: fractal_t2s_check_allowlist() against 96 candidate statements (src/fractalsql_textsql.c). The check is deterministic and needs no
+# model, so every shape the allowlist has to judge is asserted by category: P pass, E empty, X versioned or optimizer-hint comment, M more than one
+# statement, O INTO OUTFILE/DUMPFILE, F a state-changing or outside-reaching function, T a statement type that is not permitted. Covers comments of all
+# three kinds (closed, unclosed, trailing), quoting of all three kinds with semicolons inside, case, look-alike keywords, CTEs that write, and statement
+# types in select-only mode. Runs in one client session.
+# 75 multimodal_edge: the three enterprise portfolio optimizers (fractal_optimize_portfolio_multimodal, _ex and _pareto; src/fractalsql_enterprise.c) with the
+# mock enterprise core loaded: ordinary calls, every argument the validation looks at (NULL, empty, malformed or mismatched arrays, a restart count
+# below what the core returns, zero and negative counts, unknown diffusion modes), the core failing (the mock's fail sentinel) and the core finding
+# nothing (its zero-found file). The server must answer every one; a call the core fails or the arguments refuse returns NULL.
+gate_75_multimodal_edge() {
+  local tag="${CUR_VER//./_}"
+  local mock_so="$TMPROOT/fractalsql_bt_mmedge_${tag}.so" sentinel="$TMPROOT/fractalsql_bt_mmedge_fail_${tag}" zero="$TMPROOT/fractalsql_bt_mmedge_zero_${tag}"
+  local sqlf="$TMPROOT/fractalsql_bt_mmedge.sql" out n alive
+  rm -f "$mock_so" "$sentinel" "$zero"
+  cc -shared -fPIC -std=c99 -I"$HERE/include/$(fsql_ent_platform_dir)" -I"$HERE/include" tests/mock_enterprise_core.c -o "$mock_so" 2>/tmp/fractalsql_bt_gate75_build.log \
+    || { cat /tmp/fractalsql_bt_gate75_build.log >&2; fail "75 multimodal_edge: mock .so failed to build"; return; }
+  mdb_teardown >/dev/null 2>&1
+  export FRACTALSQL_ENTERPRISE_LIB="$mock_so" FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE=0 FSQL_MOCK_ENT_FAIL="$sentinel" FSQL_MOCK_ENT_ZERO_FOUND="$zero"
+  mdb_setup "$MDB_MAJOR" >/dev/null 2>&1 || { fail "75 multimodal_edge: the server did not start"; unset FRACTALSQL_ENTERPRISE_LIB FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE FSQL_MOCK_ENT_FAIL FSQL_MOCK_ENT_ZERO_FOUND; mdb_setup "$MDB_MAJOR" >/dev/null 2>&1; return; }
+  cat > "$sqlf" <<'SQL'
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 1, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2,3', '1,0,0,0,1,0,0,0,1', 2, 5, 0.9, 0.9, 7);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 0, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', -1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 0, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 99999999, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, -1, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, 0.5, 2, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2,3', '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('', '', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('x,y', 'a,b,c,d', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,nan', '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal(NULL, '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', NULL, 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', NULL, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, 0.5, 0.5);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 1, 'levy');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 1, 0.5, 0.5, 42, 1, 'levy');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 0, 'bogus');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 2, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, -1, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, NULL, NULL);
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 0, '');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, 1, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 5, 1, 3, 0, 'levy');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2,3', '1,0,0,0,1,0,0,0,1', 2, 5, 0.5, 100, 1, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, 0, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, -5, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, 1, 0, 'nope');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0', 1, 1, 1, 1, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto(NULL, NULL, 1, 1, 1, 1, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1');
+SQL
+  n=$(grep -c '^SELECT' "$sqlf")
+  out=$("${MARIADB[@]}" --force < "$sqlf" 2>&1)
+  grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out" && { fail "75 multimodal_edge: the server dropped the connection on ordinary calls -- $out"; }
+  touch "$sentinel"     # the core now fails every call
+  out=$("${MARIADB[@]}" --force < "$sqlf" 2>&1)
+  grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out" && { fail "75 multimodal_edge: the server dropped the connection while the core was failing -- $out"; }
+  rm -f "$sentinel"; touch "$zero"      # the core now finds nothing
+  out=$("${MARIADB[@]}" --force < "$sqlf" 2>&1)
+  grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out" && { fail "75 multimodal_edge: the server dropped the connection while the core found nothing -- $out"; }
+  rm -f "$zero"
+  alive=$("${MARIADB[@]}" -N -e "SELECT 1;" 2>&1)
+  [ "$alive" = "1" ] && pass "75 multimodal_edge: the server answered $n optimizer calls three times over (core working, core failing, core finding nothing)" \
+                     || fail "75 multimodal_edge: the server did not survive (alive=$alive)"
+  unset FRACTALSQL_ENTERPRISE_LIB FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE FSQL_MOCK_ENT_FAIL FSQL_MOCK_ENT_ZERO_FOUND
+  rm -f "$sqlf" "$mock_so" "$sentinel" "$zero"
+  mdb_teardown >/dev/null 2>&1
+  mdb_setup "$MDB_MAJOR" >/dev/null 2>&1
+  return 0
+}
+
+# 76 enterprise_refusals: every way the enterprise library can be refused, through the daemon's conf file and a reload (src/fractalsql_enterprise.c): a .sig of
+# the wrong size (empty, short, long) or that does not verify, a missing .sig with a signature required, a library that cannot be read, one that is a
+# directory, a path too long to name its .sig, a library without the core's symbols, a path that does not exist, and the unsigned load the operator
+# can opt into. Each is a fresh library path (a failed attempt is cached per path), applied with a reload and followed by a ledger call; the server
+# must survive every one and the refused ones must leave the ledger calls answering NULL.
+gate_76_enterprise_refusals() {
+  local tag="${CUR_VER//./_}" ctl_bin="$HERE/service/build/fsqlctl"
+  local d="$TMPROOT/fractalsql_bt_entref_${tag}" mock good nosym i=0 n_ok=0 n_bad=0 got label sigsize req rd conf_keep="$TMPROOT/fractalsql_bt_entref_conf_${tag}"
+  rm -rf "$d"; mkdir -p "$d"
+  cc -shared -fPIC -std=c99 -I"$HERE/include/$(fsql_ent_platform_dir)" -I"$HERE/include" tests/mock_enterprise_core.c -o "$d/mock.so" 2>/tmp/fractalsql_bt_gate76_build.log \
+    || { cat /tmp/fractalsql_bt_gate76_build.log >&2; fail "76 enterprise_refusals: mock .so failed to build"; return; }
+  printf 'int fsql_nothing(void){return 0;}\n' > "$d/nosym.c"
+  cc -shared -fPIC "$d/nosym.c" -o "$d/nosym.so" 2>/dev/null
+  cp "$FSQD_CONF" "$conf_keep"
+  # each variant: label|library setup (a shell snippet run with $L as the library path)|signature requirement
+  local variants=(
+    "sig64zero|cp $d/mock.so \$L; head -c 64 /dev/zero > \$L.sig|0"
+    "sig64zero_req|cp $d/mock.so \$L; head -c 64 /dev/zero > \$L.sig|1"
+    "sig10|cp $d/mock.so \$L; head -c 10 /dev/zero > \$L.sig|0"
+    "sig65|cp $d/mock.so \$L; head -c 65 /dev/zero > \$L.sig|0"
+    "sig0|cp $d/mock.so \$L; : > \$L.sig|0"
+    "nosig_req|cp $d/mock.so \$L|1"
+    "nosig_optout|cp $d/mock.so \$L|0"
+    "unreadable_req|cp $d/mock.so \$L; head -c 64 /dev/zero > \$L.sig; chmod 000 \$L|1"
+    "unreadable_optout|cp $d/mock.so \$L; head -c 64 /dev/zero > \$L.sig; chmod 000 \$L|0"
+    "directory_req|mkdir \$L; head -c 64 /dev/zero > \$L.sig|1"
+    "directory_optout|mkdir \$L|0"
+    "nosym_optout|cp $d/nosym.so \$L|0"
+    "missing_optout|true|0"
+    "missing_sig_only|head -c 64 /dev/zero > \$L.sig|1"
+  )
+  local v
+  for v in "${variants[@]}"; do
+    i=$((i + 1)); label="${v%%|*}"; v="${v#*|}"; local setup="${v%|*}" req="${v##*|}"
+    local L="$d/lib_${i}_${label}.so"
+    eval "$setup" 2>/dev/null
+    cp "$conf_keep" "$FSQD_CONF"
+    printf 'enterprise_lib = %s\nenterprise_require_signature = %s\n' "$L" "$req" >> "$FSQD_CONF"; chmod 600 "$FSQD_CONF"
+    rd="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload 2>&1)"
+    got="$("${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');" 2>&1)"
+    case "$got" in *"ERROR 2013"*|*"ERROR 2006"*|*"gone away"*|*"Lost connection"*) n_bad=$((n_bad + 1)); printf '         %s: the connection dropped (%s)\n' "$label" "${got:0:80}" ;; *) n_ok=$((n_ok + 1)) ;; esac
+    chmod 600 "$L" 2>/dev/null; rm -rf "$L" "$L.sig"
+  done
+  # a path too long to name its .sig
+  local longp="$d/$(printf 'q%.0s' $(seq 1 1100)).so"
+  cp "$conf_keep" "$FSQD_CONF"; printf 'enterprise_lib = %s\nenterprise_require_signature = 1\n' "$longp" >> "$FSQD_CONF"; chmod 600 "$FSQD_CONF"
+  FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload >/dev/null 2>&1
+  got="$("${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');" 2>&1)"
+  case "$got" in *"ERROR 2013"*|*"ERROR 2006"*|*"gone away"*|*"Lost connection"*) n_bad=$((n_bad + 1)) ;; *) n_ok=$((n_ok + 1)) ;; esac
+  cp "$conf_keep" "$FSQD_CONF"; chmod 600 "$FSQD_CONF"
+  FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload >/dev/null 2>&1
+  got="$("${MARIADB[@]}" -N -e "SELECT 1;" 2>&1)"
+  if [ "$n_bad" -eq 0 ] && [ "$got" = "1" ]; then pass "76 enterprise_refusals: the server survived $n_ok ways of presenting a bad or unusual enterprise library"
+  else fail "76 enterprise_refusals: $n_bad of $((n_ok + n_bad)) variants dropped the connection (final probe: $got)"; fi
+  rm -rf "$d" "$conf_keep"
+}
+
+# 74 udf_inputs: the vector and search UDFs with the inputs their parsers and limit checks have to judge (src/fractalsql.c, fractalsql_cognition.c): number
+# tokens in every notation (exponents with and without signs, bare dots, nan/inf, out-of-range exponents, 70-digit tokens), a corpus whose dimension does not
+# match the query, a zero-dimension query, option documents with wrong types and out-of-range values, a search whose work limit is exceeded, session ids
+# (none, unknown, the connection's own), the diversify and explain calls before and after a search, the partial-failure switch in every spelling, and
+# reasoning calls with NULL and over-limit arguments. Statements may succeed or return an error; the assertion is that the server answers every one.
+gate_74_udf_inputs() {
+  local sqlf="$TMPROOT/fractalsql_bt_udf_inputs.sql" out alive n
+  cat > "$sqlf" <<'SQL'
+SELECT fractal_search('', '1e5,2E-3,3e+2');
+SELECT fractal_search('', '.5,5.,1e,1e+');
+SELECT fractal_search('', '-.5e-2,+1');
+SELECT fractal_search('', 'nan,inf,-inf');
+SELECT fractal_search('', '1e999,1');
+SELECT fractal_search('', CONCAT(REPEAT('9', 70), ',1'));
+SELECT fractal_search('', CONCAT('1e', REPEAT('9', 70), ',1'));
+SELECT fractal_search('', CONCAT('1.', REPEAT('0', 70), '1,1'));
+SELECT fractal_search('[[1,2],[3,4]]', '1,2,3', 1, '{}');
+SELECT fractal_search('[[1,2],[3,4]]', '1,2', 1, '{}');
+SELECT fractal_search('[[1,2],[3]]', '1,2', 1, '{}');
+SELECT fractal_search('', '', 1, '{}');
+SELECT fractal_search('', ',', 1, '{}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"iterations":10000,"population_size":10000,"diffusion_factor":32}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"iterations":"x"}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"iterations":-1}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"population_size":1e10}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"diffusion_factor":0}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"walk":"a","debug":1}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"debug":true,"iterations":3,"population_size":5}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, 'not json');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '[1]');
+SELECT fractal_search('[[1,2]]', '1,2', 1, NULL);
+SELECT fractal_search('[[1,2]]', '1,2', 0, '{}');
+SELECT fractal_search('[[1,2]]', '1,2', -1, '{}');
+SELECT fractal_search('[[1,2]]', '1,2', 1000000, '{}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"session_id":0,"iterations":3,"population_size":5}');
+SELECT fractal_search('[[1,2]]', '1,2', 1, '{"session_id":99999999,"iterations":3,"population_size":5}');
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_diversify_enable(CONNECTION_ID());
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_search('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
+SELECT fractal_search('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_detect_collapse(CONNECTION_ID());
+SELECT fractal_diversify_disable(CONNECTION_ID());
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_explain_result(NULL);
+SELECT fractal_explain_result(99999999);
+SELECT fractal_search_debug('');
+SELECT fractal_search_debug(',');
+SELECT fractal_search_debug('1e5,2E-3');
+SELECT fractal_search_debug('1,2', 0, 0, 0, 0);
+SELECT fractal_search_debug('1,2', 100000, 100000, 32, 1);
+SELECT fractal_search_explore('', '', '{}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2,3', '{}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', '{"population_size":10000,"iterations":10000}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', '{"population_size":1}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', 'x');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'on');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'off');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'ON');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'Off');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'x');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), '');
+SELECT fractal_agent_partial_fail(NULL, 'on');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), NULL);
+SELECT fractal_reason(CONNECTION_ID(), 'q', NULL);
+SELECT fractal_reason(CONNECTION_ID(), 'q', '{}');
+SELECT fractal_reason(CONNECTION_ID(), 'q', REPEAT('x', 5242880));
+SELECT fractal_reason(CONNECTION_ID(), REPEAT('x', 5242880));
+SELECT fractal_reason(NULL, 'q');
+SELECT fractal_reason(CONNECTION_ID(), NULL);
+SELECT fractal_reason(CONNECTION_ID(), '');
+SELECT fractal_session_close(CONNECTION_ID());
+SELECT fractal_session_close(CONNECTION_ID());
+SELECT fractal_session_close(NULL);
+SELECT fractal_version(), fractal_edition();
+SQL
+  n=$(grep -c '^SELECT' "$sqlf")
+  out=$("${MARIADB[@]}" --force < "$sqlf" 2>&1)
+  alive=$("${MARIADB[@]}" -N -e "SELECT 1;" 2>&1)
+  if [ "$alive" = "1" ] && ! grep -qE "ERROR 2013|ERROR 2006|server has gone away|Lost connection" <<< "$out"; then
+    pass "74 udf_inputs: the server answered all $n awkward vector, search, diversify and reasoning statements"
+  else
+    printf '%s\n' "$out" | tail -5 | sed 's/^/         /'; fail "74 udf_inputs: the server did not survive (alive=$alive)"
+  fi
+  rm -f "$sqlf"
+}
+
+# 73 config_matrix: every configuration key through both ways of setting it (src/fractalsql_config.c). Part 1: the SQL functions fractal_config_set / _get
+# for all 18 keys with 189 values (accepted, wrong type, out of range, too long, empty, prefixed and upper-cased names, unknown keys), asserted by verdict:
+# OK stored, D daemon-wide setting a session may not change, L too long, U unknown key, I not an integer, R out of range, B not a boolean; a stored
+# value reads back as it was set. Part 2: the daemon's own conf file, where the daemon-wide keys DO get set -- the path rules (relative, "..", drive
+# letter, UNC, root, spaces, empty), the integer, boolean, enum and string keys, unknown keys and malformed lines -- each applied with a reload; the
+# daemon must keep answering and the conf is put back.
+gate_73_config_matrix() {
+  local sqlf="$TMPROOT/fractalsql_bt_cfg_matrix.sql" outf="$TMPROOT/fractalsql_bt_cfg_matrix.out" kind name val i=0 bad=0 n=0 got want rowsv
+  # The heredoc is read straight into the variable: wrapped in $(...), bash 3.2 (macOS) mis-tracks the quotes in rows like SELECT 'unterminated.
+  IFS= read -r -d '' rowsv <<'ROWS' || true
+D	reasoning_plugin	/opt/fsql/x.so
+D	reasoning_plugin	rel/x.so
+D	reasoning_plugin	/a/../b.so
+D	reasoning_plugin	C:\\x\\y.so
+D	reasoning_plugin	\\\\srv\\sh\\f.dll
+D	reasoning_plugin	/
+D	reasoning_plugin	@P5000@
+D	reasoning_plugin	
+D	fractalsql.reasoning_plugin	/opt/fsql/x.so
+U	REASONING_PLUGIN	/opt/fsql/x.so
+D	reasoning_url	value-1
+D	reasoning_url	
+L	reasoning_url	@X9000@
+D	reasoning_url	with space
+D	reasoning_url	ünï
+D	reasoning_url	a\nb
+D	fractalsql.reasoning_url	value-1
+U	REASONING_URL	value-1
+D	reasoning_token	value-1
+D	reasoning_token	
+L	reasoning_token	@X9000@
+D	reasoning_token	with space
+D	reasoning_token	ünï
+D	reasoning_token	a\nb
+D	fractalsql.reasoning_token	value-1
+U	REASONING_TOKEN	value-1
+OK	reasoning_model	value-1
+OK	reasoning_model	
+L	reasoning_model	@X9000@
+OK	reasoning_model	with space
+OK	reasoning_model	ünï
+OK	reasoning_model	a\nb
+OK	fractalsql.reasoning_model	value-1
+U	REASONING_MODEL	value-1
+D	reasoning_allow_plaintext	1
+D	reasoning_allow_plaintext	true
+D	reasoning_allow_plaintext	on
+D	reasoning_allow_plaintext	yes
+D	reasoning_allow_plaintext	0
+D	reasoning_allow_plaintext	false
+D	reasoning_allow_plaintext	off
+D	reasoning_allow_plaintext	no
+D	reasoning_allow_plaintext	
+D	reasoning_allow_plaintext	maybe
+D	reasoning_allow_plaintext	TRUE
+D	reasoning_allow_plaintext	2
+D	fractalsql.reasoning_allow_plaintext	1
+U	REASONING_ALLOW_PLAINTEXT	1
+D	embed_url	value-1
+D	embed_url	
+L	embed_url	@X9000@
+D	embed_url	with space
+D	embed_url	ünï
+D	embed_url	a\nb
+D	fractalsql.embed_url	value-1
+U	EMBED_URL	value-1
+OK	embed_model	value-1
+OK	embed_model	
+L	embed_model	@X9000@
+OK	embed_model	with space
+OK	embed_model	ünï
+OK	embed_model	a\nb
+OK	fractalsql.embed_model	value-1
+U	EMBED_MODEL	value-1
+OK	think	value-1
+OK	think	
+L	think	@X9000@
+OK	think	with space
+OK	think	ünï
+OK	think	a\nb
+OK	fractalsql.think	value-1
+U	THINK	value-1
+D	think_provider	value-1
+D	think_provider	
+L	think_provider	@X9000@
+D	think_provider	with space
+D	think_provider	ünï
+D	think_provider	a\nb
+D	fractalsql.think_provider	value-1
+U	THINK_PROVIDER	value-1
+D	think_native_url	value-1
+D	think_native_url	
+L	think_native_url	@X9000@
+D	think_native_url	with space
+D	think_native_url	ünï
+D	think_native_url	a\nb
+D	fractalsql.think_native_url	value-1
+U	THINK_NATIVE_URL	value-1
+OK	think_num_ctx	5
+OK	think_num_ctx	1
+OK	think_num_ctx	10
+R	think_num_ctx	0
+OK	think_num_ctx	11
+R	think_num_ctx	-1
+I	think_num_ctx	abc
+I	think_num_ctx	12x
+R	think_num_ctx	99999999999
+OK	think_num_ctx	
+I	think_num_ctx	3.5
+OK	think_num_ctx	10000000
+R	think_num_ctx	10000001
+OK	fractalsql.think_num_ctx	5
+U	THINK_NUM_CTX	5
+OK	t2s_max_attempts	5
+OK	t2s_max_attempts	1
+OK	t2s_max_attempts	10
+R	t2s_max_attempts	0
+R	t2s_max_attempts	11
+R	t2s_max_attempts	-1
+I	t2s_max_attempts	abc
+I	t2s_max_attempts	12x
+R	t2s_max_attempts	99999999999
+OK	t2s_max_attempts	
+I	t2s_max_attempts	3.5
+R	t2s_max_attempts	10000000
+R	t2s_max_attempts	10000001
+OK	fractalsql.t2s_max_attempts	5
+U	T2S_MAX_ATTEMPTS	5
+D	t2s_allowed_statements	select
+D	t2s_allowed_statements	select_insert_update
+D	t2s_allowed_statements	delete
+D	t2s_allowed_statements	SELECT
+D	t2s_allowed_statements	
+D	t2s_allowed_statements	
+D	fractalsql.t2s_allowed_statements	select
+U	T2S_ALLOWED_STATEMENTS	select
+OK	t2s_use_review	1
+OK	t2s_use_review	true
+OK	t2s_use_review	on
+OK	t2s_use_review	yes
+OK	t2s_use_review	0
+OK	t2s_use_review	false
+OK	t2s_use_review	off
+OK	t2s_use_review	no
+OK	t2s_use_review	
+B	t2s_use_review	maybe
+B	t2s_use_review	TRUE
+B	t2s_use_review	2
+OK	fractalsql.t2s_use_review	1
+U	T2S_USE_REVIEW	1
+D	enterprise_lib	/opt/fsql/x.so
+D	enterprise_lib	rel/x.so
+D	enterprise_lib	/a/../b.so
+D	enterprise_lib	C:\\x\\y.so
+D	enterprise_lib	\\\\srv\\sh\\f.dll
+D	enterprise_lib	/
+D	enterprise_lib	@P5000@
+D	enterprise_lib	
+D	fractalsql.enterprise_lib	/opt/fsql/x.so
+U	ENTERPRISE_LIB	/opt/fsql/x.so
+D	enterprise_ledger_path	/opt/fsql/x.so
+D	enterprise_ledger_path	rel/x.so
+D	enterprise_ledger_path	/a/../b.so
+D	enterprise_ledger_path	C:\\x\\y.so
+D	enterprise_ledger_path	\\\\srv\\sh\\f.dll
+D	enterprise_ledger_path	/
+D	enterprise_ledger_path	@P5000@
+D	enterprise_ledger_path	
+D	fractalsql.enterprise_ledger_path	/opt/fsql/x.so
+U	ENTERPRISE_LEDGER_PATH	/opt/fsql/x.so
+D	enterprise_ledger_key	value-1
+D	enterprise_ledger_key	
+L	enterprise_ledger_key	@X9000@
+D	enterprise_ledger_key	with space
+D	enterprise_ledger_key	ünï
+D	enterprise_ledger_key	a\nb
+D	fractalsql.enterprise_ledger_key	value-1
+U	ENTERPRISE_LEDGER_KEY	value-1
+D	enterprise_require_signature	1
+D	enterprise_require_signature	true
+D	enterprise_require_signature	on
+D	enterprise_require_signature	yes
+D	enterprise_require_signature	0
+D	enterprise_require_signature	false
+D	enterprise_require_signature	off
+D	enterprise_require_signature	no
+D	enterprise_require_signature	
+D	enterprise_require_signature	maybe
+D	enterprise_require_signature	TRUE
+D	enterprise_require_signature	2
+D	fractalsql.enterprise_require_signature	1
+U	ENTERPRISE_REQUIRE_SIGNATURE	1
+U	nope	1
+U		1
+L	@X300@	1
+U	fractalsql.	1
+U	fractalsql.nope	1
+U	reasoning_plugin 	1
+U	a;b	1
+ROWS
+  rowsv="${rowsv%$'\n'}"
+  _cfg_expand() { case "$1" in @X9000@) printf 'x%.0s' $(seq 1 9000) ;; @P5000@) printf '/'; printf 'p%.0s' $(seq 1 5000) ;; @X300@) printf 'x%.0s' $(seq 1 300) ;; *) printf '%s' "$1" ;; esac; }
+  : > "$sqlf"
+  while IFS=$'\t' read -r kind name val; do
+    i=$((i + 1)); name="$(_cfg_expand "$name")"; val="$(_cfg_expand "$val")"
+    printf "SELECT %d, IFNULL(fractal_config_set('%s', '%s', CONNECTION_ID()), '<NULL>'), IFNULL(fractal_config_get('%s', CONNECTION_ID()), '<NULL>');\n" \
+      "$i" "$(printf '%s' "$name" | sed "s/'/''/g")" "$(printf '%s' "$val" | sed "s/'/''/g")" "$(printf '%s' "$name" | sed "s/'/''/g")" >> "$sqlf"
+  done <<< "$rowsv"
+  "${MARIADB[@]}" -N < "$sqlf" > "$outf" 2>&1
+  i=0
+  while IFS=$'\t' read -r kind name val; do
+    i=$((i + 1)); n=$((n + 1))
+    got="$(awk -F'\t' -v id="$i" '$1 == id { print $2 "\t" $3 }' "$outf" | head -1)"
+    case "$kind" in
+      OK) want="ok" ;; D) want="daemon-wide setting" ;; L) want="too long" ;; U) want="unknown configuration key" ;;
+      I) want="expects an integer" ;; R) want="must be" ;; B) want="expects true/false" ;;
+    esac
+    case "$got" in *"$want"*) ;; *) bad=$((bad + 1)); [ "$bad" -le 6 ] && printf '         %s %s=%s -> %s\n' "$kind" "$name" "${val:0:30}" "${got:0:80}" ;; esac
+    if [ "$kind" = "OK" ] && [ -n "$val" ] && [ "${val#*\\}" = "$val" ] && [ "${val#*é}" = "$val" ]; then
+      case "$got" in *$'\t'"$val") ;; *) bad=$((bad + 1)); [ "$bad" -le 6 ] && printf '         read-back %s=%s -> %s\n' "$name" "$val" "${got:0:80}" ;; esac
+    fi
+  done <<< "$rowsv"
+  if [ "$bad" -eq 0 ]; then pass "73 config_matrix: all $n session-side settings got the verdict the key table specifies, and stored values read back"
+  else fail "73 config_matrix: $bad of $n settings did not (first ones above)"; fi
+
+  # Part 2: the conf file
+  local ctl_bin="$HERE/service/build/fsqlctl" conf_keep="$TMPROOT/fractalsql_bt_cfg_matrix.conf.keep" line alive rd cb=0 cn=0
+  cp "$FSQD_CONF" "$conf_keep"
+  while IFS= read -r line; do
+    cn=$((cn + 1))
+    cp "$conf_keep" "$FSQD_CONF"
+    printf '%b\n' "$line" >> "$FSQD_CONF"; chmod 600 "$FSQD_CONF"
+    rd="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload 2>&1)"
+    alive="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" ping 2>&1)"
+    case "$alive" in *pong*|*ok*|*alive*) ;; *) cb=$((cb + 1)); [ "$cb" -le 4 ] && printf '         daemon stopped answering after: %s (reload said: %s; ping said: %s)\n' "$line" "${rd:0:60}" "${alive:0:60}" ;; esac
+  done <<'CONFS'
+reasoning_plugin = /abs/ok.so
+reasoning_plugin = rel/x.so
+reasoning_plugin = /a/../b.so
+reasoning_plugin = C:\\x\\y.so
+reasoning_plugin = C:/x/y.so
+reasoning_plugin = \\\\srv\\sh\\f.dll
+reasoning_plugin = \\rooted\\path.dll
+reasoning_plugin = /
+reasoning_plugin = /with space/x.so
+reasoning_plugin =
+enterprise_lib = /abs/missing.so
+enterprise_lib = rel/x.so
+enterprise_lib = /a/../b.so
+enterprise_lib = C:\\x\\y.dll
+enterprise_ledger_path = /tmp/fsql_cfg_matrix_ledger.dat
+enterprise_ledger_path = rel/ledger
+enterprise_ledger_path = /a/../ledger
+enterprise_ledger_key = k
+enterprise_ledger_key =
+enterprise_require_signature = 1
+enterprise_require_signature = maybe
+enterprise_require_signature = 0
+reasoning_allow_plaintext = true
+reasoning_allow_plaintext = maybe
+reasoning_url = https://example.test/v1
+reasoning_url = http://example.test/v1
+embed_url = https://example.test/v1/embeddings
+think_native_url = http://127.0.0.1:11434
+think_provider = ollama
+think_provider = bogus
+think_num_ctx = 4096
+think_num_ctx = 0
+think_num_ctx = abc
+think_num_ctx = 99999999999
+t2s_max_attempts = 5
+t2s_max_attempts = 0
+t2s_max_attempts = 11
+t2s_max_attempts = x
+t2s_allowed_statements = select_insert_update
+t2s_allowed_statements = select
+t2s_allowed_statements = delete
+t2s_use_review = 1
+t2s_use_review = maybe
+reasoning_model = m
+reasoning_token = t
+embed_model = e
+think = high
+bogus_key = 1
+no equals sign here
+= novalue
+reasoning_model = a\nreasoning_model = b
+# a comment line
+   reasoning_model   =   spaced   
+reasoning_model=nospace
+reasoning_plugin = /a/one.so\nreasoning_plugin = /a/two.so\nreasoning_url = https://a.test/1\nreasoning_url = https://a.test/2\nreasoning_token = t1\nreasoning_token = t2\nembed_url = https://e.test/1\nembed_url = https://e.test/2\nembed_model = m1\nembed_model = m2\nthink_provider = ollama\nthink_provider = openai\nthink_native_url = http://127.0.0.1:1\nthink_native_url = http://127.0.0.1:2\nt2s_allowed_statements = select\nt2s_allowed_statements = select_insert_update\nenterprise_lib = /a/e1.so\nenterprise_lib = /a/e2.so\nenterprise_ledger_path = /tmp/l1\nenterprise_ledger_path = /tmp/l2\nenterprise_ledger_key = k1\nenterprise_ledger_key = k2\nsocket_path = /tmp/fsql_cfg_matrix_other.sock\nlog_path = /tmp/fsql_cfg_matrix.log
+CONFS
+  # a conf file or a key file that other users can read is refused (the daemon holds a secret): both modes, then put back
+  chmod 644 "$FSQD_CONF"
+  rd="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload 2>&1)"
+  alive="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" ping 2>&1)"
+  case "$alive" in *pong*|*ok*|*alive*) ;; *) cb=$((cb + 1)); printf '         the daemon stopped answering with a world-readable conf (reload said: %s)\n' "${rd:0:80}" ;; esac
+  cp "$conf_keep" "$FSQD_CONF"; chmod 600 "$FSQD_CONF"
+  chmod 644 "$FSQD_KEY"
+  rd="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload 2>&1)"
+  alive="$(FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" ping 2>&1)"
+  case "$alive" in *pong*|*ok*|*alive*) ;; *) cb=$((cb + 1)); printf '         the daemon stopped answering with a world-readable key file (reload said: %s)\n' "${rd:0:80}" ;; esac
+  chmod 600 "$FSQD_KEY"
+  cn=$((cn + 2))
+  cp "$conf_keep" "$FSQD_CONF"; chmod 600 "$FSQD_CONF"
+  FSQLCTL_SOCKET="$FSQD_SOCK" FSQLCTL_KEY="$FSQD_KEY" "$ctl_bin" reload >/dev/null 2>&1
+  rm -f "$sqlf" "$outf" "$conf_keep"
+  if [ "$cb" -eq 0 ]; then pass "73 config_matrix: the daemon kept answering through $cn conf-file variants (paths of every shape, every key type, unknown keys, malformed lines)"
+  else fail "73 config_matrix: the daemon stopped answering after $cb of $cn conf-file variants"; fi
+}
+
+gate_72_allowlist_matrix() {
+  local sqlf="$TMPROOT/fractalsql_bt_allowlist_matrix.sql" outf="$TMPROOT/fractalsql_bt_allowlist_matrix.out" kind cand i=0 bad=0 got want n=0
+  : > "$sqlf"
+  # The heredoc is read straight into the variable: wrapped in $(...), bash 3.2 (macOS) mis-tracks the quotes in rows like SELECT 'unterminated.
+  local rows; IFS= read -r -d '' rows <<'ROWS' || true
+P	SELECT 1
+P	select * from bt_customers where id = 1
+P	WITH x AS (SELECT 1) SELECT * FROM x
+P	SELECT 1;
+P	SELECT 1; 
+P	-- c\nSELECT 1
+P	# c\nSELECT 1
+P	/* c */ SELECT 1
+P	SELECT /* c */ 1
+E	/* never closed SELECT 1
+E	-- only a comment
+P	SELECT 1 -- trailing
+P	SELECT 1 # trailing
+X	/*! SELECT 1 */
+X	/*!50000 SELECT 1 */
+X	/*+ HINT */ SELECT 1
+X	SELECT /*! 1 */ 1
+X	SELECT /*+ MAX_EXECUTION_TIME(1) */ 1
+M	SELECT 1; SELECT 2
+M	SELECT 1; DROP TABLE bt_customers
+P	SELECT 'a;b'
+P	SELECT "a;b"
+P	SELECT `a;b` FROM bt_customers
+P	SELECT 'it''s'
+M	SELECT 'a\\'' ; DROP TABLE x; -- '
+O	SELECT 1 INTO OUTFILE '/tmp/x'
+O	SELECT 1 INTO DUMPFILE '/tmp/x'
+P	SELECT 1 INTO @v
+O	select * from bt_customers into outfile '/tmp/y'
+P	SELECT 'into outfile' AS s
+F	SELECT LOAD_FILE('/etc/passwd')
+F	SELECT SLEEP(5)
+F	SELECT BENCHMARK(1000000, MD5('a'))
+T	DO SLEEP(1)
+T	SET @a = 1
+T	CALL some_proc()
+T	INSERT INTO bt_customers (name) VALUES ('x')
+T	UPDATE bt_customers SET name = 'x'
+T	DELETE FROM bt_customers
+T	REPLACE INTO bt_customers (id) VALUES (1)
+T	DROP TABLE bt_customers
+T	TRUNCATE TABLE bt_customers
+T	CREATE TABLE t (a INT)
+T	ALTER TABLE bt_customers ADD COLUMN z INT
+T	SHOW TABLES
+T	EXPLAIN SELECT 1
+T	DESCRIBE bt_customers
+T	USE mysql
+T	GRANT ALL ON *.* TO 'x'@'%'
+T	LOCK TABLES bt_customers READ
+T	HANDLER bt_customers OPEN
+T	LOAD DATA INFILE '/etc/passwd' INTO TABLE bt_customers
+T	PREPARE s FROM 'SELECT 1'
+T	EXECUTE s
+T	BEGIN
+T	COMMIT
+T	KILL 1
+T	FLUSH TABLES
+T	`SELECT` 1
+T	"SELECT" 1
+P	(SELECT 1)
+P	(SELECT 1) UNION (SELECT 2)
+P	SELECT 1 UNION SELECT 2
+P	SELECT * FROM bt_customers FOR UPDATE
+P	SELECT * FROM bt_customers LOCK IN SHARE MODE
+F	SELECT GET_LOCK('x', 1)
+P	SELECT @@version
+P	SELECT user()
+P	SELECT * FROM information_schema.tables
+P	SELECT * FROM mysql.user
+P	  \n\t SELECT 1
+P	SELECT\n1
+P	sElEcT 1
+T	SELECTED 1
+T	SELECT1
+T	123 not a keyword
+E	;
+E	;;
+P	SELECT 1;;
+P	SELECT 1 ; -- x
+P	SELECT '\0'
+P	SELECT 0x41
+P	SELECT * FROM (SELECT 1) t
+P	WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3) SELECT * FROM n
+T	WITH x AS (SELECT 1) DELETE FROM bt_customers
+T	WITH x AS (SELECT 1) INSERT INTO bt_customers SELECT * FROM x
+P	SELECT 1 FROM DUAL
+P	SELECT SQL_NO_CACHE 1
+P	SELECT 'unterminated
+P	SELECT "unterminated
+P	SELECT `unterminated
+P	SELECT 1 /* x */ ; /* y */
+P	SELECT 1; /* only a comment after */
+P	SELECT 1; -- comment after
+P	SELECT 1; # comment after
+M	SELECT 1;\nSELECT 2
+ROWS
+  rows="${rows%$'\n'}"
+  while IFS=$'\t' read -r kind cand; do
+    i=$((i + 1))
+    printf "SELECT %d, IFNULL(fractal_t2s_check_allowlist('%s'), '<PASS>');\n" "$i" "$(printf '%s' "$cand" | sed "s/'/''/g")" >> "$sqlf"
+  done <<< "$rows"
+  "${MARIADB[@]}" -N < "$sqlf" > "$outf" 2>&1
+  i=0
+  while IFS=$'\t' read -r kind cand; do
+    i=$((i + 1)); n=$((n + 1))
+    got="$(awk -F'\t' -v id="$i" '$1 == id { print $2 }' "$outf" | head -1)"
+    case "$kind" in
+      P) want="<PASS>" ;;
+      E) want="SQL is empty" ;;
+      X) want="versioned (slash-star-bang)" ;;
+      M) want="expected exactly one SQL statement" ;;
+      O) want="INTO OUTFILE/DUMPFILE" ;;
+      F) want="a function that changes state" ;;
+      T) want="is not permitted" ;;
+    esac
+    case "$got" in
+      *"$want"*) ;;
+      *) bad=$((bad + 1)); [ "$bad" -le 6 ] && printf '         %s: %q -> %s\n' "$kind" "$cand" "${got:-<no answer>}" ;;
+    esac
+  done <<< "$rows"
+  if [ "$bad" -eq 0 ]; then pass "72 allowlist_matrix: all $n candidate statements got the verdict the allowlist is specified to give"
+  else fail "72 allowlist_matrix: $bad of $n candidates got a different verdict (first ones above)"; fi
+  rm -f "$sqlf" "$outf"
+}
+
 gate_68_mcp_conformance() {
   if [[ ! -f "$HERE/mcp/tests/mcp_conformance.py" || ! -f "$HERE/mcp/src/main.cpp" ]]; then
     skip "68 mcp_conformance (mcp/ server code not present)"; return
@@ -8633,7 +9546,7 @@ gate_68_mcp_conformance() {
   MCPC_GATE=68 \
   MCPC_LOCK_DIR="$HERE/mcp" \
   MCPC_PASSTHROUGH_ENV="MARIADB_HOST,MARIADB_PORT,MARIADB_DATABASE,MARIADB_USER,MARIADB_PASSWORD,FSQLCTL_SOCKET,FSQLCTL_KEY,FSQLCTL_CONF" \
-  MCPC_READ_TOOL="fractalsql_get_version" \
+  MCPC_READ_TOOL="fractal_version" \
   MCPC_READ_ARGS='{}' \
   MCPC_STATE_TOOL="fractal_diversify_enable" \
   MCPC_STATE_ARGS='{}' \
@@ -8689,11 +9602,12 @@ run_major() {
     [ "$g" = "63" ] && gate_63_direct_calls
     [ "$g" = "64" ] && gate_64_direct_faults
     [ "$g" = "69" ] && gate_69_plugin_sig_vendored
+    [ "$g" = "70" ] && gate_70_redact_unit
   done
 
   local need_db=0
   for g in "${gates[@]}"; do
-    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|31|32|33|34|35|36|37|38|39|40|42|43|44|45|47|48|49|50|51|52|53|54|55|56|57|58|59|60|61|62|65|66|68) need_db=1 ;; esac
+    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|31|32|33|34|35|36|37|38|39|40|42|43|44|45|47|48|49|50|51|52|53|54|55|56|57|58|59|60|61|62|65|66|68|71|72|73|74|75|76) need_db=1 ;; esac
   done
   if [ "$need_db" -eq 1 ]; then
     mdb_setup "$v"; local rc=$?
@@ -8736,6 +9650,12 @@ run_major() {
         31) gate_31_sql_agent_savepoint ;;
         32) gate_32_new_primitives ;;
         35) gate_35_enterprise_mock ;;
+        71) gate_71_ledger_env ;;
+        72) gate_72_allowlist_matrix ;;
+        73) gate_73_config_matrix ;;
+        74) gate_74_udf_inputs ;;
+        75) gate_75_multimodal_edge ;;
+        76) gate_76_enterprise_refusals ;;
         36) gate_36_morphology_metrics ;;
         37) gate_37_oom_injection ;;
         38) gate_38_fatal_signal ;;

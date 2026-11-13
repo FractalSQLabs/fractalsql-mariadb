@@ -94,17 +94,17 @@ namespace fsqlmcp
 
         t.push_back( mkTool( "fractal_vectorizer_process_queue", "vectorizer", "stateful", ToolClass::Cheap,
             "Drives the actual embedding sync (batch_size defaults 100 if omitted; "
-            "stale_after_secs defaults 600) and returns {n_processed}. Call it on YOUR schedule "
+            "stale_after defaults 600) and returns {n_processed}. Call it on YOUR schedule "
             "- there is no background worker in this engine by design; nothing embeds until "
             "this is called.",
             { Int( "batch_size", false, "", 100 ),
-              Int( "stale_after_secs", false, "", 600 ) },
+              Int( "stale_after", false, "", 600 ) },
             [ &db, optInt ]( const Json& a, CallCtx& )
             {
                 // The one procedure with NO OUT var: an ordinary SELECT result set
                 // arrives instead, captured before the drain (db.cpp).
                 return db.callProcResultSet( "fractal_vectorizer_process_queue",
-                    { optInt( a, "batch_size" ), optInt( a, "stale_after_secs" ) } );
+                    { optInt( a, "batch_size" ), optInt( a, "stale_after" ) } );
             } ) );
 
         return t;

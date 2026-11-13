@@ -112,9 +112,15 @@ CALL fractal_agent_detect_loop('varied-actor', @sed_walk, 64, 42.0, 0, @sed_l1);
 CALL fractal_agent_detect_loop('auto-actor', @sed_flip, 64, 42.0, 0, @sed_l2);
 DROP TABLE IF EXISTS sed_loop;
 CREATE TABLE sed_loop (agent_id VARCHAR(64), is_loop INT, dfa_exponent DOUBLE);
+-- JSON_VALUE renders a JSON null as the four-character STRING 'null', and
+-- the automated actor's log is a period-2 cycle whose DFA exponent the
+-- agent leaves null (a constant-norm series has no exponent to report).
+-- NULLIF turns that string back into a real NULL before it is cast into
+-- the DOUBLE column -- without it the INSERT is refused with
+-- "Incorrect double value: 'null'".
 INSERT INTO sed_loop VALUES
-    ('varied-actor', IF(JSON_VALUE(@sed_l1, '$.loop_detected') IN ('true', '1'), 1, 0), JSON_VALUE(@sed_l1, '$.dfa_exponent')),
-    ('auto-actor',    IF(JSON_VALUE(@sed_l2, '$.loop_detected') IN ('true', '1'), 1, 0), JSON_VALUE(@sed_l2, '$.dfa_exponent'));
+    ('varied-actor', IF(JSON_VALUE(@sed_l1, '$.loop_detected') IN ('true', '1'), 1, 0), CAST(NULLIF(JSON_VALUE(@sed_l1, '$.dfa_exponent'), 'null') AS DOUBLE)),
+    ('auto-actor',    IF(JSON_VALUE(@sed_l2, '$.loop_detected') IN ('true', '1'), 1, 0), CAST(NULLIF(JSON_VALUE(@sed_l2, '$.dfa_exponent'), 'null') AS DOUBLE));
 
 SELECT agent_id, is_loop, dfa_exponent FROM sed_loop ORDER BY agent_id;
 

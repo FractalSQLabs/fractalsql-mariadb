@@ -74,7 +74,7 @@
       "name": "fractal_embed"
     },
     {
-      "description": "Plain-text schema description of the named tables (or all visible tables when table_names is omitted) -- what a reasoning call sees as its own context. Exposed as a tool (not only the fractalsql://schema resource) so a client can audit exactly what an LLM call will be told before running it. Two arguments: there is no query_hint parameter in this engine.",
+      "description": "Plain-text schema description of the named tables (or all visible tables when table_names is omitted) -- what a reasoning call sees as its own context. Exposed as a tool (not only the fractalsql://schema resource) so a client can audit exactly what an LLM call will be told before running it. query_hint is accepted for forward compatibility with future table-subset ranking and is not yet used.",
       "name": "fractal_schema_context"
     },
     {
@@ -110,7 +110,7 @@
       "name": "fractal_agent_rebalance_sibling"
     },
     {
-      "description": "ENTERPRISE TIER - returns a clean 'fractal_agent_diverse_portfolios: enterprise tier not loaded' error on a Community install. Multi-restart diverse-candidate optimizer (sharpe or pareto objective_mode) -> one LLM tradeoff summary over all candidates. cov flattened 1-D row-major. NULL objective_mode/default knobs follow the documented defaults (n_restarts=8, overlap_threshold=0.3, quality_frac=0.8). The reasoning step dispatches a real LLM call (up to the documented 300s cold-load window; no automatic retry - retrying is your decision). If the reasoning endpoint fails after the data step, this call returns the computed data half plus a \"reasoning_step_failed\" field carrying the endpoint's error instead of raising - MCP sessions opt in per connection by default (FSQL_MCP_AGENT_PARTIAL=off keeps the engine's raise behavior); an unconfigured reasoning plugin still raises, that is a setup error.",
+      "description": "ENTERPRISE TIER - returns a clean 'fractal_agent_diverse_portfolios: enterprise tier not loaded' error on a Community install. Multi-restart diverse-candidate optimizer (sharpe or pareto objective_mode) -> one LLM tradeoff summary over all candidates. cov flattened 1-D row-major. NULL objective_mode/default knobs follow the documented defaults (n_restarts=8, overlap_threshold=0.15, quality_frac=0.9). The reasoning step dispatches a real LLM call (up to the documented 300s cold-load window; no automatic retry - retrying is your decision). If the reasoning endpoint fails after the data step, this call returns the computed data half plus a \"reasoning_step_failed\" field carrying the endpoint's error instead of raising - MCP sessions opt in per connection by default (FSQL_MCP_AGENT_PARTIAL=off keeps the engine's raise behavior); an unconfigured reasoning plugin still raises, that is a setup error.",
       "name": "fractal_agent_diverse_portfolios"
     },
     {
@@ -338,45 +338,45 @@
       "name": "fractal_vectorizer_enqueue"
     },
     {
-      "description": "Drives the actual embedding sync (batch_size defaults 100 if omitted; stale_after_secs defaults 600) and returns {n_processed}. Call it on YOUR schedule - there is no background worker in this engine by design; nothing embeds until this is called.",
+      "description": "Drives the actual embedding sync (batch_size defaults 100 if omitted; stale_after defaults 600) and returns {n_processed}. Call it on YOUR schedule - there is no background worker in this engine by design; nothing embeds until this is called.",
       "name": "fractal_vectorizer_process_queue"
     },
     {
       "description": "Confirms the FractalSQL install is alive and which edition is active: {edition ('Community'/'Enterprise'), version} from the engine's own fractal_edition()/fractal_version() UDFs. The plugin's version-skew guard compares the engine's reported version against what this server was built against at startup (a warn, not a fail). daemon_version reports the fractalsqld daemon's own string (null when the daemon is unreachable).",
-      "name": "fractalsql_get_version"
+      "name": "fractal_version"
     },
     {
       "description": "Reads back a config key's resolved value, or the whole non-secret surface when no key is given. IMPORTANT (5.2): this tool reads TWO credential realms -- the text-to-sql keys come from the database connection's own fractal_t2s_config() introspection (live engine values), while the provider keys are read from the DAEMON's config file (fractalsqld.conf; this server process needs read access; set FSQLCTL_CONF to its path). Secret keys (reasoning_token, http_token, enterprise_ledger_key) are never read back: asking for one by name is refused with an error that says it is a secret, and the whole-surface read reports it as <redacted>. A single key's 'value' is always a STRING (the config file holds text, so the field is text even where the live engine value is typed) -- or null when the key is not set.",
-      "name": "fractalsql_get_config"
+      "name": "fractal_daemon_config_get"
     },
     {
       "description": "Edits ONE key of the daemon's config file and asks the daemon to reload it. TWO credential realms in one tool (5.2): the file write is local filesystem (the config's authoritative home), the reload rides the FSQ protocol authenticated by the daemon's own HMAC key -- nothing to do with MariaDB user auth. Editable keys are the reasoning provider set and the text-to-sql knobs; the enterprise keys are refused as operator territory; socket_path/hmac_key_file are startup-only and the daemon would refuse them at reload anyway. Secret keys are write-only. destructiveHint: it re-points what LLM traffic hits (10.4) -- every call is logged with the key's old AND new value. When the daemon refuses the reload (its all-or-nothing validation), the exact refusal reason is surfaced and the live config is unchanged in behavior.",
-      "name": "fractalsql_set_config"
+      "name": "fractal_daemon_config_set"
     },
     {
       "description": "Sets the LLM provider configuration (provider_url, embed_url, model, embed_model, allow_plaintext, think_mode) in the daemon's config file and reloads it. destructiveHint: this re-points every subsequent reasoning/embedding/agent call at whatever URL you give it -- an attacker-controlled endpoint silently captures all future LLM traffic (10.4), so every call is logged with old and new values, and a human-consent client UI should ask first. Reasoning tokens and the enterprise keys are NEVER set by this tool. Take effect on the tier's next call (a reload never loads the plugin/library itself). allow_plaintext exists because a local dev model may legitimately serve plaintext http -- the value lands in the daemon conf, not in this server's own config.",
-      "name": "fractalsql_configure_reasoning"
+      "name": "fractal_configure_reasoning"
     },
     {
       "description": "Sets ONE configuration key for THIS CONNECTION only, layered over the daemon-wide value -- no config-file edit and no daemon reload. A session may change the TUNING keys (reasoning_model, embed_model, think, think_num_ctx, t2s_max_attempts, t2s_use_review) and nothing else: the keys that decide which code the daemon loads, where its outbound traffic goes, what credentials it uses, and its transport posture are refused BY NAME, with the reason, by the engine. Returns {ok:true} on success, or {ok:false, reason:...} for a refusal. destructiveHint: it re-points what LLM traffic this session asks for (10.4) -- every call is logged with the key's old and new value.",
-      "name": "fractalsql_session_config_set"
+      "name": "fractal_config_set"
     },
     {
       "description": "Reads one configuration key's EFFECTIVE value for THIS CONNECTION: the session's own override when it has one, otherwise the daemon-wide value. A secret's value is never returned -- the result is '<redacted>' (configured) or '<unset>' (not configured). The 'value' field is always a STRING, or null when the key is not set, whatever the value itself looks like. The operator-only keys (the enterprise tier's library, ledger and signature posture) are refused by name here, exactly as they are on the config-file surface: they are the operator's, and reading them back through a session is not how an operator reads them.",
-      "name": "fractalsql_session_config_get"
+      "name": "fractal_config_get"
     },
     {
       "description": "Drops every configuration override THIS CONNECTION holds, so it falls back to the daemon-wide values. Returns the number of overrides dropped.",
-      "name": "fractalsql_session_config_reset"
+      "name": "fractal_config_reset"
     },
     {
       "description": "Lists the configuration overrides THIS CONNECTION holds, as a JSON object. An empty object means the connection is running entirely on the daemon-wide configuration.",
-      "name": "fractalsql_session_config_list"
+      "name": "fractal_config_list"
     },
     {
       "description": "Lists every configuration key this engine knows, as a JSON array of {name, type, session_overridable} objects -- so a caller can discover which knobs a session may change instead of hard-coding the list.",
-      "name": "fractalsql_session_config_keys"
+      "name": "fractal_config_keys"
     }
   ],
-  "version": "2.0.12"
+  "version": "2.0.13"
 }

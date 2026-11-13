@@ -116,7 +116,7 @@ namespace fsqlmcp
             "otherwise); community deployments silently skip agent-side logging, which is why "
             "the MCP layer keeps its OWN per-call log independent of this ledger.",
             { Str( "entry_type", true, "provenance kind tag, e.g. 'custom_check'" ),
-              Str( "payload_json", false, "the provenance record, as a JSON document string", "{}" ) },
+              Str( "payload", true, "the provenance record, as a JSON document string" ) },
             [ &db, dormant ]( const Json& a, CallCtx& ctx )
             {
                 // Pass the session (so the destructive latch applies) and an actor
@@ -124,8 +124,8 @@ namespace fsqlmcp
                 Json raw = db.callScalarBind(
                     "SELECT fractal_audit_log(?, ?, CONNECTION_ID(), CONCAT(CURRENT_USER(), ' via ', ?))",
                     { SqlValue( a.at( "entry_type" ).get<std::string>() ),
-                      SqlValue( a.contains( "payload_json" ) && !a.at( "payload_json" ).is_null()
-                                  ? a.at( "payload_json" ).get<std::string>() : std::string( "{}" ) ),
+                      SqlValue( a.contains( "payload" ) && !a.at( "payload" ).is_null()
+                                  ? a.at( "payload" ).get<std::string>() : std::string( "{}" ) ),
                       SqlValue( ctx.clientKey ) } );
                 return Json{ { "rc", dormant( std::move( raw ), "fractal_audit_log" ) } };
             } ) );

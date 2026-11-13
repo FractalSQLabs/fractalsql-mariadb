@@ -81,7 +81,7 @@ namespace fsqlmcp
             "it fit. Returns {dim, n_corpus, best_fit, best_point, trace:{...}}. Pass a `seed` "
             "for a byte-stable, reproducible result; left out, the walk is non-deterministic.",
             { Vec( "query", true, "the query vector" ),
-              Int( "iterations", false, "SFS generations (1-10000; default 60)", 60 ),
+              Int( "iterations", false, "SFS generations (1-10000; default 30)", 30 ),
               Int( "population_size", false, "particles per generation (2-100000; default 50)", 50 ),
               Int( "diffusion_factor", false, "diffusion factor (1-32; default 2)", 2 ),
               Int( "seed", false, "walk seed; pin it for a reproducible result (default 0 = the "
@@ -90,7 +90,7 @@ namespace fsqlmcp
             {
                 return db.callScalarBind( "SELECT fractal_search_debug(?, ?, ?, ?, ?)",
                     { SqlValue( packVector( a.at( "query" ), "query" ) ),
-                      SqlValue( valueOr<int>( a, "iterations", 60 ) ),
+                      SqlValue( valueOr<int>( a, "iterations", 30 ) ),
                       SqlValue( valueOr<int>( a, "population_size", 50 ) ),
                       SqlValue( valueOr<int>( a, "diffusion_factor", 2 ) ),
                       SqlValue( valueOr<int>( a, "seed", 0 ) ) } );
@@ -248,10 +248,12 @@ namespace fsqlmcp
             "stall_threshold (0.15), repulsion_sigma (dimension-derived), "
             "repulsion_weight, max_shadows_considered (64), tail_buffer_cap "
             "(256, max 1024). Pass only the keys you want to change.",
-            { Int( "window_n", false, "", 5 ), Num( "stall_threshold", false, "", 0.15 ),
+            // No published defaults: the core owns these values, and an
+            // omitted key keeps the session's current value.
+            { Int( "window_n", false, "" ), Num( "stall_threshold", false, "" ),
               Num( "repulsion_sigma", false, "" ), Num( "repulsion_weight", false, "" ),
-              Int( "max_shadows_considered", false, "", 64 ),
-              Int( "tail_buffer_cap", false, "", 256 ) },
+              Int( "max_shadows_considered", false, "" ),
+              Int( "tail_buffer_cap", false, "" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 if( a.contains( "window_n" ) && !a.at( "window_n" ).is_null() )
@@ -319,7 +321,7 @@ namespace fsqlmcp
             "searches on this connection repel from.",
             { Int( "result_handle", true, "the doc_id/handle of the prior result" ),
               StrEnum( "kind", true, "'dwell', 'positive' or 'negative' (case-insensitive)" ),
-              Int( "dwell_ms", false, "required for kind=dwell; 0 (bare report) for positive/negative", 0 ) },
+              Int( "dwell_ms", false, "required for kind=dwell; 0 (bare report) for positive/negative" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 std::string lower = a.at( "kind" ).get<std::string>();

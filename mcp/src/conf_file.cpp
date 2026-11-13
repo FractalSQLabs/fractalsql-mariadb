@@ -106,11 +106,45 @@ namespace fsqlmcp::conffile
 
     std::map<std::string, std::string> readConf( const std::string& path )
     {
-        std::ifstream in( path );
+        std::ifstream in;
+#ifdef _WIN32
+        // writeConf replaces the file with MoveFileEx, and Windows can refuse an open of a file that was just
+        // replaced for a short while: a virus scanner or indexer holds the new file, or the rename has not settled.
+        // The writer already retries for that reason, so the reader must too, or a read that follows another
+        // process's write fails with "cannot read" although the file is there. A file that is really missing is
+        // reported at once.
+        for( int attempt = 0; attempt < 40; ++attempt )
+        {
+            in.open( path );
+            if( in ) break;
+            in.clear();
+            const DWORD attrs = GetFileAttributesA( path.c_str() );
+            if( attrs == INVALID_FILE_ATTRIBUTES )
+            {
+                const DWORD e = GetLastError();
+                if( e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ) break;
+            }
+            Sleep( 50 );
+        }
+#else
+        in.open( path );
+#endif
         if( !in )
+        {
+            std::string detail;
+#ifdef _WIN32
+            // Which error Windows gave, so a failure that survives the retries says why.
+            HANDLE h = CreateFileA( path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+            if( h == INVALID_HANDLE_VALUE )
+                detail = " (Windows error " + std::to_string( static_cast<unsigned long>( GetLastError() ) ) + ")";
+            else
+                CloseHandle( h );
+#endif
             throw ToolError( ErrorClass::Connectivity,
                 "cannot read the daemon's config file (fractalsqld.conf); the config "
-                "introspection tools need it. Set FSQLCTL_CONF to its path" );
+                "introspection tools need it. Set FSQLCTL_CONF to its path" + detail );
+        }
         std::map<std::string, std::string> conf;
         std::string line;
         while( std::getline( in, line ) )

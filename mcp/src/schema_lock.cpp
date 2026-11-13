@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
+#include <cstdlib>
 #include <stdexcept>
 #include "schema_lock.h"
 #include <openssl/evp.h>
@@ -45,6 +46,11 @@ namespace fsqlmcp
             };
         }
         const std::string canonical = sortKeysRecursive( projection ).dump( -1 );
+        if( const char* dump = std::getenv( "FSQL_MCP_DUMP_PROJECTION" ) )   // the canonical projection, readable: what the hash is taken over
+        {
+            std::ofstream out( dump );
+            out << sortKeysRecursive( projection ).dump( 1 ) << "\n";
+        }
 
         unsigned char digest[ EVP_MAX_MD_SIZE ]; unsigned int len = 0;
         EVP_MD_CTX* ctx = EVP_MD_CTX_new();

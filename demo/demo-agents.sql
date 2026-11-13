@@ -301,8 +301,8 @@ BEGIN
         SELECT 'fractal_agent_diverse_portfolios (Engine P): enterprise tier not loaded (fractal_optimize_portfolio_multimodal returned NULL). Set FRACTALSQL_ENTERPRISE_LIB and restart to activate. See docs/enterprise.md.' AS notice;
     ELSE
         CALL fractal_agent_diverse_portfolios(
-            '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.3, 0.8,
-            '{"portfolio": "agents-demo-diverse"}', 'sharpe', @r);
+            '[0.05, 0.1]', '[1.0, 0.0, 0.0, 1.0]', 1, 4, 0.15, 0.9,
+            '{"portfolio": "agents-demo-diverse"}', 'sharpe', NULL, @r);
         SELECT JSON_EXTRACT(@r, '$.optimization') AS optimization,
                JSON_VALUE(@r, '$.rationale') AS rationale;
     END IF;
@@ -312,7 +312,7 @@ CALL demo_diverse_portfolios_probe();
 DROP PROCEDURE demo_diverse_portfolios_probe;
 
 -- 14. fractal_agent_detour_classify (fleet-logistics). Vehicle 1 has a
--- deliberate detour. Trailing arg is boxcount_dim only, no k or
+-- deliberate detour. Trailing args are k then boxcount_dim, no
 -- id_col (see header).
 DROP TABLE IF EXISTS agents_demo_vehicles;
 CREATE TABLE agents_demo_vehicles (id INT PRIMARY KEY, baseline JSON, current_pos JSON);
@@ -350,15 +350,15 @@ CALL fractal_agent_detour_classify(
               SELECT t, 2 AS ord, (RAND()-0.5)*0.3 AS step FROM seq
           ) s
     ) c),
-    2, @r);
+    5, 2, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.trace_complexity') AS trace_complexity,
        JSON_VALUE(@r, '$.rationale') AS rationale;
 
 -- 15. fractal_agent_track_anomaly (maritime/cybersecurity). Vessel 1
--- has a deliberate track deviation. No trailing k/id_col at all (see
--- header), the call ends right after heading_series.
+-- has a deliberate track deviation. The trailing arg is k (no id_col,
+-- see header), the call ends right after heading_series and k.
 DROP TABLE IF EXISTS agents_demo_tracks;
 CREATE TABLE agents_demo_tracks (id INT PRIMARY KEY, baseline JSON, current_pos JSON);
 -- Same LATERAL-unavailable fix as agents_demo_vehicles above.
@@ -386,7 +386,7 @@ CALL fractal_agent_track_anomaly(
             SELECT t, (RAND()-0.5) * (CASE WHEN t BETWEEN 40 AND 60 THEN 0.35 ELSE 0.03 END) AS step FROM seq
         ) s
     ) c),
-    @r);
+    5, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id') AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.dfa_exponent') AS dfa_exponent,

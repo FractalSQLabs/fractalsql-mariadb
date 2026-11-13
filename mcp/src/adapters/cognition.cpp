@@ -77,12 +77,12 @@ namespace fsqlmcp
             "(embed_url/embed_model), returned as a plain JSON array of numbers (the MCP "
             "boundary normalizes the engine's JSON-array-string vector grammar). No automatic "
             "retry on provider timeouts.",
-            { Str( "text", true, "the text to embed" ) },
+            { Str( "input", true, "the text to embed" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 Json raw = db.callScalarBind( "SELECT fractal_embed(?, ?)",
                     { SqlValue( sessionId( db ) ),
-                      SqlValue( a.at( "text" ).get<std::string>() ) } );
+                      SqlValue( a.at( "input" ).get<std::string>() ) } );
                 if( raw.is_null() || ( raw.is_object() && raw.contains( "value" ) && raw.at( "value" ).is_null() ) )
                     throw ToolError( ErrorClass::Connectivity,
                         "fractal_embed returned NULL: the embed tier is not configured "
@@ -100,14 +100,17 @@ namespace fsqlmcp
             "Plain-text schema description of the named tables (or all visible tables when "
             "table_names is omitted) -- what a reasoning call sees as its own context. Exposed as "
             "a tool (not only the fractalsql://schema resource) so a client can audit exactly "
-            "what an LLM call will be told before running it. Two arguments: there is no "
-            "query_hint parameter in this engine.",
-            { StrArray( "table_names", false, "e.g. [\"orders\",\"customers\"]; omit for all visible tables" ) },
+            "what an LLM call will be told before running it. query_hint is accepted for forward "
+            "compatibility with future table-subset ranking and is not yet used.",
+            { StrArray( "table_names", false, "e.g. [\"orders\",\"customers\"]; omit for all visible tables" ),
+              Str( "query_hint", false, "optional natural-language hint steering which part of the schema to describe" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 const bool hasTables = a.contains( "table_names" ) && !a.at( "table_names" ).is_null();
                 if( hasTables )
                     vectors::stringArrayToJsonText( a.at( "table_names" ), "table_names" );   // element check
+                // query_hint is accepted for surface parity with the other
+                // engines and is not yet used by this engine's schema walk.
                 Json res = db.callProc( "fractal_schema_context",
                     { hasTables ? SqlValue( a.at( "table_names" ).dump() ) : SqlValue( nullptr ) },
                     { "out_context" }, MergeMode::Fields );

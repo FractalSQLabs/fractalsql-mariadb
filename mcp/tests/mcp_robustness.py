@@ -208,7 +208,7 @@ def _scalar_type(schema):
 
 
 # Admin tools whose execution rewrites the daemon's conf file and reloads it.
-_CONFIG_WRITERS = {"fractalsql_set_config", "fractalsql_configure_reasoning"}
+_CONFIG_WRITERS = {"fractal_daemon_config_set", "fractal_configure_reasoning"}
 
 
 def _tool_calls(s, tools, check):

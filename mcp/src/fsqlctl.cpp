@@ -45,7 +45,7 @@ namespace fsqlmcp
     {
         if( socketPath_.empty() )
             throw ToolError( ErrorClass::Connectivity,
-                "fractalsql_set_config/_get_config need the fractalsqld daemon: set FSQLCTL_SOCKET "
+                "fractal_daemon_config_set/_get need the fractalsqld daemon: set FSQLCTL_SOCKET "
                 "(a Unix socket path or a \\\\.\\pipe\\name) and FSQLCTL_KEY (path to the hex HMAC key file)" );
         if( keyPath_.empty() )
             throw ToolError( ErrorClass::Connectivity,

@@ -212,6 +212,7 @@ static void test_index_csv(void) {
     err[0] = '\0';
     check("index_csv: an empty index array is accepted as zero indices",
           parse_index_csv("", 0, &v, &n, err) && n == 0);
+    free(v); v = NULL;   /* a successful parse hands back an allocation, even for zero indices (found by the valgrind profile) */
 
     /* --- the rejections --- */
     err[0] = '\0';

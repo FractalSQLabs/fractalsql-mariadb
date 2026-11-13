@@ -147,6 +147,21 @@
     10.6 binaries can no longer forget to pass it and silently get
     10.6's binaries labeled and ported as if they were 11.4.
 
+.PARAMETER ClientDir
+    Path to the MariaDB Connector/C DEVELOPMENT files -- the tree holding
+    include\mysql\mysql.h, the client import library (lib\libmariadb.lib)
+    and the client DLL (lib\libmariadb.dll) that the MCP-server build
+    (gates 39, 40, 66, 68) and the C++ probe builds (gates 42, 43, 44)
+    link against. Defaults to -MdbDir, which is where the server .zip
+    distributions this repo's CI unpacks keep them.
+
+    Override it when the SERVER tree has no Connector/C development files:
+    an MSI install without the "Development components" feature ships no
+    import library at all, and the gates that need one fail at the link
+    step with LNK1181 ("cannot open input file 'libmariadb.lib'"). Any
+    MariaDB tree's client library works -- Connector/C is a client, not a
+    server component -- so pointing this at a sibling install is enough.
+
 .PARAMETER TimeoutMult
     Scales gate 06's respawn-poll budget. Default 1, auto-bumped to 3
     under -Asan/-Ubsan unless passed explicitly.
@@ -213,6 +228,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateSet('10.6', '10.11', '11.4', '12.3')][string]$MdbMajor,
     [int]$TimeoutMult = 1,
     [string]$VcpkgRoot = "",
+    [string]$ClientDir = "",
     [switch]$Asan,
     [switch]$Ubsan,
     [switch]$Fuzz,
@@ -245,6 +261,11 @@ if ($Coverage -and ($Asan -or $Ubsan)) {
 # should say so now, not three gates later as a confusing compile
 # failure.
 $MdbDir = (Resolve-Path -LiteralPath $MdbDir -ErrorAction Stop).Path
+
+# The MCP server and the C++ probe builds (gates 39, 40, 42, 43, 44, 66, 68) link MariaDB's client import library, which is NOT part of
+# every MariaDB tree: the server .zip distribution (what the CI and release workflows unpack into deps\mariadb\root) has it, and an MSI
+# install has it only when its "Development components" feature was installed. The client tree is resolved once, further down
+# (Resolve-MariaDbClient), and reported there -- so nothing is checked here.
 
 $ErrorActionPreference = "Stop"
 # Test fixtures load unsigned mock plugins and an unsigned mock enterprise core; the product defaults are exercised explicitly where tested.
@@ -361,6 +382,110 @@ function Resolve-OpenSslDir {
         throw "OpenSSL headers not found under $dir -- run: $root\vcpkg.exe install openssl:x64-windows-static (see scripts\windows\build.bat's own Prerequisites comment)"
     }
     return $dir
+}
+
+# The MariaDB Connector/C DEVELOPMENT files: the client headers, the client
+# import library and the client DLL. The MCP-server build (gates 39, 40,
+# 66, 68) and the C++ probe builds (gates 42, 43, 44) link against them.
+#
+# They normally live in the SAME tree as the server binaries: the server
+# .zip distributions this repo's CI unpacks (deps\mariadb\root) ship
+# include\mysql, lib\libmariadb.lib and lib\libmariadb.dll together, and
+# so does the "Development components" of an MSI install.
+#
+# An MSI install WITHOUT that feature has no import library at all. The
+# 10.6 MSI on a dev box carries only lib\mariadbclient.lib, which is a
+# DIFFERENT thing: it is the STATIC client library (an archive of object
+# code -- no .idata section, no import table), and there is no client DLL
+# next to it either. Linking "libmariadb.lib" against such a tree fails at
+# the link step with LNK1181, long after every other gate has passed.
+#
+# So the client tree is resolved ONCE, here, from an ordered list of
+# candidates, and the tree that is used is printed -- a build that links
+# a DIFFERENT MariaDB client's DLL than the server it talks to has to be
+# visible, not inferred.
+function Test-MariaDbImportLib([string]$path) {
+    # An import library carries an .idata section. The static client
+    # library does not, and linking it is a different exercise entirely
+    # (it drags in its own zlib/OpenSSL expectations), so it is NOT
+    # accepted as a stand-in for the import library.
+    try {
+        $bytes = [IO.File]::ReadAllBytes($path)
+        return [Text.Encoding]::ASCII.GetString($bytes).Contains('.idata')
+    }
+    catch { return $false }
+}
+
+function Resolve-MariaDbClient {
+    $candidates = @()
+    if ($ClientDir -ne "") {
+        $candidates += ,@{ Dir = (Resolve-Path -LiteralPath $ClientDir -ErrorAction Stop).Path; Why = 'the -ClientDir tree' }
+    }
+    $candidates += ,@{ Dir = $MdbDir; Why = 'the -MdbDir tree' }
+    # The repo's own vendored server tree -- the same layout CI unpacks
+    # into deps\mariadb\root, and the one mcp\scripts\windows\build.bat
+    # defaults to when MARIADB_DIR is unset.
+    $vendored = Join-Path $Here 'deps\mariadb\root'
+    if (Test-Path -LiteralPath $vendored) {
+        $candidates += ,@{ Dir = (Resolve-Path -LiteralPath $vendored).Path; Why = 'the repo''s vendored deps\mariadb\root tree' }
+    }
+    # Sibling MSI installs on this box. Connector/C is a CLIENT library:
+    # it links against any MariaDB server of a compatible vintage, so a
+    # client tree from a different install is a legitimate source.
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $root) { continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Filter 'MariaDB*' -ErrorAction SilentlyContinue)) {
+            $candidates += ,@{ Dir = $d.FullName; Why = "the sibling install $($d.FullName)" }
+        }
+    }
+
+    foreach ($c in $candidates) {
+        $inc = Join-Path $c.Dir 'include\mysql'
+        if (-not (Test-Path -LiteralPath (Join-Path $inc 'mysql.h'))) { continue }
+        $libName = $null
+        foreach ($n in @('libmariadb.lib', 'mariadbclient.lib')) {
+            $p = Join-Path $c.Dir "lib\$n"
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            # libmariadb.lib is always the import library; mariadbclient.lib
+            # is only accepted when it IS one (see Test-MariaDbImportLib).
+            if ($n -eq 'libmariadb.lib' -or (Test-MariaDbImportLib $p)) { $libName = $n; break }
+        }
+        if (-not $libName) { continue }
+        $dll = $null
+        foreach ($n in @('libmariadb.dll', 'mariadbclient.dll')) {
+            foreach ($sub in @('lib', 'bin')) {
+                $p = Join-Path $c.Dir "$sub\$n"
+                if (Test-Path -LiteralPath $p) { $dll = $p; break }
+            }
+            if ($dll) { break }
+        }
+        return [pscustomobject]@{
+            Dir     = $c.Dir
+            Why     = $c.Why
+            Inc     = $inc
+            LibName = $libName
+            LibPath = (Join-Path $c.Dir "lib\$libName")
+            Dll     = $dll
+        }
+    }
+    return $null
+}
+
+$script:MariaDbClient = Resolve-MariaDbClient
+if ($script:MariaDbClient) {
+    Write-Host "  MariaDB client (Connector/C): $($script:MariaDbClient.Dir)  [$($script:MariaDbClient.LibName)]"
+    if ($script:MariaDbClient.Dir -ne $MdbDir) {
+        Write-Host "    (taken from $($script:MariaDbClient.Why); the server tree under test is $MdbDir)"
+    }
+    if (-not $script:MariaDbClient.Dll) {
+        Write-Host "    WARNING: no client DLL (libmariadb.dll) in that tree. The probe gates stage it next to the probe binary and will not start without it."
+    }
+}
+else {
+    Write-Host "  WARNING: no MariaDB Connector/C import library (libmariadb.lib) found in any candidate tree."
+    Write-Host "           Gates 39, 40, 42, 43, 44, 66 and 68 link it and will fail at the link step (LNK1181)."
+    Write-Host "           Point -MdbDir at a server .zip distribution (deps\mariadb\root), pass -ClientDir <tree>,"
+    Write-Host "           or install the MSI's 'Development components' feature."
 }
 
 # dist\ subdir convention: -Asan/-Ubsan/-Coverage each get their own
@@ -798,7 +923,7 @@ function Start-Fsqd([string]$Tag) {
     )
     # The reasoning_plugin key rides in the conf, not only in the daemon's
     # boot environment, so the MCP gate's shutdown-drain phase can SWAP it
-    # live (the admin tier's fractalsql_set_config -> daemon RELOAD) to
+    # live (the admin tier's fractal_daemon_config_set -> daemon RELOAD) to
     # point the daemon at a deterministically-slow reasoning fixture, and
     # put it back afterwards. The boot-environment fallback still applies
     # for a key the conf does not carry, so writing it here changes
@@ -4971,7 +5096,31 @@ function Get-McpServerExe([string]$label) {
         'exit /b %ERRORLEVEL%'
     ))
     Remove-Item -LiteralPath $exe -ErrorAction SilentlyContinue
-    $out = & cmd /c "call $boot" 2>&1
+    # The MCP server build links the MariaDB client too. MARIADB_DIR is
+    # pointed at the RESOLVED client tree (not at $MdbDir) and the import
+    # library's name is passed in explicitly, because a tree that carries
+    # the client under the legacy mariadbclient.lib name would otherwise
+    # fail the link step with LNK1181.
+    $client = $script:MariaDbClient
+    if (-not $client) {
+        Skip "$label (no MariaDB Connector/C import library -- libmariadb.lib was not found in any candidate tree)"
+        return $null
+    }
+    $prevMdbDir  = $env:MARIADB_DIR
+    $prevLib     = $env:MARIADB_CLIENT_LIB
+    $prevDll     = $env:MARIADB_CLIENT_DLL
+    $env:MARIADB_DIR       = $client.Dir
+    $env:MARIADB_CLIENT_LIB = $client.LibName
+    if ($client.Dll) { $env:MARIADB_CLIENT_DLL = $client.Dll } else { Remove-Item Env:\MARIADB_CLIENT_DLL -ErrorAction SilentlyContinue }
+    try {
+        $out = & cmd /c "call $boot" 2>&1
+    }
+    finally {
+        foreach ($kv in @(@('MARIADB_DIR', $prevMdbDir), @('MARIADB_CLIENT_LIB', $prevLib), @('MARIADB_CLIENT_DLL', $prevDll))) {
+            if ($null -eq $kv[1] -or $kv[1] -eq '') { Remove-Item "Env:\$($kv[0])" -ErrorAction SilentlyContinue }
+            else { Set-Item -Path "Env:\$($kv[0])" -Value $kv[1] }
+        }
+    }
     if (Test-Path -LiteralPath $exe) { return $exe }
     if (($out -join "`n") -match 'not found|openssl tree|VCPKG_ROOT|no Visual Studio') {
         Skip "$label (no toolchain for the MCP server binary build -- install VS C++ + vcpkg openssl:x64-windows-static)"
@@ -5157,7 +5306,14 @@ function Invoke-McpProbe([string]$gate, [string]$label, [string]$src, [string[]]
     # against it would produce a binary that wants libssl-3-x64.dll at
     # runtime, which is not staged anywhere.
     $incPaths = @()
-    $mdbInc = Join-Path $MdbDir 'include\mysql'
+    $client = $script:MariaDbClient
+    if (-not $client) {
+        Fail "${gate} ${label}: no MariaDB Connector/C import library (libmariadb.lib) was found in any candidate tree, so the probe cannot be built. See the warning at the top of the run."
+        return
+    }
+    # The CLIENT tree's headers, not the server tree's: they are the ones
+    # that match the import library this probe links against.
+    $mdbInc = $client.Inc
     if (Test-Path $mdbInc) { $incPaths += $mdbInc }
     # The OpenSSL tree is resolved through the harness's own
     # Resolve-OpenSslDir, NOT through $env:VCPKG_ROOT directly. The
@@ -5178,7 +5334,7 @@ function Invoke-McpProbe([string]$gate, [string]$label, [string]$src, [string[]]
     $incPaths += (Join-Path $opensslDir 'include')
 
     $libPaths = @()
-    $mdbLib = Join-Path $MdbDir 'lib'
+    $mdbLib = Split-Path -Parent $client.LibPath
     if (Test-Path $mdbLib) { $libPaths += $mdbLib }
     $libPaths += (Join-Path $opensslDir 'lib')
 
@@ -5215,7 +5371,7 @@ function Invoke-McpProbe([string]$gate, [string]$label, [string]$src, [string[]]
     $cmd += "/Fo`"$outDir\\`""
     $cmd += '/link'
     foreach ($l in $libPaths) { $cmd += "/LIBPATH:`"$l`"" }
-    $cmd += 'libmariadb.lib', 'libssl.lib', 'libcrypto.lib'
+    $cmd += $client.LibName, 'libssl.lib', 'libcrypto.lib'
     $cmd += 'ws2_32.lib', 'advapi32.lib', 'crypt32.lib', 'user32.lib'
 
     $lines = @('@echo off')
@@ -5254,9 +5410,12 @@ function Invoke-McpProbe([string]$gate, [string]$label, [string]$src, [string[]]
     # reports a build failure for what is really a missing runtime
     # dependency. (OpenSSL is the STATIC tree here, so it needs no
     # staging -- only the MariaDB client is a runtime DLL.)
-    $mdbDll = Join-Path $MdbDir 'lib\libmariadb.dll'
-    if (Test-Path -LiteralPath $mdbDll) {
+    $mdbDll = $client.Dll
+    if ($mdbDll -and (Test-Path -LiteralPath $mdbDll)) {
         Copy-Item -LiteralPath $mdbDll -Destination (Split-Path -Parent $bin) -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        Write-Host "    WARNING: no MariaDB client DLL to stage next to $bin -- the probe will fail to start with a missing-libmariadb.dll error."
     }
 
     # The db probe reads the connection details from the same MARIADB_*
@@ -5747,7 +5906,7 @@ CALL fractal_agent_detour_classify(
     (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t SEPARATOR ','), ']') FROM (
         WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 200)
         SELECT t, ROUND(SIN(t/9.0) + t/200.0, 6) AS v FROM seq) q),
-    2, @r);
+    5, 2, @r);
 SELECT @r;
 '@) -join "`n"
     if ($l1 -match '"nearest_fleet_id" *: *"[123]"') { Pass "45 domain_agents: detour_classify (L) resolves the nearest fleet peer" } else { Fail "45 domain_agents: detour_classify nearest_fleet_id missing: $l1" }
@@ -5755,7 +5914,7 @@ SELECT @r;
     Test-G45Canary "detour_classify (L) classifies the detour through the reasoning tier" $l1
     Test-G45Error "detour_classify (L) rejects NULL identifier arguments" `
         "identifier arguments must not be NULL" `
-        "CALL fractal_agent_detour_classify(NULL,'emb','[1,0]','[0,1]','[1,2]',2,@r);"
+        "CALL fractal_agent_detour_classify(NULL,'emb','[1,0]','[0,1]','[1,2]',5,2,@r);"
     # NOTE the message asserted here is the SHARED scanner's
     # ("_fractalsql_scan_corpus: no non-NULL vector rows found"), not
     # detour_classify's own "no vehicle rows found". The engine's own
@@ -5767,7 +5926,7 @@ SELECT @r;
     # of this assertion -- a clean, specific error either way.
     Test-G45Error "detour_classify (L) raises a clean error when the fleet table has no rows" `
         "no non-NULL vector rows found" `
-        "CALL fractal_agent_detour_classify('g45_empty','emb','[1,0]','[0,1]','[1,2]',2,@r);"
+        "CALL fractal_agent_detour_classify('g45_empty','emb','[1,0]','[0,1]','[1,2]',5,2,@r);"
 
     # --- Engine M: fractal_agent_track_anomaly -----------------------
     # Trajectory search + DFA over the heading series + reason.
@@ -5777,7 +5936,7 @@ CALL fractal_agent_track_anomaly(
     (SELECT CONCAT('[', GROUP_CONCAT(v ORDER BY t SEPARATOR ','), ']') FROM (
         WITH RECURSIVE seq(t) AS (SELECT 1 UNION ALL SELECT t+1 FROM seq WHERE t < 120)
         SELECT t, ROUND(0.1 + 0.02*SIN(t/7.0), 6) AS v FROM seq) q),
-    @r);
+    5, @r);
 SELECT @r;
 '@) -join "`n"
     if ($m1 -match '"nearest_fleet_id" *: *"[123]"') { Pass "45 domain_agents: track_anomaly (M) resolves the nearest tracked peer" } else { Fail "45 domain_agents: track_anomaly nearest_fleet_id missing: $m1" }
@@ -5785,13 +5944,13 @@ SELECT @r;
     Test-G45Canary "track_anomaly (M) triages the track through the reasoning tier" $m1
     Test-G45Error "track_anomaly (M) rejects NULL identifier arguments" `
         "identifier arguments must not be NULL" `
-        "CALL fractal_agent_track_anomaly(NULL,'emb','[1,0]','[0,1]','[1,2,3]',@r);"
+        "CALL fractal_agent_track_anomaly(NULL,'emb','[1,0]','[0,1]','[1,2,3]',5,@r);"
     # Same shared-scanner-first ordering as detour_classify above: the
     # engine's own "no track rows found" is unreachable behind
     # _fractalsql_scan_corpus's error.
     Test-G45Error "track_anomaly (M) raises a clean error when the track table has no rows" `
         "no non-NULL vector rows found" `
-        "CALL fractal_agent_track_anomaly('g45_empty','emb','[1,0]','[0,1]','[1,2,3]',@r);"
+        "CALL fractal_agent_track_anomaly('g45_empty','emb','[1,0]','[0,1]','[1,2,3]',5,@r);"
 
     # --- Engine N: fractal_agent_network_coverage_alert --------------
     # No table arguments: the point cloud and the drift series are
@@ -5850,10 +6009,10 @@ SELECT @r;
     # even with no enterprise tier loaded.
     Test-G45Error "diverse_portfolios (P) rejects an unknown objective_mode" `
         "objective_mode must be 'sharpe' or 'pareto'" `
-        "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'nonsense',@r);"
+        "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'nonsense',NULL,@r);"
     Test-G45Error "diverse_portfolios (P) raises a clean error when the enterprise tier is not loaded" `
         "enterprise tier not loaded" `
-        "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'sharpe',@r);"
+        "CALL fractal_agent_diverse_portfolios('[0.05,0.1]','[1,0,0,1]',1,4,0.3,0.8,NULL,'sharpe',NULL,@r);"
 
     # --- the Universal Agent procedures ------------------------------
     # fractal_search_agent: embed -> scan -> Scout search -> refetch
@@ -6621,7 +6780,7 @@ function Gate-68-McpConformance {
         MCPC_GATE            = '68'
         MCPC_LOCK_DIR        = (Join-Path $script:Here 'mcp')
         MCPC_PASSTHROUGH_ENV = 'MARIADB_HOST,MARIADB_PORT,MARIADB_DATABASE,MARIADB_USER,MARIADB_PASSWORD,FSQLCTL_SOCKET,FSQLCTL_KEY,FSQLCTL_CONF'
-        MCPC_READ_TOOL       = 'fractalsql_get_version'
+        MCPC_READ_TOOL       = 'fractal_version'
         MCPC_READ_ARGS       = '{}'
         MCPC_STATE_TOOL      = 'fractal_diversify_enable'
         MCPC_STATE_ARGS      = '{}'
@@ -6659,6 +6818,11 @@ function Gate-68-McpConformance {
         # The driver's own failure lines, not the server's log: they say which
         # rule was broken and what was seen instead.
         ($out -split "`n" | Where-Object { $_ -match '^(FAIL|SKIP) ' } | Select-Object -First 12) | ForEach-Object { Write-Host "    $_" }
+        # The servers' own log lines are in the driver's log file, which is gone once the job ends: print the tail here.
+        if (Test-Path -LiteralPath $log) {
+            Write-Host "    --- tail of the conformance log"
+            Get-Content -LiteralPath $log -Tail 60 | ForEach-Object { Write-Host "    | $_" }
+        }
         Fail "68 mcp_conformance: the conformance driver reported failures (exit $rc; full log $log)"
     }
 }

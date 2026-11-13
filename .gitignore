@@ -62,3 +62,11 @@ fractalsql_bt_*
 /mcp/.mcp-build-mode
 
 .env
+
+# Test and fuzzing run artifacts
+fractalsql_ledger.dat*
+slow-unit-*
+crash-*
+timeout-*
+oom-*
+leak-*

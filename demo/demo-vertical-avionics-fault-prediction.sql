@@ -127,7 +127,7 @@ CALL fractal_agent_track_anomaly(
              SELECT t, SUM((MOD(x DIV 65536, 1000) - 500) / 1000.0
                            * CASE WHEN t BETWEEN 60 AND 90 THEN 0.35 ELSE 0.03 END)
                        OVER (ORDER BY t) AS s FROM n) w),
-    @r);
+    5, @r);
 SELECT JSON_VALUE(@r, '$.nearest_fleet_id')    AS nearest_fleet_id,
        JSON_VALUE(@r, '$.trajectory_distance') AS trajectory_distance,
        JSON_VALUE(@r, '$.dfa_exponent')        AS dfa_exponent,

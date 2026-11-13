@@ -247,9 +247,9 @@ def _proto_sweep(s, check):
     for method, params in (
             ("no/such/method", {}), ("", {}), ("tools/call", None), ("tools/call", {}),
             ("tools/call", {"name": None}), ("tools/call", {"name": 5}), ("tools/call", {"name": "no_such_tool"}),
-            ("tools/call", {"name": "fractalsql_get_version", "arguments": "x"}),
-            ("tools/call", {"name": "fractalsql_get_version", "arguments": [1]}),
-            ("tools/call", {"name": "fractalsql_get_version", "arguments": None}),
+            ("tools/call", {"name": "fractal_version", "arguments": "x"}),
+            ("tools/call", {"name": "fractal_version", "arguments": [1]}),
+            ("tools/call", {"name": "fractal_version", "arguments": None}),
             ("tools/call", {"name": "x" * 5000, "arguments": {}}),
             ("tools/list", {"cursor": "abc"}), ("tools/list", {"cursor": 5}), ("tools/list", None),
             ("completion/complete", {}), ("logging/setLevel", {"level": "debug"}), ("logging/setLevel", {"level": 5}),
@@ -292,7 +292,7 @@ def run(check, calls):
         if daemon:
             # The destructive tools act on the engine's own daemon; only replay them
             # against a Community install, where they refuse.
-            ver = json.dumps(s.call("tools/call", {"name": "fractalsql_get_version", "arguments": {}}, timeout=60))
+            ver = json.dumps(s.call("tools/call", {"name": "fractal_version", "arguments": {}}, timeout=60))
             _ALLOW_RISKY = "nterprise" not in ver
         listed = s.call("tools/list", {})
         tools = (listed.get("result") or {}).get("tools") or []
