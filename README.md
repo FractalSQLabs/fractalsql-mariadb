@@ -58,11 +58,13 @@ Depending on your role, you'll want to start in different places:
 ---
 
 ## 🧩 What's in the box
-
+<p align="center">
+  <img src="docs/fractalsql-mariadb-architecture.jpg" alt="FractalSQL for MariaDB diagram" width="900">
+</p>
 Four tiers of SQL-callable primitives, composable into agents with plain
 MariaDB stored procedures.
 
-- **Discovery**: diverse, mode-collapse-free retrieval: `fractal_search` (Sniper), `fractal_search_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`).
+- **Discovery**: diverse, mode-collapse-free retrieval: `fractal_sfs_converge` (Sniper), `fractal_search_explore` (Scout), `fractal_search_telemetry` (table-backed top-K, and its siblings `fractal_hybrid_clinical_search`/`fractal_search_trajectory`/`fractal_cross_modal_search`), and the indexed `fractal_search` (nearest rows of a table, through the native IVF index built with `fractal_index_create`, with every distance still exact).
 - **Cognition**: in-database LLM integration: `fractal_reason` (Bedrock, Azure OpenAI, Vertex, Ollama), `fractal_embed`, `fractal_text_to_sql`, plus an automatic **Vectorizer** pipeline (trigger-driven, MariaDB 11.7+ native `VECTOR(n)` aware).
 - **Agency**: self-correcting stored procedures: **sixteen installable agents** spanning anomaly triage, portfolio allocation, hybrid recall, route planning, deterioration triage, regime detection, and more. See the [Agent Reference](docs/api-agency.md).
 - **Analytics**: fractal/dimension primitives: `fractal_dimension_dfa`, `fractal_dimension_boxcount`, `fractal_optimize_portfolio`, and more.
@@ -129,6 +131,8 @@ what the hash chain can and can't prove.
 | 10.11 | ✓ | ✓ | ✓ | ✓ |
 | 11.4 LTS | ✓ | ✓ | ✓ | ✓ |
 | 12.3 LTS | ✓ | ✓ | ✓ | ✓ |
+
+macOS builds cover Apple Silicon and Intel.
 
 **License**: mixed, by component --
 

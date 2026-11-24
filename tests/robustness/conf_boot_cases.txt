@@ -106,7 +106,7 @@ reasoning_allow_plaintext = yes
 t2s_use_review = off
 enterprise_require_signature = 0
 end
-case key_file_with_spaces_and_newlines start key=aa bb\ncc dd
+case key_file_with_spaces_and_newlines start key=aa bb cc dd\nee ff 00 11\n22 33 44 55 66 77 88 99
 socket_path = @SOCK@
 hmac_key_file = @KEY@
 end
@@ -345,6 +345,18 @@ socket_path = @SOCK@
 hmac_key_file = @KEY@
 end
 case key_file_empty refuse key=
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_one_byte refuse key=aa
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_fifteen_bytes refuse key=00112233445566778899aabbccddee
+socket_path = @SOCK@
+hmac_key_file = @KEY@
+end
+case key_file_sixteen_bytes start key=00112233445566778899aabbccddeeff
 socket_path = @SOCK@
 hmac_key_file = @KEY@
 end

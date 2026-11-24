@@ -91,7 +91,7 @@ process for every connection:
 | `fractal_audit_unpack(blob)` | Decode a persisted QTL blob into its audit JSON. |
 
 `session_id` is `CONNECTION_ID()` by convention, the same convention as
-`fractal_reason`/`fractal_embed`/`fractal_search` — MariaDB UDFs have no
+`fractal_reason`/`fractal_embed`/`fractal_sfs_converge` — MariaDB UDFs have no
 ambient way to ask "what connection am I on," and each session needs its
 own in-memory context.
 
@@ -485,5 +485,30 @@ a plugin you built yourself.
 
 ---
 
+## Ledger retention
+
+By default the ledger *fades*: the Shadow weights decay as new feedback arrives, so recent decisions dominate. Set
+`FRACTALSQL_LEDGER_RETENTION=exact` in the environment of the process that hosts the ledger to keep every Shadow
+weight exactly as recorded instead. `fade` is the default; any other value is reported in the log and treated as
+`fade`. The mode is applied to each session's context the first time the enterprise library is in use for it.
+`exact` needs an enterprise library from core 2.0.28 or later (one that exports `fsql_ledger_set_retention`); against an
+older library the request is refused in the log and the ledger stays at `fade`, never silently.
+
 For enterprise editions, licensing, and support, contact
 **enterprise@fractalsqlabs.com**.
+
+## Destructive ledger operations are off by default
+
+`fractal_ledger_compact`, `fractal_ledger_reset_soft` and `fractal_ledger_reset_hard` destroy ledger records, so they refuse unless the
+operator enables them by setting this in the environment of the `mariadbd` process and `fractalsqld`:
+
+```sh
+FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE=1
+```
+
+Without it, a server nobody configured cannot have its audit chain destroyed by a statement from any account that may call the function.
+`fractal_ledger_flush` (sealing the ledgers into the chain) is routine and is not affected, and the one-way `fractal_lock_destructive`
+latch still wins when it is set. Each refusal is written to the server's log. Where the database has its own privileges, keep restricting
+who may execute these functions as well.
+
+This default changed: earlier builds allowed these operations unless the session was latched.

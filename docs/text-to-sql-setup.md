@@ -118,5 +118,5 @@ To secure your Text-to-SQL implementation:
 ## Known Limitations
 
 - **Distinct-value sampling**: the current version does not sample enum-like columns (e.g. `'Completed'` vs `'completed'`) to help the model with value normalization.
-- **Table ranking**: for very large schemas, all visible tables are described linearly; a `fractal_search`-based relevance ranking to subset which tables get described is not implemented.
+- **Table ranking**: for very large schemas, all visible tables are described linearly; a `fractal_sfs_converge`-based relevance ranking to subset which tables get described is not implemented.
 - **Schema caps**: `fractal_schema_context()` caps an explicit `table_names` list at 512 entries.

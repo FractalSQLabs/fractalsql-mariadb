@@ -14,6 +14,7 @@ services:
       target: fractalsqld
     environment:
       FSQL_HMAC_KEY: ${FSQL_HMAC_KEY:?set FSQL_HMAC_KEY (openssl rand -hex 32)}
+      FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE: "1"   # demo only: the ledger demos reset and compact the ledger; off by default
       FRACTALSQL_REASONING_PLUGIN: /usr/lib/fractalsql/fractalsql-reasoning-http.so
       FSQL_REASONING_HTTP_URL: http://${OLLAMA_HOST:-192.168.17.15}:11434/v1/chat/completions
       FSQL_REASONING_HTTP_ALLOW_PLAINTEXT: "1"
@@ -57,6 +58,7 @@ services:
       MARIADB_ROOT_PASSWORD: ${FSQL_DEMO_PASSWORD:?set FSQL_DEMO_PASSWORD in .env (see .env.example)}
       MARIADB_DATABASE: fractalsql_demo
       FSQL_HMAC_KEY: ${FSQL_HMAC_KEY:?set FSQL_HMAC_KEY (openssl rand -hex 32)}
+      FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE: "1"   # demo only: the ledger demos reset and compact the ledger; off by default
       FRACTALSQL_CONFIG: /etc/fractalsql/fractalsql.conf
     volumes:
       - fsqld_run:/run/fractalsql

@@ -148,8 +148,10 @@ MariaDB's UDF ABI has no error text on the runtime path, so a refusal has to
 hand the caller something it can read.
 
 A session may change the **tuning** keys -- `reasoning_model`, `embed_model`,
-`think`, `think_num_ctx`, `t2s_max_attempts`, `t2s_use_review` -- and nothing
-else. A refused key is refused **by name, with the reason**, and the key is
+`think`, `think_num_ctx`, `t2s_max_attempts`, `t2s_use_review`, `agent_use_index`,
+`agent_index_min_rows`, `agent_context_row_bytes` -- and nothing
+else. (The three `agent_*` keys are session settings only: they have no daemon-wide value, and
+`agent_use_index` is `off` until the session turns it `on` or `auto`; see [api-agency.md](api-agency.md).) A refused key is refused **by name, with the reason**, and the key is
 checked before the value -- so the refusal always names the key, never the
 value:
 
@@ -342,10 +344,10 @@ The shim classifies every function into three retry tiers (defined in
 `service/protocol/functions.def`) and handles transport failures itself,
 with no application-visible error unless every attempt fails:
 
-- **Pure functions (47)** — Vector, Dimension, Search, Portfolio, Topology
+- **Pure functions** — Vector, Dimension, Search, Portfolio, Topology
   and the read-only Analytics/ledger readers. Safe to just re-run: the
   shim retries up to 3 times across a fresh connection.
-- **Stateful functions (11)** — Diversify control, sessions, Feedback,
+- **Stateful functions** — Diversify control, sessions, Feedback,
   the Enterprise ledger/audit mutators. Re-executing could double-write
   the ledger or corrupt state, so the shim resends *once* with an
   idempotency token and the daemon *replays* the already-computed result
@@ -353,7 +355,7 @@ with no application-visible error unless every attempt fails:
   token is random per `mariadbd` boot and survives the reconnect (the
   cache is keyed by token, not by connection), so a single `mariadbd`
   restart can't cause a replay.
-- **Expensive functions (4)** — `fractal_reason`, `fractal_embed` and the
+- **Expensive functions** — `fractal_reason`, `fractal_embed` and the
   text-to-sql generation/review functions. Deterministic but costly:
   no automatic retry; the error surfaces and it's your call.
 

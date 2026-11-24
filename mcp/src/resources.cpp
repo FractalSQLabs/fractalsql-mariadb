@@ -102,7 +102,7 @@ namespace fsqlmcp
         "    {\"name\": \"fractal_agent_feedback_audit\", \"recipe\": \"Self-contained Diversify health-check cycle (warm -> isolate -> read back -> self-disable). No LLM step.\", \"vertical\": \"verifying the stateful search layer is alive\"}\n"
         "  ],\n"
         "  \"universal_agents\": [\n"
-        "    {\"name\": \"fractal_search_agent\", \"purpose\": \"Embed a query -> Scout-search a table -> reason over the matched rows' real content -> {answer, source_doc_ids, execution_time_ms}\"},\n"
+        "    {\"name\": \"fractal_search_agent\", \"purpose\": \"Embed a query -> Scout-search a table -> reason over the matched rows' real content -> {answer, source_row_ids, execution_time_ms}\"},\n"
         "    {\"name\": \"fractal_rag_agent\", \"purpose\": \"Lighter single-turn RAG sibling: embed -> Scout -> reason -> {answer} only\"},\n"
         "    {\"name\": \"fractal_sql_agent\", \"purpose\": \"Self-correcting NL->SQL with an explicit auto_execute flag (default off) -> {generated_sql, execution_status, result_json}\"},\n"
         "    {\"name\": \"fractal_agent_plan_explore\", \"purpose\": \"MCTS-style exploration of non-overlapping strategy trajectories -> one entry per branch\"},\n"

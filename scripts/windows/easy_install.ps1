@@ -1310,3 +1310,25 @@ Write-Step "Plugin directory (live @@plugin_dir): $script:PluginDir"
 
 Install-MsiPackage $target
 Invoke-Wizard $target
+
+# The MCP server shipped in the MSI is a database client: it links libmariadb,
+# and the connector travels with the machine, not with the package (libmariadb3
+# is the same declared dependency on Linux). Advisory only -- the server ships
+# with its own launcher (fractalsql-mcp.cmd), which reports exactly this if it
+# cannot resolve the connector.
+$connectorHome = [string]$env:MARIADB_CONNECTOR_HOME
+$connector = @(
+    (Join-Path $env:ProgramFiles 'MariaDB\MariaDB Connector C\lib\libmariadb.dll'),
+    (Join-Path $env:ProgramFiles 'MariaDB\MariaDB Connector C\libmariadb.dll')
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $connector -and $connectorHome) {
+    $connector = @(
+        (Join-Path $connectorHome 'libmariadb.dll'),
+        (Join-Path $connectorHome 'lib\libmariadb.dll')
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if ($connector) {
+    Write-Ok "MariaDB Connector/C found: $connector (the MCP server in fractalsql-mcp\ links it)"
+} else {
+    Write-Warn2 "MariaDB Connector/C was not found. The MCP server (fractalsql-mcp\fractalsql-mariadb-mcp.exe) links libmariadb, which the MSI deliberately does not ship (Linux packages declare it as libmariadb3 instead). Install it with 'choco install mariadb-connector-c' or from https://mariadb.com/downloads/connectors/, then start the server with fractalsql-mcp.cmd."
+}

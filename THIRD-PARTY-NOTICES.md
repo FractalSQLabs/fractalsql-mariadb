@@ -135,33 +135,31 @@ Copyright notice:
 
 -------------------------------------------------------------------------------
 
-### 5. OpenSSL
-Component: OpenSSL (libcrypto), used by fractalsqld (not by the shim).
-fractalsql_enterprise.c's ent_verify_signature() calls OpenSSL's EVP
-one-shot PureEdDSA verify to check the enterprise library's detached
-Ed25519 signature before loading it.
+### OpenSSL (MCP server, Windows build)
+Component: OpenSSL 3.x (`libssl`, `libcrypto`), used by the daemon
+`fractalsqld` (the enterprise library's Ed25519 signature verify), by the
+MCP server's HTTPS transport, and by the reasoning plugin through its
+statically linked libcurl. It is linked statically into the Windows daemon
+and MCP binaries (vcpkg `openssl:x64-windows-static`) and redistributed
+inside them. The Linux and macOS components link OpenSSL dynamically (the
+host's own library on Linux, Homebrew's `openssl@3` on macOS) and do not
+distribute it. The shim `fractalsql.dll` does not use it: its OpenSSL
+symbols resolve at plugin-load time from mariadbd's own libcrypto.
 Source: https://www.openssl.org/
-License: Apache License, Version 2.0 (OpenSSL 3.x)
-Version: the release's vcpkg openssl:x64-windows-static version, to be
-recorded at release.
+License: Apache License, Version 2.0
 
-Linkage by platform:
-  - Windows: statically linked into fractalsqld.exe and redistributed
-    inside that binary. The shim fractalsql.dll contains no OpenSSL code.
-  - Linux: fractalsqld links libcrypto dynamically from the system. No
-    OpenSSL code is redistributed in the packages.
-  - The shim (fractalsql.so) has no libcrypto dependency. Its OpenSSL
-    symbols resolve at plugin-load time from mariadbd's own libcrypto.
+Copyright 1995-<year of the release> The OpenSSL Project Authors. All Rights
+Reserved. Individual OpenSSL source files carry their own years and, in places,
+other holders (for example Oracle and Nokia); the header of each file in the
+OpenSSL source tree states the exact line. OpenSSL's own `LICENSE.txt` is the
+unmodified Apache License 2.0 text and the source tree has no separate NOTICE
+file.
 
-This product incorporates software developed by the OpenSSL Project
-for use in the OpenSSL Toolkit (https://www.openssl.org/).
-
-Copyright (c) The OpenSSL Project Authors. All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License"); you
-may not use this file except in compliance with the License. A copy
-of the License ships alongside this notice as the LICENSE file and is
-also available at https://www.apache.org/licenses/LICENSE-2.0.
+Licensed under the Apache License, Version 2.0; the full text of that licence
+ships with this distribution as the `fractalsqld\LICENSE` file. Unless required
+by applicable law or agreed to in writing, the software is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied.
 
 -------------------------------------------------------------------------------
 
@@ -179,7 +177,7 @@ components. Mirrors core's own THIRD-PARTY-NOTICES-COMMUNITY.md.
   "Efficient and Robust Approximate Nearest Neighbor Search Using
   Hierarchical Navigable Small World Graphs." Implemented in the vendored
   core for a planned persistent-index feature; not currently used by
-  `fractal_search`/`fractal_search_explore`, which do an exact brute-force
+  `fractal_sfs_converge`/`fractal_search_explore`, which do an exact brute-force
   scan (see `bench/README.md`).
 - **DFA (Detrended Fluctuation Analysis)** (`fractal_dimension_dfa`,
   `fractal_dimension_drift`): Peng, C.-K., Buldyrev, S. V., Havlin, S.,
@@ -254,3 +252,13 @@ components. Mirrors core's own THIRD-PARTY-NOTICES-COMMUNITY.md.
 - **nlohmann/json 3.11.3** (`mcp/vendor/json.hpp`): header-only JSON library
   used by the MCP server. MIT licence, Copyright 2013-2023 Niels Lohmann.
   Its licence text and SPDX tag are kept in the file.
+
+-------------------------------------------------------------------------------
+
+### Compiler runtime libraries (MCP server)
+The Linux MCP binaries link the GNU C++ standard library (`libstdc++`)
+statically; it is GPL-3.0-or-later WITH the GCC Runtime Library Exception
+(version 3.1), which permits distributing the compiled program under terms of
+its own choosing.
+
+-------------------------------------------------------------------------------

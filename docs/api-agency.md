@@ -26,7 +26,7 @@ down.
 > every agent that needs to read a caller-named table, or return more than
 > one scalar, is a plain SQL/PSM stored procedure with a trailing
 > `OUT p_result JSON` parameter, composing the C-level primitives
-> (`fractal_search`, `fractal_reason`, `fractal_dimension_*`, ...) via
+> (`fractal_sfs_converge`, `fractal_reason`, `fractal_dimension_*`, ...) via
 > ordinary `CALL`s and dynamic SQL, never a C-level "Universal Agent"
 > function. Every example on this page is `CALL fractal_agent_x(...args..., @result); SELECT @result;`,
 > never `SELECT fractal_agent_x(...) FROM ...`.
@@ -106,7 +106,7 @@ Pick by the problem shape, not by the function name.
 | "I want several genuinely different allocations to choose from, not just one" (enterprise-tier) | `diverse_portfolios` | multi-restart SFS + diverse-select → LLM rationale | ✓ |
 | "Rebalance, and compare to the nearest historical allocation?" | `rebalance_sibling` | optimizer + trajectory search → LLM rationale | ✓ |
 | "Which sub-agent should handle this incoming task?" | `route_task` | nearest-capability search + budget accounting → LLM rationale | ✓ |
-| "Which node should this workload land on (with vector refinement)?" | `schedule_workload` | `fractal_search` refine + nearest node → LLM rationale | ✓ |
+| "Which node should this workload land on (with vector refinement)?" | `schedule_workload` | `fractal_sfs_converge` refine + nearest node → LLM rationale | ✓ |
 | "Should I block this proposed action (is it near a known-bad state)?" | `outlier_intercept` | distance-to-bad-state safety barrier → LLM justification | ✓ |
 | "Triage a patient against a cohort + baseline→current drift" | `patient_deterioration_triage` | cohort search + trajectory drift → LLM triage | ✓ |
 | "Ask a natural-language question over my tables" | `data_analyst` | NL→SQL→execute → LLM analysis | ✓ |
@@ -248,6 +248,24 @@ task_emb, 1)` finds the nearest capability by real cosine distance. (2)
 `confidence` is derived from that real distance. (3) `p_budget -
 p_cost_per_route` is the accounted remaining budget. (4) `fractal_reason`
 explains the routing choice.
+
+**Searching through an index.** By default step (1) scans the table exactly. The session
+key `agent_use_index` takes three values: `off` (the default), `on` and `auto`. With `on`,
+and a [`fractal_index`](api-discovery.md) on the table and column, step (1) searches through
+the index instead. `auto` uses an index only when it is `ready`, was calibrated to its target recall, and the table has at
+least `agent_index_min_rows` rows (default 10000); otherwise it scans exactly. The calibration is made when the index is built, from a sample of the rows
+(`calibration_samples`, default 200, and `target_recall`, default 0.95, are build options), so the recall it reports is an estimate from a sample, not a
+measurement of the whole table. Every distance
+is still the exact cosine, and rows added after the build are scanned exactly. The setting is
+off by default because an index can, rarely, pick a different nearest row than the exact scan.
+`fractal_agent_outlier_intercept` (cosine), `fractal_agent_schedule_workload`,
+`fractal_agent_recall_hybrid` (the cohort becomes the `ids` option of `fractal_search`) and the
+two retrieval agents below use it the same way. Turn it on for the connection, and off again, with:
+
+```sql
+SELECT fractal_config_set('agent_use_index', 'on', CONNECTION_ID());
+SELECT fractal_config_reset(CONNECTION_ID());
+```
 
 **Example** (live-verified against a real Ollama endpoint):
 ```sql
@@ -532,7 +550,7 @@ SELECT @result;
 ### Schedule workload: `fractal_agent_schedule_workload`
 **Node placement with a vector-refinement step.**
 
-Like `route_task`, but with an extra `fractal_search` refinement pass
+Like `route_task`, but with an extra `fractal_sfs_converge` refinement pass
 `route_task` lacks. Use it when the task embedding itself should be
 locally optimized (Sniper Search) before matching against nodes.
 
@@ -543,13 +561,13 @@ locally optimized (Sniper Search) before matching against nodes.
 | `p_task_vec` | `JSON` | the workload's initial embedding |
 | `p_node_table` | `VARCHAR(128)` | table of candidate nodes |
 | `p_node_emb_col` | `VARCHAR(64)` | that table's embedding column |
-| `p_iterations` | `INT` | currently controls `fractal_search`'s `k`, not its SFS iteration count; see Notes |
+| `p_iterations` | `INT` | currently controls `fractal_sfs_converge`'s `k`, not its SFS iteration count; see Notes |
 | `p_population` | `INT` | SFS refinement population size |
 | `p_k` | `INT` | how many node matches to consider |
 | `p_context` | `TEXT` | optional label passed to the reason call (NULL ok) |
 | `p_result` (OUT) | `JSON` | `{"assigned_node":.., "confidence":.., "rationale":".."}` |
 
-**How it works.** (1) `fractal_search([task_vec], task_vec, iterations,
+**How it works.** (1) `fractal_sfs_converge([task_vec], task_vec, iterations,
 {"population_size": population, "diffusion_factor": 2})` refines the task
 embedding (Sniper Search: a single-row corpus containing just the task
 vector, converging toward its own locally optimal point). (2)
@@ -564,11 +582,11 @@ SELECT @result;
 ```
 
 **Notes.** In the current implementation, `p_iterations` is passed into
-`fractal_search`'s positional `k` argument, not into its `params.iterations`
+`fractal_sfs_converge`'s positional `k` argument, not into its `params.iterations`
 key, so it does not control the SFS refinement's generation count (that
-stays at `fractal_search`'s own default of 30 regardless of what you pass
+stays at `fractal_sfs_converge`'s own default of 30 regardless of what you pass
 here). Because the refinement corpus is always a single vector (the task
-embedding wrapped in its own one-row array), `fractal_search`'s `top_k`
+embedding wrapped in its own one-row array), `fractal_sfs_converge`'s `top_k`
 output can never have more than one entry no matter what `k` is asked for,
 so `p_iterations` currently has no observable effect on the result. Pass
 any positive integer; `p_population` (the SFS population size) is the
@@ -850,14 +868,24 @@ living in `sql/install_agents.sql` (five of them) and `sql/install_udf.sql`
 
 - `fractal_agent_trajectory_predict(table_name, vector_col, baseline_id, forecast_steps, risk_threshold, OUT result)`:
   baseline-to-current drift prediction against a table's own latest row.
-- `fractal_search_agent(query, table_name, vector_col, pop_size, iterations, OUT result)`:
-  embed the query, Scout-search a caller-named table's vector column,
-  reason over the matched rows' real content, and return the answer plus
-  `source_doc_ids` and a real (not hardcoded) `execution_time_ms`.
-- `fractal_rag_agent(query, table_name, vector_col, meta_filter, OUT answer)`:
+- `fractal_search_agent(query, table_name, vector_col, pop_size, iterations, meta_filter, OUT result)`:
+  embed the query, find the nearest rows of a caller-named table's vector column
+  (a Scout search, or `fractal_search` through an index when `agent_use_index` allows it),
+  reason over the matched rows' real content, and return
+  `{answer, source_row_ids, execution_time_ms, used_index, context_cut, reasoning_step_failed}`:
+  `source_row_ids` are the rows' primary keys (best first), `execution_time_ms` is a real
+  measurement, `used_index` says which path ran, and `context_cut` is `{"cells": N, "rows": M}`:
+  text cells cut to the session key `agent_context_row_bytes` (default 8192 characters; 0 means
+  no limit; a cut cell carries a marker saying how much was left out) and matched rows left out
+  by the 64-row cap. `meta_filter` is a flat JSON object `{"column": value, ...}` (or `NULL` for none):
+  only rows where every named column equals its value are searched, `null` matches NULL. A
+  filter that is not an object, names a column the table does not have, or matches no row is
+  an error, never ignored. Through an index the matching keys are passed to `fractal_search`
+  as its `ids` option (up to 100000 keys, otherwise the exact scan runs).
+- `fractal_rag_agent(query, table_name, vector_col, meta_filter, OUT result)`:
   a thin wrapper around `fractal_search_agent` with fixed
-  `pop_size=50`/`iterations=15`, returning only the answer text.
-  `meta_filter` is accepted for signature parity but currently unused.
+  `pop_size=50`/`iterations=15`, returning `{answer, source_row_ids, used_index, context_cut,
+  reasoning_step_failed}`. `meta_filter` works as it does for `fractal_search_agent`.
 - `fractal_sql_agent(question, table_names, max_retries, auto_execute, OUT generated_sql, OUT status, OUT result_json)`:
   self-correcting Text-to-SQL with an optional auto-execute step, the
   `auto_execute`-capable sibling of `fractal_text_to_sql`; see
@@ -885,7 +913,7 @@ Each of these six is a MariaDB stored PROCEDURE with a trailing `OUT`
 parameter, called with `CALL ...(..., @result); SELECT @result;`, the
 same convention as the 16 recipes above.
 
-- **Search**: `fractal_search`, `fractal_search_explore` (inline-corpus Scout mode),
+- **Search**: `fractal_sfs_converge`, `fractal_search_explore` (inline-corpus Scout mode),
   see [`api-discovery.md`](api-discovery.md).
 - **Table-backed search compositions**: `fractal_search_telemetry`,
   `fractal_hybrid_clinical_search`, `fractal_search_trajectory`,
@@ -893,7 +921,7 @@ same convention as the 16 recipes above.
   `fractal_search_agent`, `fractal_rag_agent`, `fractal_agent_plan_explore`:
   plain SQL/PSM stored procedures (`CALL ...(table, col, ..., @result)`)
   that scan a real table into an in-memory corpus and call the same core
-  search primitive `fractal_search` itself wraps. See
+  search primitive `fractal_sfs_converge` itself wraps. See
   `sql/install_udf.sql`'s own header comment near
   `CREATE PROCEDURE fractal_search_telemetry` for the full mechanism, and
   the Universal Agent procedures' own header comments in

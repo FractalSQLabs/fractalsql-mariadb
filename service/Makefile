@@ -30,17 +30,17 @@ CORE_ARCHIVE := $(firstword \
 
 # OpenSSL for fsqlctl.c's <openssl/hmac.h> use and for
 # fractalsql_enterprise.c's Ed25519 check (via ADAPTER_OBJS/CORE_ARCHIVE
-# below). Homebrew's openssl@3 is keg-only, so Darwin needs its own path.
-# FSQ_OPENSSL_DIR is overridable too: arm-Homebrew's openssl@3 keg has
-# no x86_64 objects, so an x86_64 cross build needs a separately built
-# tree (see release.yml's build-macos job) passed in explicitly.
+# below). Homebrew's openssl@3 is keg-only, so Darwin needs its own path, and it
+# is linked DYNAMICALLY there: Homebrew patches it and none of it is shipped. Each
+# architecture builds on its own runner, against that runner's own Homebrew.
+# FSQ_OPENSSL_DIR is overridable for a non-default prefix.
 ifeq ($(shell uname -s),Darwin)
   FSQ_OPENSSL_DIR ?= $(shell brew --prefix openssl@3 2>/dev/null)
   ifeq ($(strip $(FSQ_OPENSSL_DIR)),)
     $(error darwin build needs Homebrew's openssl@3: brew install openssl@3)
   endif
   FSQ_OPENSSL_CFLAGS  := -I$(FSQ_OPENSSL_DIR)/include
-  FSQ_OPENSSL_LDFLAGS := $(FSQ_OPENSSL_DIR)/lib/libcrypto.a
+  FSQ_OPENSSL_LDFLAGS := -L$(FSQ_OPENSSL_DIR)/lib -lcrypto
 else
   FSQ_OPENSSL_CFLAGS  :=
   FSQ_OPENSSL_LDFLAGS := -lcrypto
@@ -53,6 +53,17 @@ ADAPTER_OBJS := $(patsubst ../src/%.c,$(BUILD)/daemon/%.o,$(ADAPTER_SRCS))
 
 WARN    := -Wall -Wextra -Werror -std=gnu11
 CFLAGS  ?= -O2 -g
+
+# The precision contract (precision plan R3): the files that carry a
+# float path are built with contraction OFF and with the vectoriser
+# disabled, so the double accumulation in src/fsql_precision.h is
+# exactly what runs -- no fused multiply-add, no reassociated reduction.
+# The core archive is built with the same flags on the core's side.
+FSQ_PRECISION_FLAGS := -ffp-contract=off -fno-tree-vectorize
+# fractalsql_vector.c carries the SQL-visible distances/norms/dots;
+# fractalsql_index.c carries the verification cosine and the IVF maths.
+FSQ_PRECISION_FLAGS_fractalsql_vector := $(FSQ_PRECISION_FLAGS)
+FSQ_PRECISION_FLAGS_fractalsql_index  := $(FSQ_PRECISION_FLAGS)
 
 # make COVERAGE=1 / ASAN=1 / UBSAN=1: instrument the daemon (adapter
 # objects + fractalsqld.c), for build_test.sh
@@ -94,7 +105,7 @@ $(BUILD)/daemon:
 	mkdir -p $@
 
 $(BUILD)/daemon/%.o: ../src/%.c | $(BUILD)/daemon
-	$(CC) -w -O2 -g -fPIC $(FSQ_ARCH_FLAGS) $(MDB_CFLAGS) -I../include -I../src $(FSQ_OPENSSL_CFLAGS) $(FSQ_SAN_FLAGS) -c -o $@ $<
+	$(CC) -w -O2 -g -fPIC $(FSQ_ARCH_FLAGS) $(MDB_CFLAGS) -I../include -I../src $(FSQ_OPENSSL_CFLAGS) $(FSQ_SAN_FLAGS) $(FSQ_PRECISION_FLAGS_$*) -c -o $@ $<
 
 # The daemon TU is compiled to an object next to the adapter objects
 # instead of on the link line, so its -coverage .gcno lands in

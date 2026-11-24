@@ -66,9 +66,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM The exe links libmariadb.dll at runtime -- stage it next to the exe
-REM so dist\windows-mcp\ is runnable as-is (the mcp_smoke gate spawns
-REM the exe directly from that tree).
+REM The server looks for its two drift locks beside the executable when no path is configured, so
+REM a server started from this directory is checked against the locks this build was made with.
+REM The Windows build puts the executable in a separate output directory, so the locks are copied
+REM there: a stale copy left in the tree from an earlier build would make the server refuse to
+REM start (a schema-hash mismatch is a hard failure).
+for %%L in (.mcp-schema-lock .mcp-safety-annotations-lock) do (
+  if exist "%MCP_DIR%\%%L" copy /y "%MCP_DIR%\%%L" "%outdir%\%%L" >nul
+)
+
+REM The exe links libmariadb.dll at runtime: stage it next to the exe so
+REM dist\windows-mcp\ is runnable as-is (the mcp_smoke gate spawns the exe
+REM directly from that tree). This is a dev/test fixture -- the Linux dev
+REM box equivalent is libmariadb3 being installed on the machine. The MSI
+REM does NOT stage it: MariaDB Connector/C is an install prerequisite there,
+REM and the MSI's fractalsql-mcp.cmd resolves the installed connector.
 copy /Y "%MARIADB_CLIENT_DLL%" "%outdir%\" >nul
 if errorlevel 1 (
   echo could not stage "%MARIADB_CLIENT_DLL%" 1>&2

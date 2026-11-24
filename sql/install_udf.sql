@@ -15,9 +15,11 @@
 -- (10.6 / 10.11 / 11.4 LTS, 12.3 LTS): the UDF ABI is stable
 -- across them.
 
+DROP FUNCTION IF EXISTS fractal_sfs_converge;
+DROP FUNCTION IF EXISTS fractal_sfs_converge_debug;
 DROP FUNCTION IF EXISTS fractal_search;
 DROP FUNCTION IF EXISTS fractal_search_explore;
-DROP FUNCTION IF EXISTS fractal_search_debug;
+DROP FUNCTION IF EXISTS fractal_index_op;
 DROP FUNCTION IF EXISTS fractal_edition;
 DROP FUNCTION IF EXISTS fractal_version;
 DROP FUNCTION IF EXISTS fractal_dimension_dfa;
@@ -29,6 +31,7 @@ DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal_ex;
 DROP FUNCTION IF EXISTS fractal_optimize_portfolio_multimodal_pareto;
 DROP FUNCTION IF EXISTS fractal_change_point_detect;
 DROP FUNCTION IF EXISTS fractal_periodogram;
+DROP FUNCTION IF EXISTS fractal_chunk_text;
 DROP FUNCTION IF EXISTS fractal_spectrogram_entropy;
 DROP FUNCTION IF EXISTS fractal_state_fingerprint;
 DROP FUNCTION IF EXISTS fractal_cycle_detect;
@@ -81,9 +84,11 @@ DROP FUNCTION IF EXISTS _fractalsql_quote_ident;
 DROP FUNCTION IF EXISTS _fractalsql_quote_bare_table;
 DROP PROCEDURE IF EXISTS _fractalsql_vectorizer_enqueue;
 DROP PROCEDURE IF EXISTS fractal_vectorizer_create;
+DROP PROCEDURE IF EXISTS _fractalsql_vectorizer_register;
 DROP PROCEDURE IF EXISTS fractal_vectorizer_pause;
 DROP PROCEDURE IF EXISTS fractal_vectorizer_resume;
 DROP PROCEDURE IF EXISTS fractal_vectorizer_drop;
+DROP PROCEDURE IF EXISTS _fractalsql_vectorizer_ensure_indexes;
 DROP PROCEDURE IF EXISTS fractal_vectorizer_process_queue;
 DROP PROCEDURE IF EXISTS fractal_vectorizer_enqueue;
 DROP VIEW IF EXISTS fractal_vectorizer_status;
@@ -100,6 +105,18 @@ DROP PROCEDURE IF EXISTS fractal_cross_modal_search;
 DROP PROCEDURE IF EXISTS fractal_store_morphology;
 DROP PROCEDURE IF EXISTS fractal_mine_topology_negatives;
 DROP PROCEDURE IF EXISTS fractal_sql_agent;
+DROP PROCEDURE IF EXISTS fractal_index_create;
+DROP PROCEDURE IF EXISTS fractal_index_rebuild;
+DROP PROCEDURE IF EXISTS fractal_index_drop;
+DROP PROCEDURE IF EXISTS fractal_index_info;
+DROP PROCEDURE IF EXISTS fractal_index_list;
+DROP PROCEDURE IF EXISTS fractal_index_refresh;
+DROP PROCEDURE IF EXISTS fractal_index_ensure;
+DROP PROCEDURE IF EXISTS _fractalsql_exact_scan;
+DROP PROCEDURE IF EXISTS fractal_index_candidates;
+DROP PROCEDURE IF EXISTS _fractalsql_index_call;
+DROP PROCEDURE IF EXISTS _fractalsql_index_pk;
+DROP PROCEDURE IF EXISTS fractal_search;
 DROP FUNCTION IF EXISTS fractal_ledger_flush;
 DROP FUNCTION IF EXISTS fractal_ledger_load;
 DROP FUNCTION IF EXISTS fractal_ledger_compact;
@@ -112,26 +129,45 @@ DROP FUNCTION IF EXISTS fractal_ledger_verify;
 DROP FUNCTION IF EXISTS fractal_audit_log;
 DROP FUNCTION IF EXISTS fractal_audit_unpack;
 
--- fractal_search(vector_csv, query_csv, k, params) -> JSON STRING
+-- fractal_sfs_converge(vector_csv, query_csv, k, params) -> JSON STRING
+-- The table-free convergence function: it runs the Stochastic Fractal
+-- Search toward the query direction. It is NOT a retrieval function.
+-- It was RENAMED from fractal_search on 2026-11-18 and there is no
+-- alias: the old name is a tombstone (below) that refuses the call and
+-- names this one.
+CREATE FUNCTION fractal_sfs_converge    RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_search -> the OLD inline-corpus surface, retired.
+-- Calling it fails with a message that names fractal_sfs_converge (the
+-- convergence function) and the stored PROCEDURE fractal_search (the
+-- indexed search over a table -- see the index section at the end of
+-- this file).
 CREATE FUNCTION fractal_search    RETURNS STRING SONAME 'fractalsql.so';
 
 -- Scout Mode: fractal_search_explore(corpus, query, params) -> JSON STRING
 -- (walk=0 dispersion; result JSON carries the additive "population")
 CREATE FUNCTION fractal_search_explore   RETURNS STRING SONAME 'fractalsql.so';
 
--- fractal_search_debug(query_csv [, iterations [, population_size
+-- fractal_sfs_converge_debug(query_csv [, iterations [, population_size
 --                            [, diffusion_factor [, seed]]]]) -> JSON STRING
 -- The convergence view of the Stochastic Fractal Search: no corpus, no
 -- top-k -- just the walk's own trace on one query point, so an
 -- operator can see where the search landed and how well it fit. The
 -- result carries "best_point", "best_fit" and the debug "trace".
 -- "seed" is optional: pin it for a byte-stable, reproducible trace.
-CREATE FUNCTION fractal_search_debug   RETURNS STRING SONAME 'fractalsql.so';
+CREATE FUNCTION fractal_sfs_converge_debug   RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_index_op(request_json) -> JSON STRING
+-- The index plumbing: ONE stateful UDF carrying the whole protocol
+-- between the stored procedures (which do the table I/O) and the
+-- daemon (which does the IVF maths). See the index section at the end
+-- of this file for the request and response shapes.
+CREATE FUNCTION fractal_index_op   RETURNS STRING SONAME 'fractalsql.so';
 
 -- fractal_edition() -> 'Community'
 CREATE FUNCTION fractal_edition RETURNS STRING SONAME 'fractalsql.so';
 
--- fractal_version() -> '2.0.13'
+-- fractal_version() -> '2.0.14'
 CREATE FUNCTION fractal_version RETURNS STRING SONAME 'fractalsql.so';
 
 -- ---------------------------------------------------------------------
@@ -193,6 +229,11 @@ CREATE FUNCTION fractal_change_point_detect RETURNS STRING SONAME 'fractalsql.so
 -- sorted descending. out_freqs[i] is cycles/sample; 1/out_freqs[i] is
 -- samples/cycle. Requires n >= 4, max_peaks >= 1.
 CREATE FUNCTION fractal_periodogram RETURNS STRING SONAME 'fractalsql.so';
+
+-- fractal_chunk_text(text, size, overlap [, mode]) -> JSON STRING
+-- Splits text into chunks of at most size characters: [{"no","start","end","text"}], start and end are character offsets (end exclusive).
+-- mode is paragraph (default), sentence or fixed. Pure (no model): the same output on every FractalSQL host. NULL text gives NULL.
+CREATE FUNCTION fractal_chunk_text RETURNS STRING SONAME 'fractalsql.so';
 
 -- fractal_spectrogram_entropy(series_csv [, window [, hop [, max_frames]]])
 -- -> JSON STRING (a bare array of per-frame normalized spectral entropy
@@ -1714,75 +1755,25 @@ BEGIN
     CALL _fractalsql_vectorizer_enqueue(p_vectorizer_id, p_pk_value);
 END$$
 
--- fractal_vectorizer_create(source_table, text_col, embedding_col,
---   options, OUT id)
--- Starts keeping embedding_col in sync with text_col on source_table:
--- installs AFTER INSERT/UPDATE triggers that queue rows on write, and
--- immediately backfills any existing rows missing an embedding.
--- Requires source_table (a bare, unqualified name in the CURRENT
--- database: no cross-database vectorizer sources, chosen to match
--- MariaDB's own database/schema terminology) to have a single-column
--- PRIMARY KEY. Call
--- fractal_vectorizer_process_queue() on whatever schedule fits your
--- platform (OS cron, a MariaDB EVENT, your own app scheduler; this
--- installs no scheduler of its own) to actually generate the
--- embeddings.
---
--- SQL SECURITY INVOKER: see this section's header comment for why
--- this one function must NOT use MariaDB's own DEFINER default.
-CREATE PROCEDURE fractal_vectorizer_create(
+-- _fractalsql_vectorizer_register(source_table, text_col, embedding_col, options, pk_col, embedding_is_vector, OUT id)
+-- The registration step of fractal_vectorizer_create, after its checks: the registry row, the two sync triggers and the backfill. A stored
+-- procedure cannot call itself here (max_sp_recursion_depth is 0), so the chunking path of fractal_vectorizer_create registers the
+-- chunk table through this procedure too.
+CREATE PROCEDURE _fractalsql_vectorizer_register(
     IN  p_source_table  VARCHAR(128),
     IN  p_text_col      VARCHAR(64),
     IN  p_embedding_col VARCHAR(64),
     IN  p_options       JSON,
+    IN  v_pk_col        VARCHAR(64),
+    IN  v_embed_is_vec  BOOLEAN,
     OUT p_id            BIGINT
 )
 SQL SECURITY INVOKER
 
 BEGIN
-    DECLARE v_pk_col       VARCHAR(64);
-    DECLARE v_pk_count     INT DEFAULT 0;
-    DECLARE v_embed_type   VARCHAR(64) DEFAULT NULL;
-    DECLARE v_embed_is_vec BOOLEAN DEFAULT FALSE;
-    DECLARE v_found        INT DEFAULT 0;
     DECLARE v_dup_id       BIGINT DEFAULT NULL;
     DECLARE v_ins_trg      VARCHAR(80);
     DECLARE v_upd_trg      VARCHAR(80);
-
-    IF p_source_table LIKE '%.%' THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-            'fractal_vectorizer_create: schema-qualified source_table is not supported, pass a bare table name in the current database';
-    END IF;
-
-    SELECT COUNT(*) INTO v_found FROM information_schema.tables
-    WHERE table_schema = DATABASE() AND table_name = p_source_table AND table_type = 'BASE TABLE';
-    IF v_found = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-            'fractal_vectorizer_create: source_table not found in the current database';
-    END IF;
-
-    SELECT COUNT(*) INTO v_found FROM information_schema.columns
-    WHERE table_schema = DATABASE() AND table_name = p_source_table AND column_name = p_text_col;
-    IF v_found = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: text_col not found on source_table';
-    END IF;
-
-    SELECT COUNT(*), MIN(data_type) INTO v_found, v_embed_type FROM information_schema.columns
-    WHERE table_schema = DATABASE() AND table_name = p_source_table AND column_name = p_embedding_col;
-    IF v_found = 0 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: embedding_col not found on source_table';
-    END IF;
-    SET v_embed_is_vec = (LOWER(v_embed_type) = 'vector');
-
-    SELECT COUNT(*) INTO v_pk_count FROM information_schema.key_column_usage
-    WHERE table_schema = DATABASE() AND table_name = p_source_table AND constraint_name = 'PRIMARY';
-    IF v_pk_count <> 1 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
-            'fractal_vectorizer_create: source_table must have exactly one single-column PRIMARY KEY (composite and missing-PK tables are not supported)';
-    END IF;
-    SELECT column_name INTO v_pk_col FROM information_schema.key_column_usage
-    WHERE table_schema = DATABASE() AND table_name = p_source_table AND constraint_name = 'PRIMARY'
-    LIMIT 1;
 
     SELECT id INTO v_dup_id FROM fractal_vectorizers
     WHERE source_table = p_source_table AND text_col = p_text_col AND embedding_col = p_embedding_col;
@@ -1835,6 +1826,162 @@ BEGIN
     PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
     EXECUTE _fractalsql_vec_stmt;
     DEALLOCATE PREPARE _fractalsql_vec_stmt;
+END$$
+
+-- fractal_vectorizer_create(source_table, text_col, embedding_col,
+--   options, OUT id)
+-- Starts keeping embedding_col in sync with text_col on source_table:
+-- installs AFTER INSERT/UPDATE triggers that queue rows on write, and
+-- immediately backfills any existing rows missing an embedding.
+-- Requires source_table (a bare, unqualified name in the CURRENT
+-- database: no cross-database vectorizer sources, chosen to match
+-- MariaDB's own database/schema terminology) to have a single-column
+-- PRIMARY KEY. Call
+-- fractal_vectorizer_process_queue() on whatever schedule fits your
+-- platform (OS cron, a MariaDB EVENT, your own app scheduler; this
+-- installs no scheduler of its own) to actually generate the
+-- embeddings.
+--
+-- SQL SECURITY INVOKER: see this section's header comment for why
+-- this one function must NOT use MariaDB's own DEFINER default.
+CREATE PROCEDURE fractal_vectorizer_create(
+    IN  p_source_table  VARCHAR(128),
+    IN  p_text_col      VARCHAR(64),
+    IN  p_embedding_col VARCHAR(64),
+    IN  p_options       JSON,
+    OUT p_id            BIGINT
+)
+SQL SECURITY INVOKER
+
+fs_vc: BEGIN
+    DECLARE v_chunk_size   INT DEFAULT NULL;
+    DECLARE v_chunk_over   INT DEFAULT 0;
+    DECLARE v_chunk_mode   VARCHAR(16) DEFAULT 'paragraph';
+    DECLARE v_chunk_tbl    VARCHAR(128);
+    DECLARE v_pk_type      TEXT;
+    DECLARE v_emb_type     TEXT;
+    DECLARE v_inner        JSON;
+    DECLARE v_pk_col       VARCHAR(64);
+    DECLARE v_pk_count     INT DEFAULT 0;
+    DECLARE v_embed_type   VARCHAR(64) DEFAULT NULL;
+    DECLARE v_embed_is_vec BOOLEAN DEFAULT FALSE;
+    DECLARE v_found        INT DEFAULT 0;
+    DECLARE v_dup_id       BIGINT DEFAULT NULL;
+    DECLARE v_ins_trg      VARCHAR(80);
+    DECLARE v_upd_trg      VARCHAR(80);
+
+    IF p_source_table LIKE '%.%' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_vectorizer_create: schema-qualified source_table is not supported, pass a bare table name in the current database';
+    END IF;
+
+    SELECT COUNT(*) INTO v_found FROM information_schema.tables
+    WHERE table_schema = DATABASE() AND table_name = p_source_table AND table_type = 'BASE TABLE';
+    IF v_found = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_vectorizer_create: source_table not found in the current database';
+    END IF;
+
+    SELECT COUNT(*) INTO v_found FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = p_source_table AND column_name = p_text_col;
+    IF v_found = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: text_col not found on source_table';
+    END IF;
+
+    SET v_chunk_size = CAST(JSON_VALUE(p_options, '$.chunk_size') AS SIGNED);
+    SELECT COUNT(*), MIN(data_type) INTO v_found, v_embed_type FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = p_source_table AND column_name = p_embedding_col;
+    IF v_found = 0 AND v_chunk_size IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: embedding_col not found on source_table';
+    END IF;
+    SET v_embed_is_vec = (LOWER(v_embed_type) = 'vector');
+
+    SELECT COUNT(*) INTO v_pk_count FROM information_schema.key_column_usage
+    WHERE table_schema = DATABASE() AND table_name = p_source_table AND constraint_name = 'PRIMARY';
+    IF v_pk_count <> 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_vectorizer_create: source_table must have exactly one single-column PRIMARY KEY (composite and missing-PK tables are not supported)';
+    END IF;
+    SELECT column_name INTO v_pk_col FROM information_schema.key_column_usage
+    WHERE table_schema = DATABASE() AND table_name = p_source_table AND constraint_name = 'PRIMARY'
+    LIMIT 1;
+
+    -- Chunking: with options.chunk_size the long text is split into passages, the passages go into a chunk table
+    -- (id, parent_id, chunk_no, chunk_text, <embedding_col>) and the vectorizer is registered on THAT table: the chunks are what is
+    -- embedded. Existing rows are chunked now; afterwards the chunks follow the source row (insert, update of the text column,
+    -- delete) through three triggers on the source table.
+    IF v_chunk_size IS NOT NULL THEN
+        SET v_chunk_over = IFNULL(CAST(JSON_VALUE(p_options, '$.chunk_overlap') AS SIGNED), 0);
+        SET v_chunk_mode = IFNULL(JSON_VALUE(p_options, '$.chunk_mode'), 'paragraph');
+        IF v_chunk_size < 1 OR v_chunk_size > 100000 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: chunk_size must be 1..100000';
+        END IF;
+        IF v_chunk_over < 0 OR v_chunk_over >= v_chunk_size THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: chunk_overlap must be 0..chunk_size-1';
+        END IF;
+        IF v_chunk_mode NOT IN ('fixed', 'paragraph', 'sentence') THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_vectorizer_create: chunk_mode must be one of: fixed, paragraph, sentence';
+        END IF;
+        SET v_chunk_tbl = IFNULL(JSON_VALUE(p_options, '$.chunk_table'), CONCAT(p_source_table, '_chunks'));
+        SELECT MIN(column_type) INTO v_pk_type FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = p_source_table AND column_name = v_pk_col;
+        SELECT MIN(column_type) INTO v_emb_type FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = p_source_table AND column_name = p_embedding_col;
+        SET v_emb_type = IFNULL(v_emb_type, 'LONGTEXT');
+        SELECT COUNT(*) INTO v_found FROM information_schema.tables
+         WHERE table_schema = DATABASE() AND table_name = v_chunk_tbl;
+        IF v_found = 0 THEN
+            SET @_fractalsql_vec_ddl = CONCAT('CREATE TABLE ', _fractalsql_quote_ident(v_chunk_tbl),
+                ' (id BIGINT AUTO_INCREMENT PRIMARY KEY, parent_id ', v_pk_type, ' NOT NULL, chunk_no INT NOT NULL, chunk_text LONGTEXT NOT NULL, ',
+                _fractalsql_quote_ident(p_embedding_col), ' ', v_emb_type, ' NULL, KEY (parent_id))');
+            PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+            EXECUTE _fractalsql_vec_stmt;
+            DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        END IF;
+        SET @_fractalsql_vec_ddl = CONCAT('INSERT INTO ', _fractalsql_quote_ident(v_chunk_tbl), ' (parent_id, chunk_no, chunk_text) ',
+            'SELECT s.', _fractalsql_quote_ident(v_pk_col), ', j.no, j.txt FROM ', _fractalsql_quote_bare_table(p_source_table), ' s, ',
+            'JSON_TABLE(fractal_chunk_text(s.', _fractalsql_quote_ident(p_text_col), ', ', v_chunk_size, ', ', v_chunk_over, ', ',
+            QUOTE(v_chunk_mode), '), ''$[*]'' COLUMNS (no INT PATH ''$.no'', txt LONGTEXT PATH ''$.text'')) j ',
+            'WHERE s.', _fractalsql_quote_ident(p_text_col), ' IS NOT NULL ORDER BY s.', _fractalsql_quote_ident(v_pk_col), ', j.no');
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        SET v_inner = JSON_REMOVE(IFNULL(p_options, JSON_OBJECT()), '$.chunk_size', '$.chunk_overlap', '$.chunk_mode', '$.chunk_table');
+        SELECT COUNT(*) INTO v_found FROM information_schema.key_column_usage
+         WHERE table_schema = DATABASE() AND table_name = v_chunk_tbl AND constraint_name = 'PRIMARY';
+        SELECT (LOWER(MIN(data_type)) = 'vector') INTO v_embed_is_vec FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = v_chunk_tbl AND column_name = p_embedding_col;
+        CALL _fractalsql_vectorizer_register(v_chunk_tbl, 'chunk_text', p_embedding_col,
+            JSON_SET(v_inner, '$.chunk_source', p_source_table, '$.chunked_by_size', v_chunk_size), 'id', IFNULL(v_embed_is_vec, FALSE), p_id);
+        -- the three triggers, named after the chunking vectorizer (static SQL bodies: a trigger cannot run dynamic SQL)
+        SET @_fractalsql_vec_ddl = CONCAT('CREATE TRIGGER ', _fractalsql_quote_ident(CONCAT('_fsql_chunk_', p_id, '_ins')),
+            ' AFTER INSERT ON ', _fractalsql_quote_bare_table(p_source_table), ' FOR EACH ROW ',
+            'INSERT INTO ', _fractalsql_quote_ident(v_chunk_tbl), ' (parent_id, chunk_no, chunk_text) SELECT NEW.', _fractalsql_quote_ident(v_pk_col),
+            ', j.no, j.txt FROM JSON_TABLE(fractal_chunk_text(NEW.', _fractalsql_quote_ident(p_text_col), ', ', v_chunk_size, ', ', v_chunk_over, ', ',
+            QUOTE(v_chunk_mode), '), ''$[*]'' COLUMNS (no INT PATH ''$.no'', txt LONGTEXT PATH ''$.text'')) j');
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        SET @_fractalsql_vec_ddl = CONCAT('CREATE TRIGGER ', _fractalsql_quote_ident(CONCAT('_fsql_chunk_', p_id, '_upd')),
+            ' AFTER UPDATE ON ', _fractalsql_quote_bare_table(p_source_table), ' FOR EACH ROW ',
+            'IF NOT (OLD.', _fractalsql_quote_ident(p_text_col), ' <=> NEW.', _fractalsql_quote_ident(p_text_col), ') THEN ',
+            'DELETE FROM ', _fractalsql_quote_ident(v_chunk_tbl), ' WHERE parent_id = NEW.', _fractalsql_quote_ident(v_pk_col), '; ',
+            'INSERT INTO ', _fractalsql_quote_ident(v_chunk_tbl), ' (parent_id, chunk_no, chunk_text) SELECT NEW.', _fractalsql_quote_ident(v_pk_col),
+            ', j.no, j.txt FROM JSON_TABLE(fractal_chunk_text(NEW.', _fractalsql_quote_ident(p_text_col), ', ', v_chunk_size, ', ', v_chunk_over, ', ',
+            QUOTE(v_chunk_mode), '), ''$[*]'' COLUMNS (no INT PATH ''$.no'', txt LONGTEXT PATH ''$.text'')) j; END IF');
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        SET @_fractalsql_vec_ddl = CONCAT('CREATE TRIGGER ', _fractalsql_quote_ident(CONCAT('_fsql_chunk_', p_id, '_del')),
+            ' AFTER DELETE ON ', _fractalsql_quote_bare_table(p_source_table), ' FOR EACH ROW ',
+            'DELETE FROM ', _fractalsql_quote_ident(v_chunk_tbl), ' WHERE parent_id = OLD.', _fractalsql_quote_ident(v_pk_col));
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        LEAVE fs_vc;
+    END IF;
+
+    CALL _fractalsql_vectorizer_register(p_source_table, p_text_col, p_embedding_col, p_options, v_pk_col, v_embed_is_vec, p_id);
 END$$
 
 -- SQL SECURITY INVOKER: a plain UPDATE against fractal_vectorizers,
@@ -1916,10 +2063,61 @@ BEGIN
     EXECUTE _fractalsql_vec_stmt;
     DEALLOCATE PREPARE _fractalsql_vec_stmt;
 
+    -- a chunking vectorizer: stop chunking the source table too (the chunk table and its rows stay)
+    IF JSON_VALUE((SELECT options FROM fractal_vectorizers WHERE id = p_vectorizer_id), '$.chunk_source') IS NOT NULL THEN
+        SET @_fractalsql_vec_ddl = CONCAT('DROP TRIGGER IF EXISTS ', _fractalsql_quote_ident(CONCAT('_fsql_chunk_', p_vectorizer_id, '_ins')));
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        SET @_fractalsql_vec_ddl = CONCAT('DROP TRIGGER IF EXISTS ', _fractalsql_quote_ident(CONCAT('_fsql_chunk_', p_vectorizer_id, '_upd')));
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+        SET @_fractalsql_vec_ddl = CONCAT('DROP TRIGGER IF EXISTS ', _fractalsql_quote_ident(CONCAT('_fsql_chunk_', p_vectorizer_id, '_del')));
+        PREPARE _fractalsql_vec_stmt FROM @_fractalsql_vec_ddl;
+        EXECUTE _fractalsql_vec_stmt;
+        DEALLOCATE PREPARE _fractalsql_vec_stmt;
+    END IF;
+
     -- fractal_vectorizer_queue and fractal_vectorizer_rate_window rows
     -- cascade via their own REFERENCES fractal_vectorizers(id)
     -- ON DELETE CASCADE.
     DELETE FROM fractal_vectorizers WHERE id = p_vectorizer_id;
+END$$
+
+-- _fractalsql_vectorizer_ensure_indexes(token)
+-- The vectorizer option index_ensure (true; off by default): after a process_queue batch, the index that already exists on the
+-- embedding column of each vectorizer that finished rows in the batch is brought up to date with fractal_index_ensure (a few added
+-- rows are folded in, a large change rebuilds). It never creates an index, and a failure never fails the batch.
+CREATE PROCEDURE _fractalsql_vectorizer_ensure_indexes(IN p_token CHAR(36))
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_done  BOOLEAN DEFAULT FALSE;
+    DECLARE v_tbl   VARCHAR(128);
+    DECLARE v_col   VARCHAR(64);
+    DECLARE v_n     INT DEFAULT 0;
+    DECLARE v_r     LONGTEXT;
+    DECLARE cur2 CURSOR FOR
+        SELECT DISTINCT v.source_table, v.embedding_col
+          FROM fractal_vectorizer_queue q
+          JOIN fractal_vectorizers v ON v.id = q.vectorizer_id
+         WHERE q.claim_token = p_token AND q.status = 'done'
+           AND LOWER(IFNULL(JSON_VALUE(v.options, '$.index_ensure'), 'false')) IN ('true', '1');
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN GET DIAGNOSTICS CONDITION 1 @fractal_vectorizer_ensure_error = MESSAGE_TEXT; END;
+
+    SET @fractal_vectorizer_ensure_error = NULL;
+    OPEN cur2;
+    ens_loop: LOOP
+        FETCH cur2 INTO v_tbl, v_col;
+        IF v_done THEN LEAVE ens_loop; END IF;
+        SET v_n = 0;
+        SELECT COUNT(*) INTO v_n FROM fractal_index_meta WHERE tbl = v_tbl AND col = v_col;
+        IF v_n > 0 THEN
+            CALL fractal_index_ensure(v_tbl, v_col, NULL, v_r);
+        END IF;
+    END LOOP;
+    CLOSE cur2;
 END$$
 
 -- fractal_vectorizer_process_queue([batch_size], [stale_after_secs])
@@ -2217,6 +2415,8 @@ BEGIN
              OR (q.status = 'failed' AND q.updated_at < NOW() - INTERVAL 1 DAY));
     END;
 
+    IF v_n_processed > 0 THEN CALL _fractalsql_vectorizer_ensure_indexes(v_token); END IF;
+
     SELECT v_n_processed AS n_processed;
 END$$
 
@@ -2335,15 +2535,18 @@ BEGIN
         '{"iterations":15,"population_size":50,"diffusion_factor":2,',
         '"walk":0.5,"session_id":', CONNECTION_ID(), '}');
 
-    SET v_search_result = fractal_search(p_corpus_json, p_query_json, p_k, v_params);
+    SET v_search_result = fractal_sfs_converge(p_corpus_json, p_query_json, p_k, v_params);
 
     -- Remap corpus-position idx -> real doc_id via p_ids_json. A
     -- fractal_search result may legitimately carry fewer than k top_k
     -- entries if the corpus itself has fewer rows; JSON_TABLE just
     -- naturally yields fewer rows in that case, nothing special needed.
-    SELECT JSON_ARRAYAGG(JSON_OBJECT(
-             'doc_id', JSON_EXTRACT(p_ids_json, CONCAT('$[', t.idx, ']')),
-             'dist', t.dist))
+    -- The id is spliced in as a JSON literal: JSON_OBJECT stringifies a
+    -- JSON-typed argument and escapes it again, which mangled the caller's
+    -- own id text. JSON_EXTRACT's text form is already a JSON literal.
+    SELECT JSON_ARRAYAGG(JSON_MERGE_PRESERVE(
+             CONCAT('{"doc_id":', JSON_EXTRACT(p_ids_json, CONCAT('$[', t.idx, ']')), '}'),
+             JSON_OBJECT('dist', t.dist)))
       INTO p_result_json
     FROM JSON_TABLE(v_search_result, '$.top_k[*]' COLUMNS (
            idx  INT    PATH '$.idx',
@@ -2434,7 +2637,8 @@ BEGIN
         '       JSON_ARRAYAGG(', _fractalsql_quote_ident(v_pk_col), ' ORDER BY ', _fractalsql_quote_ident(v_pk_col), ') ',
         'INTO @_fractalsql_sc_corpus, @_fractalsql_sc_ids ',
         'FROM ', _fractalsql_quote_ident(p_table_name),
-        ' WHERE ', _fractalsql_quote_ident(p_vector_col), ' IS NOT NULL');
+        ' WHERE ', _fractalsql_quote_ident(p_vector_col), ' IS NOT NULL',
+        IF(@_fractalsql_scan_where IS NULL, '', CONCAT(' AND (', @_fractalsql_scan_where, ')')));
     SET @_fractalsql_sc_corpus = NULL;
     SET @_fractalsql_sc_ids    = NULL;
     PREPARE _fractalsql_sc_stmt FROM @_fractalsql_sc_sql;
@@ -2472,7 +2676,9 @@ CREATE PROCEDURE _fractalsql_fetch_row_context(
     IN  p_table_name    VARCHAR(128),
     IN  p_vector_col    VARCHAR(64),
     IN  p_doc_ids_json  JSON,
-    OUT p_context_json  JSON
+    OUT p_context_json  JSON,
+    OUT p_cells_cut     INT,
+    OUT p_rows_dropped  INT
 )
 SQL SECURITY INVOKER
 
@@ -2480,9 +2686,18 @@ BEGIN
     DECLARE v_pk_col    VARCHAR(64);
     DECLARE v_pk_count  INT DEFAULT 0;
     DECLARE v_cols      TEXT;
+    DECLARE v_cutexpr   TEXT;
     DECLARE v_id_list   TEXT DEFAULT '';
     DECLARE v_n         INT DEFAULT 0;
     DECLARE v_i         INT DEFAULT 0;
+    DECLARE v_lim       BIGINT DEFAULT 8192;
+    DECLARE v_cfg       VARCHAR(64);
+
+    SET p_cells_cut = 0;
+    SET p_rows_dropped = 0;
+    -- text cells longer than agent_context_row_bytes (a session key, default 8192 characters, 0 = no limit) are cut with a marker
+    SET v_cfg = NULLIF(fractal_config_get('agent_context_row_bytes', CONNECTION_ID()), '');
+    IF v_cfg IS NOT NULL AND v_cfg REGEXP '^[0-9]+$' THEN SET v_lim = CAST(v_cfg AS UNSIGNED); END IF;
 
     IF p_table_name LIKE '%.%' THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
@@ -2501,8 +2716,16 @@ BEGIN
 
     -- Build "'col1', col1, 'col2', col2, ..." for every column except the
     -- vector column, so the LLM-facing context never carries embeddings.
-    SELECT GROUP_CONCAT(CONCAT(QUOTE(column_name), ', ', _fractalsql_quote_ident(column_name)) SEPARATOR ', ')
-      INTO v_cols
+    SELECT GROUP_CONCAT(CONCAT(QUOTE(column_name), ', ',
+             IF(v_lim > 0 AND LOWER(data_type) IN ('char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext'),
+                CONCAT('CASE WHEN CHAR_LENGTH(', _fractalsql_quote_ident(column_name), ') > ', v_lim, ' THEN CONCAT(LEFT(',
+                       _fractalsql_quote_ident(column_name), ', ', v_lim, '), '' ...[cut: '', CHAR_LENGTH(',
+                       _fractalsql_quote_ident(column_name), ') - ', v_lim, ', '' more characters]'') ELSE ',
+                       _fractalsql_quote_ident(column_name), ' END'),
+                _fractalsql_quote_ident(column_name))) SEPARATOR ', '),
+           GROUP_CONCAT(IF(v_lim > 0 AND LOWER(data_type) IN ('char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext'),
+                CONCAT('COALESCE(CHAR_LENGTH(', _fractalsql_quote_ident(column_name), ') > ', v_lim, ', 0)'), NULL) SEPARATOR ' + ')
+      INTO v_cols, v_cutexpr
     FROM information_schema.columns
     WHERE table_schema = DATABASE() AND table_name = p_table_name AND column_name <> p_vector_col;
     IF v_cols IS NULL THEN
@@ -2514,22 +2737,34 @@ BEGIN
         SET p_context_json = JSON_ARRAY();
     ELSE
         SET v_n = JSON_LENGTH(p_doc_ids_json);
+        -- at most 64 rows go to the model; the rest are counted, not silently lost
+        IF v_n > 64 THEN SET p_rows_dropped = v_n - 64; SET v_n = 64; END IF;
         WHILE v_i < v_n DO
             IF v_i > 0 THEN
                 SET v_id_list = CONCAT(v_id_list, ', ');
             END IF;
-            SET v_id_list = CONCAT(v_id_list, QUOTE(JSON_UNQUOTE(JSON_EXTRACT(p_doc_ids_json, CONCAT('$[', v_i, ']')))));
+            -- JSON_VALUE, not JSON_UNQUOTE(JSON_EXTRACT(...)): on MariaDB 10.6
+            -- JSON_UNQUOTE cannot carry a character outside the BMP (a 4-byte
+            -- UTF-8 one -- an emoji, a rare CJK ideograph), so a row id
+            -- holding one was mangled here and the row the model then saw
+            -- was not the row the search had found. JSON_VALUE returns the
+            -- text as it is on every supported major; its one difference is
+            -- that an EMPTY string comes back as NULL, hence the IFNULL.
+            SET v_id_list = CONCAT(v_id_list, QUOTE(IFNULL(JSON_VALUE(p_doc_ids_json, CONCAT('$[', v_i, ']')), '')));
             SET v_i = v_i + 1;
         END WHILE;
 
+        SET @_fractalsql_frc_cut = 0;
         SET @_fractalsql_frc_sql = CONCAT(
-            'SELECT JSON_ARRAYAGG(JSON_OBJECT(', v_cols, ')) INTO @_fractalsql_frc_ctx FROM ',
+            'SELECT JSON_ARRAYAGG(JSON_OBJECT(', v_cols, ')), ', IFNULL(CONCAT('SUM(', v_cutexpr, ')'), '0'),
+            ' INTO @_fractalsql_frc_ctx, @_fractalsql_frc_cut FROM ',
             _fractalsql_quote_ident(p_table_name), ' WHERE ', _fractalsql_quote_ident(v_pk_col),
             ' IN (', v_id_list, ')');
         SET @_fractalsql_frc_ctx = NULL;
         PREPARE _fractalsql_frc_stmt FROM @_fractalsql_frc_sql;
         EXECUTE _fractalsql_frc_stmt;
         DEALLOCATE PREPARE _fractalsql_frc_stmt;
+        SET p_cells_cut = IFNULL(@_fractalsql_frc_cut, 0);
         -- The matched rows are DATA that the table's writers control.
         -- Wrap them in an envelope that labels their provenance and trust level
         -- and tells the reasoner not to follow anything inside them.
@@ -2616,9 +2851,9 @@ BEGIN
     SET v_is_vec = (LOWER(v_type) = 'vector');
 
     DROP TEMPORARY TABLE IF EXISTS _fractalsql_hcs_cohort_ids;
-    CREATE TEMPORARY TABLE _fractalsql_hcs_cohort_ids (id VARCHAR(255));
+    CREATE TEMPORARY TABLE _fractalsql_hcs_cohort_ids (id TEXT);
     INSERT INTO _fractalsql_hcs_cohort_ids (id)
-    SELECT jt.id FROM JSON_TABLE(p_doc_ids, '$[*]' COLUMNS (id VARCHAR(255) PATH '$')) jt;
+    SELECT jt.id FROM JSON_TABLE(p_doc_ids, '$[*]' COLUMNS (id TEXT PATH '$')) jt;
 
     -- vector_col is prefixed "t." explicitly (rather than reusing a
     -- pre-built expression string) since it needs the table alias only
@@ -2945,6 +3180,1355 @@ CREATE FUNCTION fractal_audit_log RETURNS INTEGER SONAME 'fractalsql.so';
 -- storage, so this is fully, honestly complete: it only needs the
 -- enterprise library loaded.
 CREATE FUNCTION fractal_audit_unpack RETURNS STRING SONAME 'fractalsql.so';
+
+-- ====================================================================
+-- THE INDEX: fractal_index_create / _rebuild / _drop / _info /
+-- _candidates, and the INDEXED fractal_search.
+-- ====================================================================
+--
+-- This host is split-process: the shim (fractalsql.so) runs inside
+-- mariadbd and forwards every UDF call to the fractalsqld daemon over
+-- the local socket; the daemon is where the maths runs. The daemon has
+-- NO database access, so the TABLE I/O lives here, in stored procedures:
+--
+--   fractal_index_create(table, column [, options])  reads the table in
+--       batches by primary-key range, trains the model in the daemon,
+--       encodes every row, and writes the cells into InnoDB.
+--   fractal_search(table, column, query, k [, options]) probes the
+--       cells in the daemon, fetches the candidates' rows from the base
+--       table, and VERIFIES every one of them with the shared
+--       double-precision cosine. The index never returns an approximate
+--       distance as an answer.
+--
+-- The plumbing UDF fractal_index_op(request_json) is the whole daemon
+-- protocol (one JSON request in, one JSON response out);
+-- _fractalsql_index_call() wraps it and turns a reported error into a
+-- SQL error carrying that exact text.
+--
+-- The storage (created on first use):
+--   fractal_index_meta   one row per index: the table/column it covers,
+--                        the model blob, the row count and the id
+--                        watermark, the generation pointer, the options.
+--   fractal_index_cells  one row per (index, generation, cell): the row
+--                        ids (a CSV of integers) and the codes (a hex
+--                        string).
+--   fractal_index_stage  the encode pass's scratch space (one row per
+--                        indexed row), emptied after every build.
+--
+-- A build writes a NEW generation and moves the generation pointer in
+-- one statement, so a reader only ever sees a complete generation (the
+-- previous generation keeps serving until the pointer moves, and its
+-- cells are dropped after that).
+-- Rows added after the build (id above the watermark) are scanned
+-- exactly (the delta); deleted rows are dropped by the verification
+-- step; a changed vector is only picked up by a rebuild (info reports
+-- "stale").
+--
+-- Indexed search does NOT apply Diversify repulsion: it is a plain
+-- nearest-neighbour retrieval over the verified shortlist. Use
+-- fractal_search_telemetry for the stateful, diversity-aware path.
+
+DELIMITER $$
+
+-- The plumbing wrapper: one call into the daemon, with the daemon's
+-- reported error raised as a SQL error.
+CREATE PROCEDURE _fractalsql_index_call(
+    IN  p_request  LONGTEXT,
+    OUT p_response LONGTEXT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_resp LONGTEXT;
+    DECLARE v_err  TEXT;
+
+    SET v_resp = fractal_index_op(p_request);
+    IF v_resp IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractalsql: the index plumbing call failed (the daemon refused it)';
+    END IF;
+    SET v_err = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.error'));
+    IF v_err IS NOT NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_err;
+    END IF;
+    SET p_response = v_resp;
+END$$
+
+-- The table's single-column PRIMARY KEY: the index's stable row id.
+-- A composite or a non-numeric key is refused (the index needs an
+-- ordered, storable id).
+CREATE PROCEDURE _fractalsql_index_pk(
+    IN  p_table_name VARCHAR(128),
+    OUT p_pk_col     VARCHAR(64)
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_pk_count INT DEFAULT 0;
+    DECLARE v_pk_type  VARCHAR(64);
+
+    IF p_table_name LIKE '%.%' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            '_fractalsql_index_pk: schema-qualified table names are not supported; pass a bare table name in the current database';
+    END IF;
+
+    SELECT COUNT(*) INTO v_pk_count
+      FROM information_schema.key_column_usage
+     WHERE table_schema = DATABASE() AND table_name = p_table_name
+       AND constraint_name = 'PRIMARY';
+    IF v_pk_count <> 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            '_fractalsql_index_pk: the table must have exactly one single-column PRIMARY KEY';
+    END IF;
+
+    SELECT k.column_name, c.data_type
+      INTO p_pk_col, v_pk_type
+      FROM information_schema.key_column_usage k
+      JOIN information_schema.columns c
+        ON c.table_schema = k.table_schema AND c.table_name = k.table_name
+       AND c.column_name = k.column_name
+     WHERE k.table_schema = DATABASE() AND k.table_name = p_table_name
+       AND k.constraint_name = 'PRIMARY'
+     LIMIT 1;
+
+    IF p_pk_col IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            '_fractalsql_index_pk: the primary key column could not be resolved';
+    END IF;
+    IF LOWER(v_pk_type) NOT IN ('bigint','int','integer','smallint','mediumint','tinyint','unsigned','serial') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            '_fractalsql_index_pk: the index needs a single-column NUMERIC primary key (the stable row id)';
+    END IF;
+END$$
+
+-- fractal_index_create(table_name, vector_col [, options_json]) -> JSON
+--
+-- options_json keys (the same names every host uses):
+--   name             the index name (default: <table>_<column>)
+--   vector_format    INT8 (default) | INT4 | FP16 | FP32
+--   nlist            0 (default: sqrt(rows)) .. 4096
+--   pca_dim          0 (default: dim/4) .. dim  (INT8/INT4 only)
+--   iters            0 (default: 6) .. 100
+--   sample           0 (default: 50000) .. 1000000
+--   seed             0 (default: 1)
+--
+-- The internal key "_rebuild" is set by fractal_index_rebuild: it lets
+-- the build write a NEW generation over an existing index instead of
+-- refusing.
+CREATE PROCEDURE fractal_index_create(
+    IN  p_table   VARCHAR(128),
+    IN  p_col     VARCHAR(64),
+    IN  p_options LONGTEXT,
+    OUT p_result  LONGTEXT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_pk        VARCHAR(64);
+    DECLARE v_type      VARCHAR(64);
+    DECLARE v_is_vec    BOOLEAN DEFAULT FALSE;
+    DECLARE v_col_expr  TEXT;
+    DECLARE v_dim       INT DEFAULT 0;
+    DECLARE v_name      VARCHAR(64);
+    DECLARE v_fmt       VARCHAR(8) DEFAULT 'INT8';
+    DECLARE v_nlist     INT DEFAULT 0;
+    DECLARE v_pca       INT DEFAULT 0;
+    DECLARE v_iters     INT DEFAULT 0;
+    DECLARE v_sample    INT DEFAULT 0;
+    DECLARE v_seed      BIGINT DEFAULT 1;
+    DECLARE v_token     VARCHAR(32);
+    DECLARE v_resp      LONGTEXT;
+    DECLARE v_req       LONGTEXT;
+    DECLARE v_model     LONGTEXT;
+    DECLARE v_mtoken    VARCHAR(32);
+    DECLARE v_codebytes INT DEFAULT 0;
+    DECLARE v_nlist_out INT DEFAULT 0;
+    DECLARE v_pca_out   INT DEFAULT 0;
+    DECLARE v_rows      BIGINT DEFAULT 0;
+    DECLARE v_maxid     BIGINT DEFAULT 0;
+    DECLARE v_last      BIGINT DEFAULT 0;
+    DECLARE v_batch     INT DEFAULT 256;
+    DECLARE v_gcml      BIGINT UNSIGNED;
+    DECLARE v_nbatch    INT DEFAULT 0;
+    DECLARE v_exists    INT DEFAULT 0;
+    DECLARE v_gen       INT DEFAULT 1;
+    DECLARE v_oldgen    INT DEFAULT 0;
+    DECLARE v_rebuild   INT DEFAULT 0;
+    DECLARE v_opts      LONGTEXT DEFAULT '{}';
+    DECLARE v_cal       LONGTEXT DEFAULT NULL;
+    DECLARE v_calresp   LONGTEXT DEFAULT NULL;
+    DECLARE v_calsamp   INT DEFAULT 200;
+    DECLARE v_caltarget DOUBLE DEFAULT 0.95;
+    DECLARE v_nprobe_new INT DEFAULT 16;
+
+    IF p_options IS NULL OR p_options = '' THEN SET v_opts = '{}'; ELSE SET v_opts = p_options; END IF;
+
+    -- the name, the format and the knobs
+    SET v_fmt    = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.vector_format')), 'INT8');
+    SET v_nlist  = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.nlist')) AS SIGNED), 0);
+    SET v_pca    = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.pca_dim')) AS SIGNED), 0);
+    SET v_iters  = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.iters')) AS SIGNED), 0);
+    SET v_sample = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.sample')) AS SIGNED), 0);
+    SET v_seed   = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.seed')) AS SIGNED), 1);
+    SET v_calsamp   = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.calibration_samples')) AS SIGNED), 200);
+    SET v_caltarget = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.target_recall')) AS DECIMAL(5,4)), 0.95);
+    SET v_name   = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.name')),
+                            CONCAT(LEFT(p_table, 24), '_', LEFT(p_col, 24)));
+    SET v_rebuild = CASE WHEN LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$._rebuild')), 'false')) = 'true'
+                          THEN 1 ELSE 0 END;
+
+    IF v_fmt NOT IN ('INT8','INT4','FP16','FP32') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: vector_format must be INT8, INT4, FP16 or FP32';
+    END IF;
+    IF v_nlist < 0 OR v_nlist > 4096 OR v_iters < 0 OR v_iters > 100
+       OR v_sample < 0 OR v_sample > 1000000 OR v_pca < 0 OR v_seed < 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: nlist must be 0..4096, iters 0..100, sample 0..1000000, pca_dim >= 0, seed >= 0';
+    END IF;
+
+    CALL _fractalsql_index_pk(p_table, v_pk);
+
+    -- the vector column, and how to read it (MariaDB's own VECTOR(n)
+    -- type needs VEC_TOTEXT to become text)
+    SELECT MIN(data_type) INTO v_type FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = p_table AND column_name = p_col;
+    IF v_type IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: the vector column was not found on the table';
+    END IF;
+    SET v_is_vec = (LOWER(v_type) = 'vector');
+    SET v_col_expr = IF(v_is_vec,
+        CONCAT('VEC_TOTEXT(', _fractalsql_quote_ident(p_col), ')'),
+        _fractalsql_quote_ident(p_col));
+
+    -- the storage
+    CREATE TABLE IF NOT EXISTS fractal_index_meta (
+        name           VARCHAR(64)  NOT NULL PRIMARY KEY,
+        tbl            VARCHAR(128) NOT NULL,
+        col            VARCHAR(64)  NOT NULL,
+        id_col         VARCHAR(64)  NOT NULL,
+        dim            INT          NOT NULL,
+        format         VARCHAR(8)   NOT NULL,
+        nlist          INT          NOT NULL,
+        pca_dim        INT          NOT NULL,
+        row_count     BIGINT       NOT NULL,
+        max_id         BIGINT       NOT NULL,
+        model          LONGBLOB     NOT NULL,
+        seed           BIGINT       NOT NULL,
+        generation     INT          NOT NULL,
+        format_version INT          NOT NULL,
+        options        LONGTEXT     NOT NULL,
+        built_at       VARCHAR(40)  NOT NULL,
+        nprobe_default INT          NOT NULL DEFAULT 16,
+        calib          LONGTEXT     NULL
+    ) ENGINE=InnoDB;
+    -- an earlier install has no calibration column
+    ALTER TABLE fractal_index_meta ADD COLUMN IF NOT EXISTS calib LONGTEXT NULL;
+
+    CREATE TABLE IF NOT EXISTS fractal_index_cells (
+        name       VARCHAR(64) NOT NULL,
+        generation INT         NOT NULL,
+        cell       INT         NOT NULL,
+        n          INT         NOT NULL,
+        ids        LONGTEXT    NOT NULL,
+        codes      LONGTEXT    NOT NULL,
+        PRIMARY KEY (name, generation, cell)
+    ) ENGINE=InnoDB;
+
+    CREATE TABLE IF NOT EXISTS fractal_index_stage (
+        name       VARCHAR(64)  NOT NULL,
+        generation INT          NOT NULL,
+        cell       INT          NOT NULL,
+        rid        BIGINT       NOT NULL,
+        code       LONGTEXT     NOT NULL,
+        KEY k_stage (name, generation, cell)
+    ) ENGINE=InnoDB;
+    -- an earlier install kept the code as VARCHAR(4096), which cut the codes of a wide FP32 vector (over 512 dimensions) short
+    ALTER TABLE fractal_index_stage MODIFY code LONGTEXT NOT NULL;
+
+    SELECT COUNT(*), COALESCE(MAX(generation), 0) INTO v_exists, v_oldgen
+      FROM fractal_index_meta WHERE name = v_name;
+    IF v_exists > 0 AND v_rebuild = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: an index with that name already exists (use fractal_index_rebuild, or fractal_index_drop first)';
+    END IF;
+    SET v_gen = v_oldgen + 1;
+
+    -- the dimension, from the first row that has a vector
+    SET @_fi_dim_sql = CONCAT('SELECT fractal_vector_dims(', v_col_expr, ') INTO @_fi_dim FROM ',
+                              _fractalsql_quote_bare_table(p_table), ' WHERE ',
+                              _fractalsql_quote_ident(p_col), ' IS NOT NULL LIMIT 1');
+    SET @_fi_dim = NULL;
+    PREPARE _fi_dim_stmt FROM @_fi_dim_sql;
+    EXECUTE _fi_dim_stmt;
+    DEALLOCATE PREPARE _fi_dim_stmt;
+    SET v_dim = COALESCE(@_fi_dim, 0);
+    IF v_dim <= 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: the column has no parsable vectors to index';
+    END IF;
+
+    -- the training pass
+    SET v_req = JSON_OBJECT('op', 'train_begin', 'format', v_fmt, 'dim', v_dim,
+                             'nlist', v_nlist, 'pca_dim', v_pca, 'iters', v_iters,
+                             'sample', v_sample, 'seed', v_seed);
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_token = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.token'));
+    IF v_token IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: the daemon did not open a trainer';
+    END IF;
+
+    SET v_gcml = @@SESSION.group_concat_max_len;
+    SET SESSION group_concat_max_len = 1073741824;
+
+    -- the first id (the batch loop walks the primary key from there)
+    SET @_fi_min_sql = CONCAT('SELECT COALESCE(MIN(', _fractalsql_quote_ident(v_pk), '), 0) INTO @_fi_min FROM ',
+                              _fractalsql_quote_bare_table(p_table));
+    SET @_fi_min = NULL;
+    PREPARE _fi_min_stmt FROM @_fi_min_sql;
+    EXECUTE _fi_min_stmt;
+    DEALLOCATE PREPARE _fi_min_stmt;
+    SET v_last = COALESCE(@_fi_min, 0) - 1;
+
+    -- The batch loop: read the table in primary-key order, a batch at a
+    -- time. The ids and the vectors come back in the SAME order (both
+    -- aggregates carry ORDER BY <pk>), so the encode pass can join them.
+    REPEAT
+        SET @_fi_ids = NULL;
+        SET @_fi_corpus = NULL;
+        SET @_fi_sql = CONCAT(
+            'SELECT GROUP_CONCAT(t.rid ORDER BY t.rid SEPARATOR '',''), ',
+            '       GROUP_CONCAT(t.v ORDER BY t.rid SEPARATOR '';'') ',
+            'INTO @_fi_ids, @_fi_corpus ',
+            'FROM (SELECT ', _fractalsql_quote_ident(v_pk), ' AS rid, ', v_col_expr, ' AS v FROM ',
+            _fractalsql_quote_bare_table(p_table), ' WHERE ',
+            _fractalsql_quote_ident(v_pk), ' > ', v_last, ' AND ',
+            _fractalsql_quote_ident(p_col), ' IS NOT NULL ORDER BY ',
+            _fractalsql_quote_ident(v_pk), ' LIMIT ', v_batch, ') t');
+        PREPARE _fi_batch_stmt FROM @_fi_sql;
+        EXECUTE _fi_batch_stmt;
+        DEALLOCATE PREPARE _fi_batch_stmt;
+
+        SET v_nbatch = 0;
+        IF @_fi_ids IS NOT NULL THEN
+            SET v_nbatch = LENGTH(@_fi_ids) - LENGTH(REPLACE(@_fi_ids, ',', '')) + 1;
+        END IF;
+        IF v_nbatch > 0 THEN
+            SET v_last = CAST(SUBSTRING_INDEX(@_fi_ids, ',', -1) AS SIGNED);
+            SET v_rows = v_rows + v_nbatch;
+            IF v_last > v_maxid THEN SET v_maxid = v_last; END IF;
+
+            SET v_req = JSON_OBJECT('op', 'train_add', 'token', v_token, 'corpus', @_fi_corpus);
+            CALL _fractalsql_index_call(v_req, v_resp);
+        END IF;
+    UNTIL v_nbatch = 0
+    END REPEAT;
+
+    IF v_rows = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: the column has no vectors to index';
+    END IF;
+
+    -- the model
+    SET v_req = JSON_OBJECT('op', 'train_end', 'token', v_token);
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_model     = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.model'));
+    SET v_mtoken    = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.token'));
+    SET v_codebytes = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.code_bytes')) AS SIGNED), 0);
+    SET v_nlist_out = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.nlist')) AS SIGNED), 0);
+    SET v_pca_out   = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.pca_dim')) AS SIGNED), 0);
+    IF v_model IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_create: the daemon did not return a model';
+    END IF;
+
+    -- the encode pass: every row gets its cell and its code
+    DELETE FROM fractal_index_stage WHERE name = v_name AND generation = v_gen;
+    SET v_last = COALESCE(@_fi_min, 0) - 1;
+    REPEAT
+        SET @_fi_ids = NULL;
+        SET @_fi_corpus = NULL;
+        SET @_fi_sql = CONCAT(
+            'SELECT GROUP_CONCAT(t.rid ORDER BY t.rid SEPARATOR '',''), ',
+            '       GROUP_CONCAT(t.v ORDER BY t.rid SEPARATOR '';'') ',
+            'INTO @_fi_ids, @_fi_corpus ',
+            'FROM (SELECT ', _fractalsql_quote_ident(v_pk), ' AS rid, ', v_col_expr, ' AS v FROM ',
+            _fractalsql_quote_bare_table(p_table), ' WHERE ',
+            _fractalsql_quote_ident(v_pk), ' > ', v_last, ' AND ',
+            _fractalsql_quote_ident(p_col), ' IS NOT NULL ORDER BY ',
+            _fractalsql_quote_ident(v_pk), ' LIMIT ', v_batch, ') t');
+        PREPARE _fi_batch_stmt FROM @_fi_sql;
+        EXECUTE _fi_batch_stmt;
+        DEALLOCATE PREPARE _fi_batch_stmt;
+
+        SET v_nbatch = 0;
+        IF @_fi_ids IS NOT NULL THEN
+            SET v_nbatch = LENGTH(@_fi_ids) - LENGTH(REPLACE(@_fi_ids, ',', '')) + 1;
+        END IF;
+        IF v_nbatch > 0 THEN
+            SET v_last = CAST(SUBSTRING_INDEX(@_fi_ids, ',', -1) AS SIGNED);
+            SET v_req = JSON_OBJECT('op', 'encode', 'token', v_mtoken, 'corpus', @_fi_corpus);
+            CALL _fractalsql_index_call(v_req, v_resp);
+            -- the cells and the codes come back as two parallel arrays,
+            -- in the row order of the batch: join them to the ids by
+            -- ordinality.
+            INSERT INTO fractal_index_stage(name, generation, cell, rid, code)
+            SELECT v_name, v_gen, c.cell, i.rid, d.code
+              FROM JSON_TABLE(CONCAT('[', @_fi_ids, ']'), '$[*]' COLUMNS(ord FOR ORDINALITY, rid BIGINT PATH '$')) i
+              JOIN JSON_TABLE(v_resp, '$.cells[*]' COLUMNS(ord FOR ORDINALITY, cell INT PATH '$')) c
+                ON c.ord = i.ord
+              JOIN JSON_TABLE(v_resp, '$.codes[*]' COLUMNS(ord FOR ORDINALITY, code LONGTEXT PATH '$')) d
+                ON d.ord = i.ord;
+        END IF;
+    UNTIL v_nbatch = 0
+    END REPEAT;
+
+    -- the cells: one row per cell (a per-cell aggregate, never the
+    -- whole corpus in one string)
+    INSERT INTO fractal_index_cells(name, generation, cell, n, ids, codes)
+    SELECT v_name, v_gen, cell, COUNT(*),
+           GROUP_CONCAT(rid ORDER BY rid SEPARATOR ','),
+           GROUP_CONCAT(code ORDER BY rid SEPARATOR '')
+      FROM fractal_index_stage WHERE name = v_name AND generation = v_gen
+     GROUP BY cell;
+
+    -- calibration: an ESTIMATE of the recall from a sample of the rows (the model is run against a temporary index over the sample).
+    -- A failure here leaves the index uncalibrated; it does not fail the build.
+    IF v_calsamp > 0 AND v_caltarget > 0 AND v_rows >= 12 THEN
+        BEGIN
+            DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET v_calresp = NULL;
+            SET @_fi_corpus = NULL;
+            SET @_fi_sql = CONCAT(
+                'SELECT GROUP_CONCAT(t.v SEPARATOR '';'') INTO @_fi_corpus FROM (SELECT ', v_col_expr, ' AS v FROM ',
+                _fractalsql_quote_bare_table(p_table), ' WHERE ', _fractalsql_quote_ident(p_col),
+                ' IS NOT NULL ORDER BY RAND(', v_seed, ') LIMIT 5000) t');
+            PREPARE _fi_cal_stmt FROM @_fi_sql;
+            EXECUTE _fi_cal_stmt;
+            DEALLOCATE PREPARE _fi_cal_stmt;
+            SET v_req = JSON_OBJECT('op', 'calibrate', 'token', v_mtoken, 'corpus', @_fi_corpus,
+                                    'samples', LEAST(v_calsamp, 2000), 'target', v_caltarget, 'seed', v_seed);
+            SET v_calresp = NULL;
+            CALL _fractalsql_index_call(v_req, v_calresp);
+        END;
+        IF v_calresp IS NOT NULL AND JSON_VALID(v_calresp) AND JSON_EXTRACT(v_calresp, '$.recommended_nprobe') IS NOT NULL THEN
+            SET v_cal = v_calresp;
+            SET v_nprobe_new = GREATEST(1, CAST(JSON_UNQUOTE(JSON_EXTRACT(v_calresp, '$.recommended_nprobe')) AS SIGNED));
+        END IF;
+    END IF;
+
+    SET SESSION group_concat_max_len = v_gcml;
+
+    -- the metadata: the generation pointer moves here (one statement),
+    -- and only now are the previous generation's cells dropped.
+    REPLACE INTO fractal_index_meta(name, tbl, col, id_col, dim, format, nlist, pca_dim,
+                                    row_count, max_id, model, seed, generation, format_version,
+                                    options, built_at, nprobe_default, calib)
+    VALUES (v_name, p_table, p_col, v_pk, v_dim, v_fmt, v_nlist_out, v_pca_out,
+            v_rows, v_maxid, UNHEX(v_model), v_seed, v_gen, 1,
+            v_opts, DATE_FORMAT(NOW(), '%Y-%m-%dT%H:%i:%SZ'), v_nprobe_new, v_cal);
+
+    DELETE FROM fractal_index_cells WHERE name = v_name AND generation < v_gen;
+    DELETE FROM fractal_index_stage  WHERE name = v_name;
+
+    SET p_result = JSON_OBJECT(
+        'name', v_name, 'table', p_table, 'column', p_col, 'format', v_fmt,
+        'dim', v_dim, 'rows', v_rows, 'nlist', v_nlist_out, 'pca_dim', v_pca_out,
+        'code_bytes', v_codebytes, 'generation', v_gen, 'max_id', v_maxid,
+        'nprobe_default', v_nprobe_new,
+        'calibration', IF(v_cal IS NOT NULL, JSON_EXTRACT(v_cal, '$'),
+            JSON_OBJECT('skipped', 'no calibration: fewer than 12 rows, calibration_samples = 0, or the estimate failed; the default nprobe is 16')));
+END$$
+
+-- fractal_index_rebuild(name) -> JSON
+-- A full rebuild from the current rows, with the same options. The new
+-- generation is built first; the generation pointer moves at the end,
+-- so the previous generation keeps serving until the new one is ready.
+CREATE PROCEDURE fractal_index_rebuild(
+    IN  p_name   VARCHAR(64),
+    OUT p_result LONGTEXT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_tbl    VARCHAR(128);
+    DECLARE v_col    VARCHAR(64);
+    DECLARE v_opts   LONGTEXT;
+    DECLARE v_exists INT DEFAULT 0;
+
+    SELECT COUNT(*) INTO v_exists FROM fractal_index_meta WHERE name = p_name;
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_rebuild: no index with that name';
+    END IF;
+    SELECT tbl, col, options INTO v_tbl, v_col, v_opts FROM fractal_index_meta WHERE name = p_name;
+
+    SET v_opts = JSON_SET(COALESCE(v_opts, '{}'), '$._rebuild', TRUE);
+    CALL fractal_index_create(v_tbl, v_col, v_opts, p_result);
+END$$
+
+-- fractal_index_drop(name) -> 1
+CREATE PROCEDURE fractal_index_drop(
+    IN  p_name VARCHAR(64),
+    OUT p_ok   INT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_exists INT DEFAULT 0;
+    SELECT COUNT(*) INTO v_exists FROM fractal_index_meta WHERE name = p_name;
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_drop: no index with that name';
+    END IF;
+    DELETE FROM fractal_index_cells WHERE name = p_name;
+    DELETE FROM fractal_index_meta   WHERE name = p_name;
+    DELETE FROM fractal_index_stage  WHERE name = p_name;
+    SET p_ok = 1;
+END$$
+
+-- fractal_index_info(name) -> JSON
+-- The format, the sizes, the staleness and the row counts.
+CREATE PROCEDURE fractal_index_info(
+    IN  p_name   VARCHAR(64),
+    OUT p_result LONGTEXT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_tbl     VARCHAR(128);
+    DECLARE v_col     VARCHAR(64);
+    DECLARE v_idcol   VARCHAR(64);
+    DECLARE v_dim     INT DEFAULT 0;
+    DECLARE v_fmt     VARCHAR(8) DEFAULT '';
+    DECLARE v_nlist   INT DEFAULT 0;
+    DECLARE v_pca     INT DEFAULT 0;
+    DECLARE v_rows    BIGINT DEFAULT 0;
+    DECLARE v_maxid   BIGINT DEFAULT 0;
+    DECLARE v_gen     INT DEFAULT 0;
+    DECLARE v_seed    BIGINT DEFAULT 0;
+    DECLARE v_built   VARCHAR(40) DEFAULT '';
+    DECLARE v_fv      INT DEFAULT 0;
+    DECLARE v_opts    LONGTEXT DEFAULT '{}';
+    DECLARE v_nprobe  INT DEFAULT 16;
+    DECLARE v_now     BIGINT DEFAULT 0;
+    DECLARE v_maxnow  BIGINT DEFAULT 0;
+    DECLARE v_cells   INT DEFAULT 0;
+    DECLARE v_exists  INT DEFAULT 0;
+    DECLARE v_added   BIGINT DEFAULT 0;
+    DECLARE v_deleted BIGINT DEFAULT 0;
+    DECLARE v_den     BIGINT DEFAULT 1;
+    DECLARE v_missing INT DEFAULT 0;
+    DECLARE v_status  VARCHAR(16) DEFAULT 'ready';
+    DECLARE v_advice  LONGTEXT;
+    DECLARE v_calib   LONGTEXT;
+    DECLARE CONTINUE HANDLER FOR 1146, 1054 SET v_missing = 1;
+
+    SELECT COUNT(*) INTO v_exists FROM fractal_index_meta WHERE name = p_name;
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_info: no index with that name';
+    END IF;
+
+    SELECT tbl, col, id_col, dim, format, nlist, pca_dim, row_count, max_id, seed,
+           generation, format_version, built_at, options, nprobe_default, calib
+      INTO v_tbl, v_col, v_idcol, v_dim, v_fmt, v_nlist, v_pca, v_rows, v_maxid,
+           v_seed, v_gen, v_fv, v_built, v_opts, v_nprobe, v_calib
+      FROM fractal_index_meta WHERE name = p_name;
+
+    SELECT COUNT(*) INTO v_cells FROM fractal_index_cells WHERE name = p_name AND generation = v_gen;
+
+    -- the table (or its column) can be gone while the index outlives it: that is the "orphaned" status, not an error
+    SET v_missing = 0;
+    SET @_fi_cnt = NULL; SET @_fi_max = NULL; SET @_fi_added = NULL;
+    SET @_fi_now_sql = CONCAT('SELECT COUNT(*), COALESCE(MAX(', _fractalsql_quote_ident(v_idcol), '), 0), ',
+                               'COALESCE(SUM(', _fractalsql_quote_ident(v_idcol), ' > ', v_maxid, '), 0) ',
+                               'INTO @_fi_cnt, @_fi_max, @_fi_added FROM ',
+                               _fractalsql_quote_bare_table(v_tbl), ' WHERE ',
+                               _fractalsql_quote_ident(v_col), ' IS NOT NULL');
+    PREPARE _fi_now_stmt FROM @_fi_now_sql;
+    IF v_missing = 0 THEN
+        EXECUTE _fi_now_stmt;
+        DEALLOCATE PREPARE _fi_now_stmt;
+    END IF;
+    IF v_missing = 1 THEN
+        SET v_now = 0; SET v_maxnow = 0; SET v_added = 0;
+        SET v_deleted = v_rows;
+    ELSE
+        SET v_now = COALESCE(@_fi_cnt, 0);
+        SET v_maxnow = COALESCE(@_fi_max, 0);
+        SET v_added = COALESCE(@_fi_added, 0);
+        SET v_deleted = GREATEST(v_rows - (v_now - v_added), 0);
+    END IF;
+
+    -- ready | stale | empty | orphaned. "stale" here means there is something to do (rows were added, or many were
+    -- deleted); the raw "stale" flag is true for any change, including a few deleted rows the verify step already drops.
+    SET v_den = GREATEST(v_rows, 1);
+    SET v_advice = JSON_ARRAY();
+    IF v_missing = 1 THEN
+        SET v_status = 'orphaned';
+        SET v_advice = JSON_ARRAY(CONCAT('the table ', v_tbl, ' or its column ', v_col,
+                                         ' no longer exists; fractal_index_drop removes the index'));
+    ELSEIF v_now = 0 THEN
+        SET v_status = 'empty';
+        SET v_advice = JSON_ARRAY('the table has no vectors; load rows and build the index again');
+    ELSE
+        IF v_added > 0 OR v_deleted / v_den > 0.2 THEN SET v_status = 'stale'; ELSE SET v_status = 'ready'; END IF;
+        IF v_added > 0 AND v_added / v_den > 0.25 THEN
+            SET v_advice = JSON_ARRAY_APPEND(v_advice, '$', CONCAT('rebuild: ', ROUND(100 * v_added / v_den),
+                '% of the rows (', v_added, ') were added since the build, more than the cells were trained for'));
+        ELSEIF v_added > 0 THEN
+            SET v_advice = JSON_ARRAY_APPEND(v_advice, '$', CONCAT('refresh: ', v_added, ' rows (',
+                ROUND(100 * v_added / v_den), '% of the index) were added since the build; fractal_index_refresh folds them in'));
+        END IF;
+        IF v_deleted / v_den > 0.2 THEN
+            SET v_advice = JSON_ARRAY_APPEND(v_advice, '$', CONCAT('rebuild: ', v_deleted, ' rows (',
+                ROUND(100 * v_deleted / v_den), '%) were deleted since the build; they are dropped from results but still held in the cells'));
+        END IF;
+        -- the calibration (an estimate from a sample) missed its target recall: the index is degraded
+        IF v_status = 'ready' AND v_calib IS NOT NULL AND JSON_VALID(v_calib)
+           AND JSON_UNQUOTE(JSON_EXTRACT(v_calib, '$.reaches_target')) = 'false' THEN
+            SET v_status = 'degraded';
+            SET v_advice = JSON_ARRAY_APPEND(v_advice, '$', CONCAT('the build''s calibration (an estimate from a sample) did not reach recall ',
+                JSON_UNQUOTE(JSON_EXTRACT(v_calib, '$.target')), ' even at the best nprobe; rebuild with more cells or another vector_format'));
+        END IF;
+    END IF;
+
+    SET p_result = JSON_OBJECT(
+        'name', p_name, 'table', v_tbl, 'column', v_col, 'id_col', v_idcol,
+        'metric', 'cosine', 'format', v_fmt, 'dim', v_dim, 'nlist', v_nlist,
+        'pca_dim', v_pca, 'generation', v_gen, 'format_version', v_fv,
+        'seed', v_seed, 'built_at', v_built, 'rows_indexed', v_rows,
+        'rows_now', v_now, 'max_id_indexed', v_maxid, 'max_id_now', v_maxnow,
+        'cells', v_cells, 'nprobe_default', v_nprobe,
+        'has_delta', (v_added > 0),
+        'stale', (v_now <> v_rows OR v_maxnow <> v_maxid),
+        'rows_added_since_build', v_added, 'rows_deleted_since_build', v_deleted,
+        'status', v_status, 'advice', JSON_EXTRACT(v_advice, '$'),
+        'calibration', IF(v_calib IS NOT NULL AND JSON_VALID(v_calib), JSON_EXTRACT(v_calib, '$'), JSON_OBJECT('skipped', 'the index was built without a calibration; the default nprobe applies')),
+        'options', JSON_EXTRACT(v_opts, '$'));
+END$$
+
+-- fractal_index_list(OUT result) -> JSON array
+-- One summary per index (name, table, column, format, dim, rows, rows_now, stale, status, generation), sorted by name.
+CREATE PROCEDURE fractal_index_list(
+    OUT p_result LONGTEXT
+)
+SQL SECURITY INVOKER
+
+fs_list: BEGIN
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE v_n    VARCHAR(64);
+    DECLARE v_info LONGTEXT;
+    DECLARE v_meta INT DEFAULT 0;
+    DECLARE c_idx CURSOR FOR SELECT name FROM fractal_index_meta ORDER BY name;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
+
+    SET p_result = JSON_ARRAY();
+    SELECT COUNT(*) INTO v_meta FROM information_schema.tables
+     WHERE table_schema = DATABASE() AND table_name = 'fractal_index_meta';
+    IF v_meta = 0 THEN LEAVE fs_list; END IF;
+    OPEN c_idx;
+    l: LOOP
+        FETCH c_idx INTO v_n;
+        IF v_done = 1 THEN LEAVE l; END IF;
+        CALL fractal_index_info(v_n, v_info);
+        SET p_result = JSON_ARRAY_APPEND(p_result, '$', JSON_OBJECT(
+            'name', v_n,
+            'table', JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.table')),
+            'column', JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.column')),
+            'format', JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.format')),
+            'dim', JSON_EXTRACT(v_info, '$.dim'),
+            'rows', JSON_EXTRACT(v_info, '$.rows_indexed'),
+            'rows_now', JSON_EXTRACT(v_info, '$.rows_now'),
+            'stale', JSON_EXTRACT(v_info, '$.stale'),
+            'status', JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.status')),
+            'generation', JSON_EXTRACT(v_info, '$.generation')));
+    END LOOP;
+    CLOSE c_idx;
+END fs_list$$
+
+-- fractal_index_refresh(name) -> JSON {name, added, rows, generation, refreshed}
+-- Folds the rows added since the build (id above the watermark) into the cells: each new row is encoded with the index's
+-- existing model (no retraining) and appended to its cell, in a NEW generation written in one transaction. Deleted rows are
+-- already dropped by the verify step, and a changed vector needs fractal_index_rebuild.
+CREATE PROCEDURE fractal_index_refresh(
+    IN  p_name   VARCHAR(64),
+    OUT p_result LONGTEXT
+)
+SQL SECURITY INVOKER
+
+fs_refresh: BEGIN
+    DECLARE v_tbl      VARCHAR(128);
+    DECLARE v_col      VARCHAR(64);
+    DECLARE v_idcol    VARCHAR(64);
+    DECLARE v_pk       VARCHAR(64);
+    DECLARE v_type     VARCHAR(64);
+    DECLARE v_col_expr TEXT;
+    DECLARE v_fmt      VARCHAR(8);
+    DECLARE v_rows     BIGINT DEFAULT 0;
+    DECLARE v_maxid    BIGINT DEFAULT 0;
+    DECLARE v_gen      INT DEFAULT 0;
+    DECLARE v_model    LONGTEXT;
+    DECLARE v_token    VARCHAR(32);
+    DECLARE v_req      LONGTEXT;
+    DECLARE v_resp     LONGTEXT;
+    DECLARE v_last     BIGINT DEFAULT 0;
+    DECLARE v_batch    INT DEFAULT 256;
+    DECLARE v_nbatch   INT DEFAULT 0;
+    DECLARE v_added    BIGINT DEFAULT 0;
+    DECLARE v_newmax   BIGINT DEFAULT 0;
+    DECLARE v_gcml     BIGINT UNSIGNED;
+    DECLARE v_exists   INT DEFAULT 0;
+
+    SELECT COUNT(*) INTO v_exists FROM fractal_index_meta WHERE name = p_name;
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_index_refresh: no index with that name';
+    END IF;
+    SELECT tbl, col, id_col, format, row_count, max_id, generation, HEX(model)
+      INTO v_tbl, v_col, v_idcol, v_fmt, v_rows, v_maxid, v_gen, v_model
+      FROM fractal_index_meta WHERE name = p_name;
+
+    CALL _fractalsql_index_pk(v_tbl, v_pk);
+    SELECT MIN(data_type) INTO v_type FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = v_tbl AND column_name = v_col;
+    IF v_type IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_refresh: the indexed table or column no longer exists; fractal_index_drop removes the index';
+    END IF;
+    SET v_col_expr = IF(LOWER(v_type) = 'vector',
+        CONCAT('VEC_TOTEXT(', _fractalsql_quote_ident(v_col), ')'), _fractalsql_quote_ident(v_col));
+
+    SET v_req = JSON_OBJECT('op', 'open', 'model', v_model);
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_token = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.token'));
+
+    SET v_gcml = @@SESSION.group_concat_max_len;
+    SET SESSION group_concat_max_len = 1073741824;
+    DELETE FROM fractal_index_stage WHERE name = p_name;
+    SET v_last = v_maxid;
+    SET v_newmax = v_maxid;
+    REPEAT
+        SET @_fi_ids = NULL; SET @_fi_corpus = NULL;
+        SET @_fi_sql = CONCAT(
+            'SELECT GROUP_CONCAT(t.rid ORDER BY t.rid SEPARATOR '',''), ',
+            '       GROUP_CONCAT(t.v ORDER BY t.rid SEPARATOR '';'') ',
+            'INTO @_fi_ids, @_fi_corpus ',
+            'FROM (SELECT ', _fractalsql_quote_ident(v_pk), ' AS rid, ', v_col_expr, ' AS v FROM ',
+            _fractalsql_quote_bare_table(v_tbl), ' WHERE ',
+            _fractalsql_quote_ident(v_pk), ' > ', v_last, ' AND ',
+            _fractalsql_quote_ident(v_col), ' IS NOT NULL ORDER BY ',
+            _fractalsql_quote_ident(v_pk), ' LIMIT ', v_batch, ') t');
+        PREPARE _fi_batch_stmt FROM @_fi_sql;
+        EXECUTE _fi_batch_stmt;
+        DEALLOCATE PREPARE _fi_batch_stmt;
+        SET v_nbatch = 0;
+        IF @_fi_ids IS NOT NULL THEN
+            SET v_nbatch = LENGTH(@_fi_ids) - LENGTH(REPLACE(@_fi_ids, ',', '')) + 1;
+        END IF;
+        IF v_nbatch > 0 THEN
+            SET v_last = CAST(SUBSTRING_INDEX(@_fi_ids, ',', -1) AS SIGNED);
+            IF v_last > v_newmax THEN SET v_newmax = v_last; END IF;
+            SET v_added = v_added + v_nbatch;
+            SET v_req = JSON_OBJECT('op', 'encode', 'token', v_token, 'corpus', @_fi_corpus);
+            CALL _fractalsql_index_call(v_req, v_resp);
+            INSERT INTO fractal_index_stage(name, generation, cell, rid, code)
+            SELECT p_name, v_gen + 1, c.cell, i.rid, d.code
+              FROM JSON_TABLE(CONCAT('[', @_fi_ids, ']'), '$[*]' COLUMNS(ord FOR ORDINALITY, rid BIGINT PATH '$')) i
+              JOIN JSON_TABLE(v_resp, '$.cells[*]' COLUMNS(ord FOR ORDINALITY, cell INT PATH '$')) c ON c.ord = i.ord
+              JOIN JSON_TABLE(v_resp, '$.codes[*]' COLUMNS(ord FOR ORDINALITY, code LONGTEXT PATH '$')) d ON d.ord = i.ord;
+        END IF;
+    UNTIL v_nbatch = 0
+    END REPEAT;
+    SET v_req = JSON_OBJECT('op', 'close', 'token', v_token);
+    CALL _fractalsql_index_call(v_req, v_resp);
+
+    IF v_added = 0 THEN
+        SET SESSION group_concat_max_len = v_gcml;
+        SET p_result = JSON_OBJECT('name', p_name, 'added', 0, 'rows', v_rows, 'generation', v_gen, 'refreshed', FALSE);
+        LEAVE fs_refresh;
+    END IF;
+
+    -- the new generation: the old cells copied, the new rows appended to their cells, the pointer moved in one transaction
+    START TRANSACTION;
+    -- The new rows per cell are aggregated into a REAL table first, not into a
+    -- derived table: MariaDB 10.6 merges a derived table into the UPDATE that
+    -- joins it, and the merged form refuses the row with "Data too long for
+    -- column 'ids'" -- the fold below never ran there. A temporary table is
+    -- not merged, and its columns are declared, so the aggregation lands
+    -- exactly as it reads on every line.
+    DROP TEMPORARY TABLE IF EXISTS _fi_newcells;
+    CREATE TEMPORARY TABLE _fi_newcells (
+        cell  INT      NOT NULL,
+        n     INT      NOT NULL,
+        ids   LONGTEXT NOT NULL,
+        codes LONGTEXT NOT NULL
+    );
+    INSERT INTO _fi_newcells(cell, n, ids, codes)
+    SELECT cell, COUNT(*), GROUP_CONCAT(rid ORDER BY rid SEPARATOR ','),
+           GROUP_CONCAT(code ORDER BY rid SEPARATOR '')
+      FROM fractal_index_stage WHERE name = p_name AND generation = v_gen + 1 GROUP BY cell;
+    INSERT INTO fractal_index_cells(name, generation, cell, n, ids, codes)
+    SELECT name, v_gen + 1, cell, n, ids, codes FROM fractal_index_cells WHERE name = p_name AND generation = v_gen;
+    UPDATE fractal_index_cells c
+      JOIN _fi_newcells s ON s.cell = c.cell
+       SET c.n = c.n + s.n, c.ids = CONCAT(c.ids, ',', s.ids), c.codes = CONCAT(c.codes, s.codes)
+     WHERE c.name = p_name AND c.generation = v_gen + 1;
+    INSERT INTO fractal_index_cells(name, generation, cell, n, ids, codes)
+    SELECT p_name, v_gen + 1, s.cell, s.n, s.ids, s.codes
+      FROM _fi_newcells s
+     WHERE NOT EXISTS (SELECT 1 FROM fractal_index_cells x
+                        WHERE x.name = p_name AND x.generation = v_gen + 1 AND x.cell = s.cell);
+    DROP TEMPORARY TABLE IF EXISTS _fi_newcells;
+    UPDATE fractal_index_meta SET generation = v_gen + 1, row_count = row_count + v_added, max_id = v_newmax
+     WHERE name = p_name;
+    DELETE FROM fractal_index_cells WHERE name = p_name AND generation <= v_gen;
+    DELETE FROM fractal_index_stage WHERE name = p_name;
+    COMMIT;
+    SET SESSION group_concat_max_len = v_gcml;
+    SET p_result = JSON_OBJECT('name', p_name, 'added', v_added, 'rows', v_rows + v_added,
+                               'generation', v_gen + 1, 'refreshed', TRUE);
+END fs_refresh$$
+
+-- fractal_index_ensure(table, column, options) -> JSON {name, action, status, generation, rows}
+-- Leaves the index on that table and column fit to use: builds it when there is none (created), folds in the added rows when that is
+-- all that is needed (refreshed), rebuilds when more than a quarter of the rows were added or more than a fifth deleted (rebuilt),
+-- and otherwise changes nothing (unchanged). options (JSON text, or NULL) are used only when it builds. For a setup script or a
+-- scheduled job: a search never builds or changes an index.
+CREATE PROCEDURE fractal_index_ensure(
+    IN  p_table   VARCHAR(128),
+    IN  p_col     VARCHAR(64),
+    IN  p_options LONGTEXT,
+    OUT p_result  LONGTEXT
+)
+SQL SECURITY INVOKER
+
+fs_ensure: BEGIN
+    DECLARE v_name    VARCHAR(64);
+    DECLARE v_n       INT DEFAULT 0;
+    DECLARE v_action  VARCHAR(16) DEFAULT 'unchanged';
+    DECLARE v_info    LONGTEXT;
+    DECLARE v_tmp     LONGTEXT;
+    DECLARE v_status  VARCHAR(16);
+    DECLARE v_rows    BIGINT DEFAULT 0;
+    DECLARE v_added   BIGINT DEFAULT 0;
+    DECLARE v_deleted BIGINT DEFAULT 0;
+    DECLARE v_den     BIGINT DEFAULT 1;
+    DECLARE CONTINUE HANDLER FOR 1146 SET v_n = 0;   -- no fractal_index_meta yet: no index exists
+
+    SELECT COUNT(*) INTO v_n FROM fractal_index_meta WHERE tbl = p_table AND col = p_col;
+    IF v_n = 0 THEN
+        CALL fractal_index_create(p_table, p_col, IFNULL(p_options, '{}'), v_tmp);
+        SET v_action = 'created';
+    ELSE
+        SELECT name INTO v_name FROM fractal_index_meta WHERE tbl = p_table AND col = p_col ORDER BY name LIMIT 1;
+        CALL fractal_index_info(v_name, v_info);
+        SET v_status  = JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.status'));
+        SET v_rows    = JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.rows_indexed'));
+        SET v_added   = JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.rows_added_since_build'));
+        SET v_deleted = JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.rows_deleted_since_build'));
+        SET v_den     = GREATEST(v_rows, 1);
+        IF v_status = 'stale' THEN
+            IF v_added / v_den > 0.25 OR v_deleted / v_den > 0.2 THEN
+                CALL fractal_index_rebuild(v_name, v_tmp);
+                SET v_action = 'rebuilt';
+            ELSEIF v_added > 0 THEN
+                CALL fractal_index_refresh(v_name, v_tmp);
+                SET v_action = 'refreshed';
+            END IF;
+        END IF;
+    END IF;
+
+    SELECT name INTO v_name FROM fractal_index_meta WHERE tbl = p_table AND col = p_col ORDER BY name LIMIT 1;
+    CALL fractal_index_info(v_name, v_info);
+    SET p_result = JSON_OBJECT('name', v_name, 'action', v_action,
+        'status', JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.status')),
+        'generation', JSON_EXTRACT(v_info, '$.generation'),
+        'rows', JSON_EXTRACT(v_info, '$.rows_indexed'));
+END fs_ensure$$
+
+-- The exact scan of a table's vectors in primary-key batches (every row, or only the rows of p_idset when it is not NULL),
+-- each scored with the shared double-precision cosine. Used by fractal_search when there is no index and as the
+-- fallback of a restricted search.
+CREATE PROCEDURE _fractalsql_exact_scan(
+    IN  p_table    VARCHAR(128),
+    IN  p_pk       VARCHAR(64),
+    IN  p_col      VARCHAR(64),
+    IN  p_col_expr TEXT,
+    IN  p_query    LONGTEXT,
+    IN  p_k        INT,
+    IN  p_idset    LONGTEXT,
+    OUT p_result   LONGTEXT,
+    OUT p_rows     BIGINT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_allids LONGTEXT DEFAULT '[]';
+    DECLARE v_last   BIGINT DEFAULT 0;
+    DECLARE v_batch  INT DEFAULT 256;
+    DECLARE v_n      INT DEFAULT 0;
+    DECLARE v_req    LONGTEXT;
+    DECLARE v_resp   LONGTEXT;
+    DECLARE v_dists  LONGTEXT;
+    DECLARE v_gcml   BIGINT UNSIGNED;
+    DECLARE v_filter TEXT DEFAULT '';
+
+    SET p_rows = 0;
+    IF p_idset IS NOT NULL THEN
+        IF p_idset = '' THEN SET p_result = JSON_ARRAY(); SET v_n = -1; ELSE
+            SET v_filter = CONCAT(' AND ', _fractalsql_quote_ident(p_pk), ' IN (', p_idset, ')'); END IF;
+    END IF;
+    IF v_n = -1 THEN SET v_n = 0; ELSE
+    SET v_gcml = @@SESSION.group_concat_max_len;
+    SET SESSION group_concat_max_len = 1073741824;
+    REPEAT
+        SET @_fi_ids = NULL; SET @_fi_corpus = NULL;
+        SET @_fi_sql = CONCAT(
+            'SELECT GROUP_CONCAT(t.rid ORDER BY t.rid SEPARATOR '',''), ',
+            '       GROUP_CONCAT(t.v ORDER BY t.rid SEPARATOR '';'') ',
+            'INTO @_fi_ids, @_fi_corpus ',
+            'FROM (SELECT ', _fractalsql_quote_ident(p_pk), ' AS rid, ', p_col_expr, ' AS v FROM ',
+            _fractalsql_quote_bare_table(p_table), ' WHERE ',
+            _fractalsql_quote_ident(p_pk), ' > ', v_last, ' AND ',
+            _fractalsql_quote_ident(p_col), ' IS NOT NULL', v_filter, ' ORDER BY ',
+            _fractalsql_quote_ident(p_pk), ' LIMIT ', v_batch, ') t');
+        PREPARE _fi_batch_stmt FROM @_fi_sql;
+        EXECUTE _fi_batch_stmt;
+        DEALLOCATE PREPARE _fi_batch_stmt;
+        SET v_n = 0;
+        IF @_fi_ids IS NOT NULL THEN
+            SET v_n = LENGTH(@_fi_ids) - LENGTH(REPLACE(@_fi_ids, ',', '')) + 1;
+        END IF;
+        IF v_n > 0 THEN
+            SET v_last = CAST(SUBSTRING_INDEX(@_fi_ids, ',', -1) AS SIGNED);
+            SET p_rows = p_rows + v_n;
+            SET v_req = JSON_OBJECT('op', 'verify', 'query', p_query, 'ids', @_fi_ids, 'corpus', @_fi_corpus);
+            CALL _fractalsql_index_call(v_req, v_resp);
+            SET v_dists = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.distances'));
+            SET v_allids = JSON_MERGE_PRESERVE(v_allids,
+                       (SELECT JSON_ARRAYAGG(JSON_OBJECT('doc_id', i.rid, 'dist', dd.d))
+                          FROM JSON_TABLE(CONCAT('[', @_fi_ids, ']'), '$[*]'
+                                  COLUMNS(ord FOR ORDINALITY, rid BIGINT PATH '$')) i
+                          JOIN JSON_TABLE(v_dists, '$[*]'
+                                  COLUMNS(ord FOR ORDINALITY, d DOUBLE PATH '$')) dd
+                            ON dd.ord = i.ord));
+        END IF;
+    UNTIL v_n = 0
+    END REPEAT;
+    SET SESSION group_concat_max_len = v_gcml;
+    SET p_result = COALESCE((
+        SELECT JSON_ARRAYAGG(JSON_OBJECT('doc_id', t.doc_id, 'dist', t.dist) ORDER BY t.dist, t.doc_id)
+          FROM (SELECT j.doc_id, j.dist FROM JSON_TABLE(v_allids, '$[*]'
+                  COLUMNS(doc_id BIGINT PATH '$.doc_id', dist DOUBLE PATH '$.dist')) j
+                 ORDER BY j.dist, j.doc_id LIMIT p_k) t), JSON_ARRAY());
+    END IF;
+END$$
+
+-- fractal_search(table_name, vector_col, query, k [, options_json]) -> JSON
+--
+-- The INDEXED search: the same rows and the same {doc_id, dist} shape as
+-- fractal_search_telemetry, but through the index when one exists (and
+-- an EXACT scan when it does not). Every returned distance is verified
+-- against the base table with the shared double-precision cosine.
+--
+-- options_json keys:
+--   index      the index name (default: the one on this table/column)
+--   nprobe     how many cells to probe (default: the index's own default)
+--   rerank     how many candidates to verify (default: 30 for INT8,
+--              40 for INT4, 0 otherwise)
+--   use_index  false forces the exact scan
+--   ids        a JSON array of row ids: search only those rows. At most 4096 ids
+--              (or no index) is an exact scan of the set; a longer set goes
+--              through the index and is filtered, with an exact fallback when
+--              fewer than k rows survive. [] returns no rows.
+CREATE PROCEDURE fractal_search(
+    IN  p_table   VARCHAR(128),
+    IN  p_col     VARCHAR(64),
+    IN  p_query   LONGTEXT,
+    IN  p_k       INT,
+    IN  p_options LONGTEXT,
+    OUT p_result  LONGTEXT,
+    OUT p_stats   LONGTEXT
+)
+SQL SECURITY INVOKER
+
+fs_search: BEGIN
+    DECLARE v_name      VARCHAR(64);
+    DECLARE v_exists    INT DEFAULT 0;
+    DECLARE v_meta      INT DEFAULT 0;
+    DECLARE v_use       INT DEFAULT 1;
+    DECLARE v_nprobe    INT DEFAULT 16;
+    DECLARE v_rerank    INT DEFAULT 30;
+    DECLARE v_fmt       VARCHAR(8) DEFAULT 'INT8';
+    DECLARE v_gen       INT DEFAULT 0;
+    DECLARE v_maxid     BIGINT DEFAULT 0;
+    DECLARE v_dim       INT DEFAULT 0;
+    DECLARE v_model     LONGTEXT;
+    DECLARE v_token     VARCHAR(32);
+    DECLARE v_resp      LONGTEXT;
+    DECLARE v_req       LONGTEXT;
+    DECLARE v_cand      LONGTEXT;
+    DECLARE v_id_list   LONGTEXT DEFAULT '';
+    DECLARE v_dists     LONGTEXT;
+    DECLARE v_rowsscan  BIGINT DEFAULT 0;
+    DECLARE v_cellspro  INT DEFAULT 0;
+    DECLARE v_pk        VARCHAR(64);
+    DECLARE v_type      VARCHAR(64);
+    DECLARE v_is_vec    BOOLEAN DEFAULT FALSE;
+    DECLARE v_col_expr  TEXT;
+    DECLARE v_ids_csv   LONGTEXT;
+    DECLARE v_corpus    LONGTEXT;
+    DECLARE v_n         INT DEFAULT 0;
+    DECLARE v_opts      LONGTEXT DEFAULT '{}';
+    DECLARE v_gcml      BIGINT UNSIGNED;
+    DECLARE v_last      BIGINT DEFAULT 0;
+    DECLARE v_batch     INT DEFAULT 256;
+    DECLARE v_allids    LONGTEXT;
+    DECLARE v_cellids   LONGTEXT;
+    DECLARE v_cellcodes LONGTEXT;
+    DECLARE v_cellno    INT DEFAULT 0;
+    DECLARE v_ncell     INT DEFAULT 0;
+    DECLARE v_i         INT DEFAULT 0;
+    DECLARE v_idset     LONGTEXT DEFAULT NULL;
+    DECLARE v_nids      INT DEFAULT 0;
+    DECLARE v_nbad      INT DEFAULT 0;
+    DECLARE v_idfilter  TEXT DEFAULT '';
+
+    IF p_k IS NULL OR p_k <= 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_search: k must be > 0';
+    END IF;
+    IF p_query IS NULL THEN
+        SET p_result = NULL;
+        SET p_stats = JSON_OBJECT('used_index', FALSE, 'rows_scanned', 0);
+        LEAVE fs_search;
+    END IF;
+    IF p_options IS NULL OR p_options = '' THEN SET v_opts = '{}'; ELSE SET v_opts = p_options; END IF;
+
+    SET v_use = CASE WHEN LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.use_index')), 'true')) = 'false'
+                      THEN 0 ELSE 1 END;
+
+    -- ids: restrict the search to a set of row ids (a JSON array of integers). At most 4096 ids, or no index, scans the set
+    -- exactly; a longer set goes through the index and is filtered, with an exact fallback if fewer than k rows survive.
+    IF JSON_EXTRACT(v_opts, '$.ids') IS NOT NULL THEN
+        IF JSON_TYPE(JSON_EXTRACT(v_opts, '$.ids')) <> 'ARRAY' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_search: ids must be a JSON array of integers';
+        END IF;
+        -- Every element must be an integer. The check reads each element as TEXT and
+        -- matches it against the integer form, rather than asking JSON_TYPE for a
+        -- JSON-typed JSON_TABLE column: on MariaDB 10.6 such a column yields NULL for
+        -- every row (the JSON column type is not supported there), so JSON_TYPE said
+        -- nothing and a malformed ids set was silently accepted on that line only.
+        SELECT COUNT(*) INTO v_nbad
+          FROM JSON_TABLE(JSON_EXTRACT(v_opts, '$.ids'), '$[*]' COLUMNS(t VARCHAR(64) PATH '$')) j
+         WHERE j.t NOT REGEXP '^-?[0-9]+$';
+        IF v_nbad > 0 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fractal_search: ids must be a JSON array of integers';
+        END IF;
+        SET v_nids = JSON_LENGTH(JSON_EXTRACT(v_opts, '$.ids'));
+        SELECT COALESCE(GROUP_CONCAT(DISTINCT j.i ORDER BY j.i SEPARATOR ','), '') INTO v_idset
+          FROM JSON_TABLE(JSON_EXTRACT(v_opts, '$.ids'), '$[*]' COLUMNS(i BIGINT PATH '$')) j;
+    END IF;
+
+    -- the index (if any) for this table/column. The storage tables are
+    -- created by the first build, so they may not exist at all yet.
+    SET v_name = JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.index'));
+    SELECT COUNT(*) INTO v_meta FROM information_schema.tables
+     WHERE table_schema = DATABASE() AND table_name = 'fractal_index_meta';
+    IF v_name IS NULL AND v_meta > 0 THEN
+        SELECT name INTO v_name FROM fractal_index_meta WHERE tbl = p_table AND col = p_col LIMIT 1;
+    END IF;
+    IF v_name IS NOT NULL AND v_meta > 0 THEN
+        SELECT COUNT(*) INTO v_exists FROM fractal_index_meta WHERE name = v_name;
+        IF v_exists = 0 THEN SET v_name = NULL; END IF;
+    END IF;
+    IF v_name IS NOT NULL AND v_use = 0 THEN SET v_name = NULL; END IF;
+    IF v_name IS NOT NULL AND v_idset IS NOT NULL AND v_nids <= 4096 THEN SET v_name = NULL; END IF;
+
+    -- the table's id column and its vector expression
+    CALL _fractalsql_index_pk(p_table, v_pk);
+    SELECT MIN(data_type) INTO v_type FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = p_table AND column_name = p_col;
+    IF v_type IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_search: the vector column was not found on the table';
+    END IF;
+    SET v_is_vec = (LOWER(v_type) = 'vector');
+    SET v_col_expr = IF(v_is_vec,
+        CONCAT('VEC_TOTEXT(', _fractalsql_quote_ident(p_col), ')'),
+        _fractalsql_quote_ident(p_col));
+
+    SET v_gcml = @@SESSION.group_concat_max_len;
+    SET SESSION group_concat_max_len = 1073741824;
+
+    IF v_name IS NULL THEN
+        -- ---------------- the EXACT scan (every row, or only the ids) ----------------
+        CALL _fractalsql_exact_scan(p_table, v_pk, p_col, v_col_expr, p_query, p_k, v_idset, p_result, v_rowsscan);
+        SET SESSION group_concat_max_len = v_gcml;
+        SET p_stats = JSON_OBJECT('used_index', FALSE, 'rows_scanned', v_rowsscan,
+                                   'cells_probed', 0, 'index', NULL);
+        LEAVE fs_search;
+    END IF;
+
+    -- ---------------- the INDEXED path ----------------
+    SELECT generation, max_id, dim, format, HEX(model), nprobe_default
+      INTO v_gen, v_maxid, v_dim, v_fmt, v_model, v_nprobe
+      FROM fractal_index_meta WHERE name = v_name;
+
+    SET v_nprobe = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.nprobe')) AS SIGNED), v_nprobe);
+    IF v_nprobe < 1 THEN SET v_nprobe = 1; END IF;
+    IF v_nprobe > 4096 THEN SET v_nprobe = 4096; END IF;
+    SET v_rerank = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.rerank')) AS SIGNED),
+                            CASE WHEN v_fmt = 'INT4' THEN 40 WHEN v_fmt = 'INT8' THEN 30 ELSE 0 END);
+
+    -- open the model in the daemon (it may have been restarted: the
+    -- model lives in InnoDB, the resident index does not)
+    SET v_req = JSON_OBJECT('op', 'open', 'model', v_model);
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_token = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.token'));
+
+    -- which cells to probe
+    SET v_req = JSON_OBJECT('op', 'probe', 'token', v_token, 'query', p_query, 'nprobe', v_nprobe);
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_cand = v_resp;
+    SET v_ncell = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_cand, '$.n')) AS SIGNED), 0);
+
+    -- load those cells from InnoDB into the daemon's resident index.
+    -- The cells travel ONE AT A TIME (the shim caps a UDF result at
+    -- 64 MiB and a protocol frame at 80 MiB).
+    SET v_i = 0;
+    WHILE v_i < v_ncell DO
+        SET v_cellno = CAST(JSON_UNQUOTE(JSON_EXTRACT(v_cand, CONCAT('$.cells[', v_i, ']'))) AS SIGNED);
+        SET v_cellids = NULL; SET v_cellcodes = NULL;
+        SELECT ids, codes INTO v_cellids, v_cellcodes
+          FROM fractal_index_cells
+         WHERE name = v_name AND generation = v_gen AND cell = v_cellno;
+        IF v_cellids IS NOT NULL AND v_cellids <> '' THEN
+            SET v_req = JSON_OBJECT('op', 'load_cell', 'token', v_token, 'cell', v_cellno,
+                                    'ids', v_cellids, 'codes', v_cellcodes);
+            CALL _fractalsql_index_call(v_req, v_resp);
+        END IF;
+        SET v_i = v_i + 1;
+    END WHILE;
+
+    -- the candidates
+    SET v_req = JSON_OBJECT('op', 'search', 'token', v_token, 'query', p_query,
+                            'nprobe', v_nprobe, 'shortlist', GREATEST(v_rerank, p_k + 5));
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_cand = v_resp;
+    SET v_rowsscan = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_cand, '$.rows_scanned')) AS SIGNED), 0);
+    SET v_cellspro = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_cand, '$.cells_probed')) AS SIGNED), 0);
+
+    -- the candidate ids
+    SELECT GROUP_CONCAT(t.doc_id SEPARATOR ',') INTO v_id_list
+      FROM JSON_TABLE(v_cand, '$.candidates[*]' COLUMNS(doc_id BIGINT PATH '$.doc_id')) t;
+    IF v_id_list IS NULL THEN SET v_id_list = ''; END IF;
+
+    -- fetch the candidates' rows (and the rows added after the build --
+    -- the delta -- which are scanned exactly)
+    IF v_idset IS NOT NULL THEN
+        SET v_idfilter = CONCAT(' AND ', _fractalsql_quote_ident(v_pk), ' IN (', IF(v_idset = '', 'NULL', v_idset), ')');
+    END IF;
+    IF v_id_list <> '' THEN
+        SET @_fi_fetch_sql = CONCAT(
+            'SELECT GROUP_CONCAT(t.rid ORDER BY t.rid SEPARATOR '',''), ',
+            '       GROUP_CONCAT(t.v ORDER BY t.rid SEPARATOR '';'') ',
+            'INTO @_fi_ids, @_fi_corpus ',
+            'FROM (SELECT ', _fractalsql_quote_ident(v_pk), ' AS rid, ', v_col_expr, ' AS v FROM ',
+            _fractalsql_quote_bare_table(p_table), ' WHERE (',
+            _fractalsql_quote_ident(v_pk), ' IN (', v_id_list, ') ',
+            'OR ', _fractalsql_quote_ident(v_pk), ' > ', v_maxid, ') ', v_idfilter, ' ORDER BY ',
+            _fractalsql_quote_ident(v_pk), ') t');
+    ELSE
+        SET @_fi_fetch_sql = CONCAT(
+            'SELECT GROUP_CONCAT(t.rid ORDER BY t.rid SEPARATOR '',''), ',
+            '       GROUP_CONCAT(t.v ORDER BY t.rid SEPARATOR '';'') ',
+            'INTO @_fi_ids, @_fi_corpus ',
+            'FROM (SELECT ', _fractalsql_quote_ident(v_pk), ' AS rid, ', v_col_expr, ' AS v FROM ',
+            _fractalsql_quote_bare_table(p_table), ' WHERE ',
+            _fractalsql_quote_ident(v_pk), ' > ', v_maxid, v_idfilter, ' ORDER BY ',
+            _fractalsql_quote_ident(v_pk), ') t');
+    END IF;
+    SET @_fi_ids = NULL; SET @_fi_corpus = NULL;
+    PREPARE _fi_fetch_stmt FROM @_fi_fetch_sql;
+    EXECUTE _fi_fetch_stmt;
+    DEALLOCATE PREPARE _fi_fetch_stmt;
+    SET v_ids_csv = COALESCE(@_fi_ids, '');
+    SET v_corpus  = COALESCE(@_fi_corpus, '');
+
+    -- verify every candidate against the base table: the exact
+    -- double-precision cosine, and the row ids that are still there
+    IF v_ids_csv <> '' THEN
+        SET v_req = JSON_OBJECT('op', 'verify', 'query', p_query,
+                                'ids', v_ids_csv, 'corpus', v_corpus);
+        CALL _fractalsql_index_call(v_req, v_resp);
+        SET v_dists = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.distances'));
+        SET p_result = COALESCE((
+            SELECT JSON_ARRAYAGG(JSON_OBJECT('doc_id', t.doc_id, 'dist', t.dist) ORDER BY t.dist, t.doc_id)
+              FROM (SELECT i.rid AS doc_id, d.d AS dist
+                      FROM JSON_TABLE(CONCAT('[', v_ids_csv, ']'), '$[*]'
+                             COLUMNS(ord FOR ORDINALITY, rid BIGINT PATH '$')) i
+                      JOIN JSON_TABLE(v_dists, '$[*]'
+                             COLUMNS(ord FOR ORDINALITY, d DOUBLE PATH '$')) d
+                        ON d.ord = i.ord
+                     ORDER BY d.d, i.rid LIMIT p_k) t), JSON_ARRAY());
+    ELSE
+        SET p_result = JSON_ARRAY();
+    END IF;
+
+    -- release the daemon's resident index
+    SET v_req = JSON_OBJECT('op', 'close', 'token', v_token);
+    CALL _fractalsql_index_call(v_req, v_resp);
+
+    -- a restricted search whose index shortlist left fewer than k rows of the set: scan the set exactly
+    IF v_idset IS NOT NULL AND JSON_LENGTH(p_result) < p_k THEN
+        CALL _fractalsql_exact_scan(p_table, v_pk, p_col, v_col_expr, p_query, p_k, v_idset, p_result, v_rowsscan);
+        SET SESSION group_concat_max_len = v_gcml;
+        SET p_stats = JSON_OBJECT('used_index', FALSE, 'rows_scanned', v_rowsscan,
+                                   'cells_probed', 0, 'index', NULL);
+        LEAVE fs_search;
+    END IF;
+
+    SET SESSION group_concat_max_len = v_gcml;
+    SET p_stats = JSON_OBJECT('used_index', TRUE, 'rows_scanned', v_rowsscan,
+                              'cells_probed', v_cellspro, 'index', v_name,
+                              'nprobe', v_nprobe);
+END fs_search$$
+
+-- fractal_index_candidates(table_name, vector_col, query [, options_json]) -> JSON
+--
+-- The candidate row ids for Scout: every row of the `near` nearest
+-- cells, plus `per_cell` representatives from every other cell, plus
+-- the rows that were added after the build (the delta).
+CREATE PROCEDURE fractal_index_candidates(
+    IN  p_table   VARCHAR(128),
+    IN  p_col     VARCHAR(64),
+    IN  p_query   LONGTEXT,
+    IN  p_options LONGTEXT,
+    OUT p_result  LONGTEXT
+)
+SQL SECURITY INVOKER
+
+BEGIN
+    DECLARE v_name    VARCHAR(64);
+    DECLARE v_exists  INT DEFAULT 0;
+    DECLARE v_meta    INT DEFAULT 0;
+    DECLARE v_gen     INT DEFAULT 0;
+    DECLARE v_maxid   BIGINT DEFAULT 0;
+    DECLARE v_model   LONGTEXT;
+    DECLARE v_token   VARCHAR(32);
+    DECLARE v_resp    LONGTEXT;
+    DECLARE v_req     LONGTEXT;
+    DECLARE v_near    INT DEFAULT 6;
+    DECLARE v_per     INT DEFAULT 1;
+    DECLARE v_cells   LONGTEXT;
+    DECLARE v_ncell   INT DEFAULT 0;
+    DECLARE v_ids     LONGTEXT DEFAULT '[]';
+    DECLARE v_pk      VARCHAR(64);
+    DECLARE v_opts    LONGTEXT DEFAULT '{}';
+    DECLARE v_i       INT DEFAULT 0;
+    DECLARE v_cellno  INT DEFAULT 0;
+    DECLARE v_cellids LONGTEXT;
+    DECLARE v_part    LONGTEXT;
+    DECLARE v_nearlist LONGTEXT;
+
+    IF p_options IS NULL OR p_options = '' THEN SET v_opts = '{}'; ELSE SET v_opts = p_options; END IF;
+    SET v_near = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.near')) AS SIGNED), 6);
+    SET v_per  = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.per_cell')) AS SIGNED), 1);
+
+    SET v_name = JSON_UNQUOTE(JSON_EXTRACT(v_opts, '$.index'));
+    SELECT COUNT(*) INTO v_meta FROM information_schema.tables
+     WHERE table_schema = DATABASE() AND table_name = 'fractal_index_meta';
+    IF v_name IS NULL AND v_meta > 0 THEN
+        SELECT name INTO v_name FROM fractal_index_meta WHERE tbl = p_table AND col = p_col LIMIT 1;
+    END IF;
+    IF v_name IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_candidates: no index on this table and column';
+    END IF;
+    SELECT COUNT(*) INTO v_exists FROM fractal_index_meta WHERE name = v_name;
+    IF v_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'fractal_index_candidates: no index with that name';
+    END IF;
+
+    SELECT generation, max_id, HEX(model) INTO v_gen, v_maxid, v_model
+      FROM fractal_index_meta WHERE name = v_name;
+
+    SET v_req = JSON_OBJECT('op', 'open', 'model', v_model);
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_token = JSON_UNQUOTE(JSON_EXTRACT(v_resp, '$.token'));
+
+    SET v_req = JSON_OBJECT('op', 'probe', 'token', v_token, 'query', p_query,
+                            'nprobe', GREATEST(v_near, 1));
+    CALL _fractalsql_index_call(v_req, v_resp);
+    SET v_cells = v_resp;
+    SET v_ncell = COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_cells, '$.n')) AS SIGNED), 0);
+    SET v_nearlist = '';
+
+    -- every row of the near cells
+    SET v_i = 0;
+    WHILE v_i < v_ncell DO
+        SET v_cellno = CAST(JSON_UNQUOTE(JSON_EXTRACT(v_cells, CONCAT('$.cells[', v_i, ']'))) AS SIGNED);
+        SET v_nearlist = CONCAT(v_nearlist, IF(v_nearlist = '', '', ','), v_cellno);
+        SET v_cellids = NULL;
+        SELECT ids INTO v_cellids FROM fractal_index_cells
+         WHERE name = v_name AND generation = v_gen AND cell = v_cellno;
+        IF v_cellids IS NOT NULL AND v_cellids <> '' THEN
+            SET v_ids = JSON_MERGE_PRESERVE(v_ids, CONCAT('[', v_cellids, ']'));
+        END IF;
+        SET v_i = v_i + 1;
+    END WHILE;
+
+    -- plus per_cell representatives from every other cell
+    IF v_per > 0 AND v_nearlist <> '' THEN
+        SET @_fi_others = NULL;
+        SET @_fi_others_sql = CONCAT(
+            'SELECT GROUP_CONCAT(cell SEPARATOR '','') FROM fractal_index_cells WHERE name = ',
+            QUOTE(v_name), ' AND generation = ', v_gen, ' AND cell NOT IN (', v_nearlist, ')');
+        PREPARE _fi_others_stmt FROM @_fi_others_sql;
+        EXECUTE _fi_others_stmt;
+        DEALLOCATE PREPARE _fi_others_stmt;
+        SET v_ncell = 0;
+        IF @_fi_others IS NOT NULL THEN
+            SET v_ncell = LENGTH(@_fi_others) - LENGTH(REPLACE(@_fi_others, ',', '')) + 1;
+        END IF;
+        SET v_i = 0;
+        WHILE v_i < v_ncell DO
+            SET v_cellno = CAST(SUBSTRING_INDEX(@_fi_others, ',', v_i + 1) AS SIGNED);
+            SET v_cellids = NULL;
+            SELECT ids INTO v_cellids FROM fractal_index_cells
+             WHERE name = v_name AND generation = v_gen AND cell = v_cellno;
+            IF v_cellids IS NOT NULL AND v_cellids <> '' THEN
+                SET v_part = SUBSTRING_INDEX(v_cellids, ',', v_per);
+                SET v_ids = JSON_MERGE_PRESERVE(v_ids, CONCAT('[', v_part, ']'));
+            END IF;
+            SET v_i = v_i + 1;
+        END WHILE;
+    END IF;
+
+    -- the delta: the rows that were added after the build
+    CALL _fractalsql_index_pk(p_table, v_pk);
+    SET @_fi_delta_sql = CONCAT(
+        'SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(v_pk), ') INTO @_fi_delta FROM ',
+        _fractalsql_quote_bare_table(p_table), ' WHERE ',
+        _fractalsql_quote_ident(v_pk), ' > ', v_maxid);
+    SET @_fi_delta = NULL;
+    PREPARE _fi_delta_stmt FROM @_fi_delta_sql;
+    EXECUTE _fi_delta_stmt;
+    DEALLOCATE PREPARE _fi_delta_stmt;
+    IF @_fi_delta IS NOT NULL THEN
+        SET v_ids = JSON_MERGE_PRESERVE(v_ids, @_fi_delta);
+    END IF;
+
+    SET v_req = JSON_OBJECT('op', 'close', 'token', v_token);
+    CALL _fractalsql_index_call(v_req, v_resp);
+
+    SET p_result = v_ids;
+END$$
+
+DELIMITER ;
 
 -- Verify installation:
 --   SELECT name, dl FROM mysql.func;

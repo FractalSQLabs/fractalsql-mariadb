@@ -79,8 +79,16 @@ FRACTALSQL_CONFIG="$work/fractalsqld.conf" "$MARIADBD_BIN" --no-defaults --datad
     --socket="$work/mdb.sock" --skip-networking --plugin-dir="$work/plugins" \
     --pid-file="$work/mdb.pid" --log-error="$work/mdb.err" --user="$user" </dev/null >/dev/null 2>&1 &
 i=0
-while ! "$MARIADB_ADMIN_BIN" --no-defaults -uroot -S "$work/mdb.sock" ping >/dev/null 2>&1 && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
-mdb < "$here/sql/install_spike.sql" >"$work/install_sql.log" 2>&1 || { bad "install_spike.sql"; exit 1; }
+# 60s, not 10: the server initialises InnoDB before it accepts connections,
+# and on a loaded host that took 10.4s once -- a hair over the old 10s
+# budget, which turned into "install_spike.sql" failing on a server that
+# was about to come up. The ping is checked afterwards, so a server that
+# never starts says so instead of failing the next step.
+while ! "$MARIADB_ADMIN_BIN" --no-defaults -uroot -S "$work/mdb.sock" ping >/dev/null 2>&1 && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+if ! "$MARIADB_ADMIN_BIN" --no-defaults -uroot -S "$work/mdb.sock" ping >/dev/null 2>&1; then
+  bad "the server did not start (see $work/mdb.err)"; tail -5 "$work/mdb.err" 2>/dev/null; exit 1
+fi
+mdb < "$here/sql/install_spike.sql" >"$work/install_sql.log" 2>&1 || { bad "install_spike.sql"; cat "$work/install_sql.log"; exit 1; }
 ok "server up and spike UDFs installed"
 
 queries > "$work/out.log"
@@ -92,7 +100,7 @@ queries > "$work/out.log"
 # expected row has no regex metacharacters, so a literal match is both
 # portable and simpler.
 dims_row=$(printf '3\t2\tNULL\tNULL')
-if grep -qx "2.0.13" "$work/out.log" && grep -qxF "$dims_row" "$work/out.log" && grep -q "expected 1 argument, got 0" "$work/out.log"; then ok "SQL values correct (version, dims, NULL handling, arity error)"; else bad "SQL values (see $work/out.log)"; fi
+if grep -qx "2.0.14" "$work/out.log" && grep -qxF "$dims_row" "$work/out.log" && grep -q "expected 1 argument, got 0" "$work/out.log"; then ok "SQL values correct (version, dims, NULL handling, arity error)"; else bad "SQL values (see $work/out.log)"; fi
 
 echo "== A5: kill fractalsqld, server must survive"
 kill "$daemon_pid" 2>/dev/null; wait "$daemon_pid" 2>/dev/null
@@ -103,7 +111,7 @@ mdb -e "SELECT 1;" >/dev/null 2>&1 && ok "server still answers after daemon deat
 echo "== lazy reconnect"
 start_daemon
 out=$(mdb -e "SELECT fractal_version();" 2>&1)
-case "$out" in *2.0.13*) ok "shim reconnects to a restarted daemon";; *) bad "no reconnect: $out";; esac
+case "$out" in *2.0.14*) ok "shim reconnects to a restarted daemon";; *) bad "no reconnect: $out";; esac
 
 echo "== frame-level auth"
 if "$here/build/frame_test" "$work/fsqld.sock" "$(cat "$work/hmac.key")"; then ok "frame_test: valid PING, bad tag, oversize length"; else bad "frame_test"; fi

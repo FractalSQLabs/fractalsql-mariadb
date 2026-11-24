@@ -226,10 +226,10 @@ SELECT fractal_reason(
 -- ------------------------------------------------------------------
 -- === 5. Sniper Search: converge toward an ideal-customer profile ===
 -- Query: recent + frequent + high-value (a "Champions"-shaped target).
--- fractal_search is 4-arg here (corpus, query, k, params); corpus=''
+-- fractal_sfs_converge is 4-arg here (corpus, query, k, params); corpus=''
 -- (empty corpus, src/fractalsql.c's own documented convention) + k=1
 -- runs Sniper mode with no real corpus, same as demo.sql Section 2.
-SELECT fractal_search('', '[-0.7, 0.7, 0.7]', 1, '{"iterations": 50}') AS ideal_profile;
+SELECT fractal_sfs_converge('', '[-0.7, 0.7, 0.7]', 1, '{"iterations": 50}') AS ideal_profile;
 -- Read the result as a DIRECTION to aim for, not a literal target
 -- coordinate. Cosine similarity (what Sniper optimizes for) is
 -- scale-invariant, so every point along the same ray as the query

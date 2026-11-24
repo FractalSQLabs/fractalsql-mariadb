@@ -70,3 +70,4 @@ crash-*
 timeout-*
 oom-*
 leak-*
+*.mmd

@@ -90,6 +90,25 @@ namespace fsqlmcp
                             ? a.at( "max_points" ).get<int>() : 16 ) ) } );
             }, true ) );
 
+        t.push_back( mkTool( "fractal_chunk_text", "analytics", "pure", ToolClass::Cheap,
+            "Split text into chunks of at most chunk_size characters (code points) and return a JSON array of "
+            "{no, start, end, text}; start and end are character offsets, end exclusive. chunk_mode paragraph "
+            "(default) packs whole paragraphs, sentence packs whole sentences, fixed cuts every chunk_size - "
+            "chunk_overlap characters; a paragraph or sentence longer than chunk_size is cut with chunk_overlap "
+            "shared. Pure: no model, the same output on every FractalSQL host.",
+            { Str( "text", true, "the text to split" ),
+              Int( "chunk_size", true, "largest chunk in characters, 1..100000", 800 ),
+              Int( "chunk_overlap", false, "characters shared by neighbouring pieces when a paragraph or sentence has to be cut, 0..chunk_size-1", 0 ),
+              Str( "chunk_mode", false, "paragraph, sentence or fixed", "paragraph" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_chunk_text(?, ?, ?, ?)",
+                    { SqlValue( a.at( "text" ).get<std::string>() ),
+                      SqlValue( static_cast<std::int64_t>( a.value( "chunk_size", 800 ) ) ),
+                      SqlValue( static_cast<std::int64_t>( a.value( "chunk_overlap", 0 ) ) ),
+                      SqlValue( a.value( "chunk_mode", std::string( "paragraph" ) ) ) } );
+            }, true ) );
+
         t.push_back( mkTool( "fractal_periodogram", "analytics", "pure", ToolClass::Cheap,
             "Classical periodogram via an exact O(n^2) DFT (not an FFT). Returns "
             "{'freqs':[...],'power':[...]}: the top max_peaks bins, descending power. "
@@ -248,6 +267,122 @@ namespace fsqlmcp
                       SqlValue( packFlat( a.at( "b" ), "b" ) ) } );
             }, true ) );
 
+
+        // The vector algebra: the same shape as the other hosts' tools -- a
+        // vector comes back as a JSON array of numbers, a scalar as the
+        // number itself.
+        t.push_back( mkTool( "fractal_vector_dims", "analytics", "pure", ToolClass::Cheap,
+            "The vector's dimension: how many components it has. Check it before handing a vector "
+            "to the vectorizer.",
+            { Vec( "v", true, "the vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_dims(?)",
+                    { SqlValue( packVector( a.at( "v" ), "v" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_norm", "analytics", "pure", ToolClass::Cheap,
+            "The vector's L2 norm (its magnitude).",
+            { Vec( "v", true, "the vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_norm(?)",
+                    { SqlValue( packVector( a.at( "v" ), "v" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_normalize", "analytics", "pure", ToolClass::Cheap,
+            "The vector scaled to unit length, so a distance between two vectors reflects direction "
+            "only. Returned as a JSON array of numbers.",
+            { Vec( "v", true, "the vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_to_json(fractal_vector_normalize(?))",
+                    { SqlValue( packVector( a.at( "v" ), "v" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_add", "analytics", "pure", ToolClass::Cheap,
+            "The element-wise sum of two vectors. Returned as a JSON array of numbers.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind(
+                    "SELECT fractal_vector_to_json(fractal_vector_add(?, ?))",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_sub", "analytics", "pure", ToolClass::Cheap,
+            "The element-wise difference of two vectors. Returned as a JSON array of numbers.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind(
+                    "SELECT fractal_vector_to_json(fractal_vector_sub(?, ?))",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_l2_distance", "analytics", "pure", ToolClass::Cheap,
+            "The L2 (Euclidean) distance between two vectors.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_l2_distance(?, ?)",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_l2_squared", "analytics", "pure", ToolClass::Cheap,
+            "The squared L2 distance: the same measure without the square root.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_l2_squared(?, ?)",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_cosine_distance", "analytics", "pure", ToolClass::Cheap,
+            "The cosine distance between two vectors: 0 when they point the same way, 1 when they are "
+            "orthogonal.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_cosine_distance(?, ?)",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_cosine_similarity", "analytics", "pure", ToolClass::Cheap,
+            "The cosine similarity between two vectors: 1 when they point the same way, 0 when they "
+            "are orthogonal.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_cosine_similarity(?, ?)",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_negative_inner_product", "analytics", "pure", ToolClass::Cheap,
+            "The negative inner product of two vectors.",
+            { Vec( "a", true, "first vector" ), Vec( "b", true, "second vector" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_negative_inner_product(?, ?)",
+                    { SqlValue( packVector( a.at( "a" ), "a" ) ),
+                      SqlValue( packVector( a.at( "b" ), "b" ) ) } );
+            }, true ) );
+
+        t.push_back( mkTool( "fractal_vector_scale", "analytics", "pure", ToolClass::Cheap,
+            "The vector multiplied by a scalar factor. Returned as a JSON array of numbers.",
+            { Vec( "v", true, "the vector" ), Num( "s", true, "the factor to scale by" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callScalarBind( "SELECT fractal_vector_to_json(fractal_vector_scale(?, ?))",
+                    { SqlValue( packVector( a.at( "v" ), "v" ) ),
+                      SqlValue( a.at( "s" ).get<double>() ) } );
+            }, true ) );
         t.push_back( mkTool( "fractal_vector", "analytics", "pure", ToolClass::Cheap,
             "Builds the zero vector of the given dimension in the CANONICAL form: a fixed binary "
             "layout (uint16 dim LE, uint16 reserved, then dim little-endian float32 values) "

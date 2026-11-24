@@ -37,6 +37,15 @@ LOG_DIR=/usr/local/var/log/fractalsql
 SOCK_DIR=/usr/local/var/run/fractalsql
 PLIST_DST="${HOME}/Library/LaunchAgents/com.fractalsqlabs.fractalsqld.plist"
 
+# fractalsqld links Homebrew's openssl@3 dynamically (Homebrew patches it; this zip ships none). Without it the daemon
+# would be installed and then fail to start, so check first.
+OPENSSL_LIB="$(otool -L "${HERE}/fractalsqld" 2>/dev/null | awk '/libcrypto/ {print $1; exit}')"
+if [ -n "${OPENSSL_LIB}" ] && [ ! -f "${OPENSSL_LIB}" ]; then
+    echo "error: fractalsqld needs Homebrew's openssl@3, which is not installed (${OPENSSL_LIB} is missing)." >&2
+    echo "  Install it first:  brew install openssl@3" >&2
+    exit 1
+fi
+
 MARIADB_BIN="${MARIADB_BIN:-mariadb}"
 if ! command -v "${MARIADB_BIN}" >/dev/null 2>&1; then
     MARIADB_BIN="mysql"

@@ -51,7 +51,7 @@
     tests\mock_enterprise_core.c), 36
     morphology_metrics (the four Analytics-tier mesh/graph UDFs,
     known-answer/edge-case asserted), 39 mcp_smoke (the full MCP server
-    session against the scratch cluster: initialize, the 93-tool
+    session against the scratch cluster: initialize, the 99-tool
     catalog, per-tier tools/call round trips, $/cancel with KILL QUERY,
     resources+prompts, and the S-FT-004 partial-reasoning case through
     the admin tools -- driver: mcp\tests\mcp_smoke_client.py; self-skips
@@ -67,7 +67,7 @@
     gate_48_t2s_review_isolation is the POSIX twin), 49
     config_overlay (the per-session configuration overlay's five SQL
     functions -- set/get/list/reset/keys -- the canonical vector form
-    (fractal_vector/from_text/to_json) and fractal_search_debug; the
+    (fractal_vector/from_text/to_json) and fractal_sfs_converge_debug; the
     MCP's own half of the overlay contract is proven by gate 39)
     51 udf_sweeps, 52 validators, 55 ledger_forged, 58 enterprise_loading
     and 60 scripted_replies (the robustness gates that need only the SQL
@@ -270,6 +270,8 @@ $MdbDir = (Resolve-Path -LiteralPath $MdbDir -ErrorAction Stop).Path
 $ErrorActionPreference = "Stop"
 # Test fixtures load unsigned mock plugins and an unsigned mock enterprise core; the product defaults are exercised explicitly where tested.
 if (-not $env:FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE) { $env:FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = "0" }
+# The destructive ledger operations are off unless the server's environment enables them; the gates exercise them.
+if (-not $env:FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE) { $env:FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE = "1" }
 if (-not $env:FSQL_REASONING_REQUIRE_SIGNATURE) { $env:FSQL_REASONING_REQUIRE_SIGNATURE = "0" }
 # PowerShell 7.3+ can treat ANY native-command stderr write as a
 # terminating error under $ErrorActionPreference = 'Stop' -- regardless
@@ -296,9 +298,9 @@ Set-Location $Here
 # ("[SKIP] N enterprise*: skipped (community edition; no fractalsql-
 # enterprise-sovereign-c.* shared lib in include/)"), instead of
 # silently omitting the opt-in gates from the transcript.
-$DefaultGates = @("01","02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31","32","33","34","35","36","39","40","41","42","43","44","45","47","48","49","50","51","52","55","58","60","66","68","37","38","46","53","54","56","57","59","61","62","63","64","65","67")
+$DefaultGates = @("01","02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31","32","33","34","35","36","39","40","41","42","43","44","45","47","48","49","50","51","52","55","58","60","66","68","37","38","46","53","54","56","57","59","61","62","63","64","65","69","70","71","72","73","74","75","76","77","78","79","80","81","82","83","84","85","86","87")
 $QuickGates   = @("01", "02")
-$FuzzGates    = @("30")
+$FuzzGates    = @("30", "67")
 
 if ($Asan -or $Ubsan) { if (-not $PSBoundParameters.ContainsKey('TimeoutMult')) { $TimeoutMult = 3 } }
 
@@ -997,6 +999,15 @@ function Mdb-Setup {
     $script:DataDir = "$env:TEMP\fractalsql_bt_data_$suffix"
     $script:PlugDir = "$env:TEMP\fractalsql_bt_plugin_$suffix"
     $script:Port = 13300 + ([int]($Major -replace '\D', '') % 100)
+    # The DB-backed gate drivers (tests\test_precision.py, tests\test_index.py,
+    # tests\_t2s_common.py) reach the server over TCP through the MariaDB
+    # Connector/Python, whose defaults are 127.0.0.1:3306 -- not this
+    # cluster's port. Without these the drivers print SKIP and the gates
+    # record a skip, which is a pass in the log but proves nothing.
+    $env:FRACTALSQL_HOST = '127.0.0.1'
+    $env:FRACTALSQL_PORT = "$($script:Port)"
+    $env:FRACTALSQL_USER = 'root'
+    $env:FRACTALSQL_DB = 'fractalsql_bt'
     Remove-Item -Recurse -Force $script:DataDir -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $script:PlugDir -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
@@ -1304,6 +1315,28 @@ function Mdb-Teardown {
     if ($script:PlugDir) { Remove-Item -Recurse -Force $script:PlugDir -ErrorAction SilentlyContinue }
 }
 
+# The gates that build the mock enterprise core leave its import .lib, the
+# linker's .exp and the compile's .obj beside the DLL in %TEMP%, and
+# nothing took them away: a run used to litter the temp directory with a
+# set per mock per run. The names carry this build's tag, so only this
+# run's are removed.
+#
+# This runs at the END of the run, not in Mdb-Teardown: the teardown also
+# runs MID-run (a gate that restarts the daemon to pick up a new
+# FRACTALSQL_ENTERPRISE_LIB calls it), and the gate that builds the mock
+# has already built it by then -- taking it away there would leave the
+# enterprise tier dormant for the very gate that needs it.
+function Remove-MockEnterpriseArtifacts {
+    $tag = $MdbMajor -replace '\.', '_'
+    foreach ($base in @("fractalsql_bt_mock_ent_$tag", "fractalsql_bt_robust_mock_$tag")) {
+        foreach ($ext in @(".dll", ".badsig.dll", ".nosig.dll", ".sig", ".badsig.sig",
+                           ".lib", ".exp", ".obj")) {
+            Remove-Item -LiteralPath "$env:TEMP\$base$ext" -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -LiteralPath "$env:TEMP\fractalsql_bt_mock_ent_fail_$tag" -Force -ErrorAction SilentlyContinue
+}
+
 # --- gates ---------------------------------------------------------------
 
 # --- gate 01: build --------------------------------------------------
@@ -1394,7 +1427,41 @@ function Gate-01-Build {
         $env:VCPKG_ROOT = Resolve-VcpkgRoot
         try {
             & "$Here\scripts\windows\build.bat"
-            if ($LASTEXITCODE -ne 0) { Fail "01 build"; return $false }
+            if ($LASTEXITCODE -ne 0) {
+                # The linker's own error for a file a running process still has
+                # mapped (LNK1168: cannot open ... for writing) does not say
+                # who holds it. The usual holder is the INSTALLED fractalsqld
+                # service, which runs from this very dist tree (the MSI puts
+                # it there) -- so name the service and say what to do. The
+                # sanitizer cells build into their own dist trees and are not
+                # affected by it.
+                $svc = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+                         Where-Object { $_.PathName -and $_.PathName -like "*$DaemonExe*" })
+                if ($svc.Count -gt 0) {
+                    foreach ($s in $svc) {
+                        Write-Host ("    the Windows service '{0}' runs from {1} and holds it open." -f $s.Name, $DaemonExe)
+                    }
+                    Write-Host ("    stop the service (sc stop {0}) and re-run, or build a cell that has a dist tree of its own (-Asan / -Ubsan)." -f $svc[0].Name)
+                }
+                # Otherwise: name the process that has the file mapped (a
+                # leftover daemon from an interrupted run). Processes that deny
+                # module access are skipped.
+                $holders = @()
+                foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
+                    try {
+                        if ($proc.Modules | Where-Object { $_.FileName -eq $DaemonExe }) {
+                            $cmd = try { (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction Stop).CommandLine } catch { '' }
+                            $holders += "$($proc.ProcessName) (PID $($proc.Id)) $cmd"
+                        }
+                    } catch { }
+                }
+                if ($holders.Count -gt 0) {
+                    Write-Host ("    a running process still holds {0}: {1}" -f $DaemonExe, ($holders -join '; '))
+                    Write-Host "    stop it (a fractalsqld.exe left behind by an interrupted run) and re-run."
+                }
+                Fail "01 build"
+                return $false
+            }
         } finally {
             Remove-Item Env:\CC_DAEMON, Env:\CRT_FLAG, Env:\SAN_FLAGS, Env:\LINK_EXPORTS -ErrorAction SilentlyContinue
         }
@@ -1488,6 +1555,51 @@ function Gate-30-FuzzSmoke {
     }
 }
 
+# Normalize-Captured <text> -- the line endings a POSIX shell would have
+# seen for the same output.
+#
+# The MariaDB client and the python drivers both write CRLF on Windows, and
+# PowerShell's Out-String appends a CRLF of its own. The POSIX twin captures
+# the same output with $(...), which strips trailing newlines and leaves LF
+# endings -- so the two hosts do NOT see the same bytes today, and a gate
+# that anchors a regex with $ fails on a value that is otherwise perfectly
+# correct: the trailing \r is not in the class, and the $ anchor is only
+# reached after it. That is exactly how "fractal_vector_norm answers"
+# became a Windows-only FAIL on a value that was right all along.
+#
+# This is the Windows counterpart of that capture: CRLF becomes LF, and the
+# trailing newline goes away, so every gate below compares the same bytes
+# the POSIX gate compares. A LONE CR is left alone -- unlike a CRLF, it is
+# not a line separator here and can be part of a value.
+function Normalize-Captured([string]$Text) {
+    if ($null -eq $Text) { return "" }
+    return ($Text -replace "`r`n", "`n").TrimEnd([char]10, [char]13)
+}
+
+# Mdb-Sql <statement> -- runs one statement through the client and returns
+# its output. A statement that carries a DOUBLE QUOTE is written to a temp
+# file and sourced instead of being passed on the command line: Windows'
+# command-line rules split an argument at a quote, so the fragment that
+# falls off the end is taken by the client as the DATABASE name -- the
+# statement then never runs and the client reports "Unknown database
+# 'iterations\:50,population_size\:30}');'". Sourcing keeps the statement
+# in one piece on every shell and every PowerShell version.
+#
+# The output is normalized (see Normalize-Captured) so that it matches what
+# the POSIX gate's $(...) capture would have produced.
+function Mdb-Sql([string]$Sql) {
+    if ($Sql.Contains('"')) {
+        $f = Join-Path $env:TEMP ("fsql_bt_sql_" + [guid]::NewGuid().ToString("N") + ".sql")
+        Set-Content -LiteralPath $f -Value $Sql -Encoding ascii
+        try {
+            return (Normalize-Captured (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "source $f" 2>&1 | Out-String))
+        } finally {
+            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return (Normalize-Captured (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e $Sql 2>&1 | Out-String))
+}
+
 function Gate-02-Smoke {
     # src\fractalsql.c defines the version via a macro, not a literal:
     #   #define FSQL_VERSION "2.0.0"          (line ~74)
@@ -1505,8 +1617,8 @@ function Gate-02-Smoke {
     if ($ed -and $ed -notmatch "ERROR") { Pass "02 smoke: edition=$ed" } else { Fail "02 smoke: edition='$ed'" }
 
     $r = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e `
-        "SELECT fractal_search('[[1,0],[0,1],[0.6,0.8]]', '[0.6,0.8]', 3, '{\`"iterations\`":50,\`"population_size\`":30}');" 2>&1
-    if ($r -match '"best_point"') { Pass "02 smoke: fractal_search returns best_point" } else { Fail "02 smoke: fractal_search='$r'" }
+        "SELECT fractal_sfs_converge('[[1,0],[0,1],[0.6,0.8]]', '[0.6,0.8]', 3, '{\`"iterations\`":50,\`"population_size\`":30}');" 2>&1
+    if ($r -match '"best_point"') { Pass "02 smoke: fractal_sfs_converge returns best_point" } else { Fail "02 smoke: fractal_sfs_converge='$r'" }
 }
 
 function Gate-03-SchemaContext {
@@ -1853,10 +1965,10 @@ function Gate-12-Soak {
     $ok = $true
     $lastOut = ""
     for ($i = 0; $i -lt 30; $i++) {
-        $lastOut = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_search('[[1,0,0],[0,1,0],[0,0,1]]', '[0.6,0.8,0]', 2, '{}');" 2>&1
+        $lastOut = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_sfs_converge('[[1,0,0],[0,1,0],[0,0,1]]', '[0.6,0.8,0]', 2, '{}');" 2>&1
         if ($lastOut -notmatch '"best_point"') { $ok = $false; break }
     }
-    if ($ok) { Pass "12 soak: 30x fractal_search all returned a valid result" } else { Fail "12 soak: a soak iteration failed: $lastOut" }
+    if ($ok) { Pass "12 soak: 30x fractal_sfs_converge all returned a valid result" } else { Fail "12 soak: a soak iteration failed: $lastOut" }
 }
 
 function Gate-13-VectorizerEmbed {
@@ -2553,10 +2665,10 @@ CALL fractal_vectorizer_create('bt_embed_crash', 'body', 'embedding', NULL, @vid
 }
 
 function Gate-19-SfsBounds {
-    $r = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_search('[[1,0]]', '[1,0]', 0, '{}');" 2>&1
+    $r = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_sfs_converge('[[1,0]]', '[1,0]', 0, '{}');" 2>&1
     if ($r -match "k must be 1\.\.1000000|ERROR") { Pass "19 sfs_bounds: k=0 rejected" } else { Fail "19 sfs_bounds: expected k=0 rejection, got: $r" }
 
-    $r2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_search('[[1,0]]', '[1,0]', 2000000, '{}');" 2>&1
+    $r2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_sfs_converge('[[1,0]]', '[1,0]', 2000000, '{}');" 2>&1
     if ($r2 -match "k must be 1\.\.1000000|ERROR") { Pass "19 sfs_bounds: k=2000000 rejected" } else { Fail "19 sfs_bounds: expected k=2000000 rejection, got: $r2" }
 
     # Oversized-query (>4MiB) rejection, same recipe as the Linux
@@ -2568,7 +2680,7 @@ function Gate-19-SfsBounds {
     # through the console codepage -- a temp file sidesteps both.
     $big = "[" + ("1," * 2100000) + "1]"            # > 4 MiB of text
     $bigSql = "$Here\.gate19_big.sql"
-    [System.IO.File]::WriteAllText($bigSql, "SELECT fractal_search('[[1,0]]', '$big', 1, '{}');")
+    [System.IO.File]::WriteAllText($bigSql, "SELECT fractal_sfs_converge('[[1,0]]', '$big', 1, '{}');")
     try {
         $r3 = cmd /c "`"$script:MariadbExe`" --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N < `"$bigSql`" 2>&1"
         if (($r3 -join ' ') -match "ERROR|NULL") { Pass "19 sfs_bounds: oversized query (>4MiB) rejected" } else { Fail "19 sfs_bounds: expected oversized-query rejection, got: $(($r3 -join ' ').Substring(0, [Math]::Min(120, ($r3 -join ' ').Length)))" }
@@ -2583,9 +2695,9 @@ function Gate-19-SfsBounds {
         (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e $sql 2>&1 | Out-String).Trim()
     }
     $wrapRows = @(
-        @('search_debug iterations', "SELECT fractal_search_debug('[1,2,3]', {N}, 10, 2, 42);", 20),
-        @('search_debug population', "SELECT fractal_search_debug('[1,2,3]', 20, {N}, 2, 42);", 10),
-        @('search_debug diffusion', "SELECT fractal_search_debug('[1,2,3]', 20, 10, {N}, 42);", 2),
+        @('search_debug iterations', "SELECT fractal_sfs_converge_debug('[1,2,3]', {N}, 10, 2, 42);", 20),
+        @('search_debug population', "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, {N}, 2, 42);", 10),
+        @('search_debug diffusion', "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, {N}, 42);", 2),
         @('state_fingerprint n_bits', "SELECT fractal_state_fingerprint('1,2,3', {N}, 42);", 64)
     )
     $wrapBad = @()
@@ -2599,7 +2711,7 @@ function Gate-19-SfsBounds {
     }
     if ($wrapBad.Count -eq 0) { Pass "19 sfs_bounds: $($wrapRows.Count) integer arguments reject a value that wraps back into range" }
     else { Fail "19 sfs_bounds: integer arguments past int range: $($wrapBad -join '; ')" }
-    $rk = Invoke-Bt19 "SELECT fractal_search('[[1,0]]', '[1,0]', 4294967297, '{}');"
+    $rk = Invoke-Bt19 "SELECT fractal_sfs_converge('[[1,0]]', '[1,0]', 4294967297, '{}');"
     if ($rk -match "k must be 1\.\.1000000|ERROR") { Pass "19 sfs_bounds: k=4294967297 (wraps to 1) rejected" } else { Fail "19 sfs_bounds: k that wraps to 1 was accepted: $rk" }
     $rb = Invoke-Bt19 "SELECT fractal_state_fingerprint('1,2,3', 33554425, 42);"
     if ($rb -eq 'NULL') { Pass '19 sfs_bounds: state_fingerprint refuses an n_bits past the 4 MiB ceiling' } else { Fail "19 sfs_bounds: state_fingerprint accepted n_bits past the ceiling: $rb" }
@@ -2608,7 +2720,7 @@ function Gate-19-SfsBounds {
     if ($rw -eq 'NULL') { Pass '19 sfs_bounds: state_fingerprint refuses n_bits x length past the work bound' } else { Fail "19 sfs_bounds: state_fingerprint accepted n_bits x length past the work bound: $rw" }
     # The other bounded costs. Values are built in SQL so no argument is large;
     # a refused call answers NULL.
-    $rbig = Invoke-Bt19 "SELECT fractal_search_debug(CONCAT('[', REPEAT('0.5,', 999), '0.5]'), 1000, 1000, 8, 42);"
+    $rbig = Invoke-Bt19 "SELECT fractal_sfs_converge_debug(CONCAT('[', REPEAT('0.5,', 999), '0.5]'), 1000, 1000, 8, 42);"
     if ($rbig -eq 'NULL') { Pass '19 sfs_bounds: search_debug refuses iterations x population x diffusion x dim past the work bound' } else { Fail "19 sfs_bounds: search_debug accepted a search past the work bound: $rbig" }
     $rbig = Invoke-Bt19 "SELECT fractal_periodogram(CONCAT(REPEAT('0.1,', 1048576), '0.1'), 3);"
     if ($rbig -eq 'NULL') { Pass '19 sfs_bounds: periodogram refuses a series past 1048576 samples' } else { Fail "19 sfs_bounds: periodogram accepted a series past 1048576 samples: $rbig" }
@@ -3134,6 +3246,8 @@ function Gate-32-NewPrimitives {
     $pg = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_periodogram('$sine', 4);" 2>&1
     $pgJoined = ($pg -join "`n")
     if ($pgJoined -match '"freqs"') { Pass "32 new_primitives: periodogram returned peaks" } else { Fail "32 new_primitives: periodogram='$pgJoined'" }
+    $pgShape = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT CONCAT(JSON_LENGTH(JSON_KEYS('$pgJoined')), '|', JSON_CONTAINS_PATH('$pgJoined', 'all', '`$.freqs', '`$.power'), '|', JSON_LENGTH('$pgJoined', '`$.freqs') = JSON_LENGTH('$pgJoined', '`$.power'));" 2>&1) -join ''
+    if ($pgShape -eq '2|1|1') { Pass "32 new_primitives: periodogram document has exactly the keys freqs and power, of equal length" } else { Fail "32 new_primitives: periodogram document shape: $pgShape" }
 
     # Note: '$.freqs[0]' etc. are literal inside these double-quoted
     # strings -- PowerShell only interpolates $ followed by a name
@@ -3529,9 +3643,29 @@ function Gate-25-Enterprise {
 # a real Windows enterprise release, since none has been staged here;
 # flagged as the single most likely thing to need adjusting on a real
 # run).
+# The enterprise core the enterprise gates run against: the REAL library when it exists in include/ (or FSQL_ENT_SO names it), otherwise the
+# mock core (tests\mock_enterprise_core.c, built here with cl.exe). Returns @{ Path; Kind } with Kind 'real' or 'mock', or $null when neither
+# is available. The mock answers the same entry points but not the real ledger's content or signature, so the checks that need the real core
+# test Kind.
+function Resolve-EntLib {
+    $real = $env:FSQL_ENT_SO
+    if (-not $real -or -not (Test-Path $real)) { $real = "$Here\include\windows-x86_64\fractalsql-enterprise-sovereign-c.dll" }
+    if (Test-Path $real) { return [pscustomobject]@{ Path = $real; Kind = 'real' } }
+    $mockSo = "$env:TEMP\fractalsql_bt_mdb_mock_enterprise.dll"
+    if (-not (Test-Path $mockSo)) {
+        $obj = [System.IO.Path]::ChangeExtension($mockSo, '.obj')
+        $src = Join-Path $Here 'tests\mock_enterprise_core.c'
+        $inc = Join-Path $Here 'include'
+        $null = & cl.exe /nologo /MT /LD /DFSQL_BUILDING_DLL "/I$inc" $src "/Fo$obj" "/Fe$mockSo" 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $mockSo)) { return $null }
+    }
+    return [pscustomobject]@{ Path = $mockSo; Kind = 'mock' }
+}
+
 function Gate-26-EnterpriseActive {
-    $entDll = "$Here\include\windows-x86_64\fractalsql-enterprise-sovereign-c.dll"
-    if (-not (Test-Path $entDll)) { Skip "26 enterprise_active: no enterprise library found (include/)"; return }
+    $ent = Resolve-EntLib
+    if (-not $ent) { Fail "26 enterprise_active: no enterprise library (the mock core did not build)"; return }
+    $entDll = $ent.Path
 
     $ledgerPath = "$Here\.gate26_ledger.dat"
     Remove-Item $ledgerPath -ErrorAction SilentlyContinue
@@ -3557,10 +3691,10 @@ function Gate-26-EnterpriseActive {
     & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e "SELECT fractal_feedback_report(CONNECTION_ID(), 1, 'positive', 500);" 2>&1 | Out-Null
     $fl = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_ledger_flush(CONNECTION_ID());" 2>&1
     $fileOk = (Test-Path $ledgerPath) -and ((Get-Item $ledgerPath).Length -gt 0)
-    if ($fl -eq "0" -and $fileOk) { Pass "26 enterprise_active: flush genuinely persists to a real ledger file" } else { Fail "26 enterprise_active: expected flush=0 and a non-empty $ledgerPath, got flush=$fl" }
+    if ($ent.Kind -ne 'real') { if ($fl -eq "0") { Pass "26 enterprise_active: flush answers through the mock core (the real core persists a ledger file)" } else { Fail "26 enterprise_active: expected flush=0 with the mock core, got: $fl" } } else { if ($fl -eq "0" -and $fileOk) { Pass "26 enterprise_active: flush genuinely persists to a real ledger file" } else { Fail "26 enterprise_active: expected flush=0 and a non-empty $ledgerPath, got flush=$fl" } }
 
     $v1 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_ledger_verify(CONNECTION_ID());" 2>&1
-    if ($v1 -eq '{"ok":true,"rows_verified":1}') { Pass "26 enterprise_active: fractal_ledger_verify confirms the 1-row chain" } else { Fail "26 enterprise_active: expected 1-row ok verify, got: $v1" }
+    if ($ent.Kind -ne 'real') { if ($v1 -like '{"ok":true,*') { Pass "26 enterprise_active: fractal_ledger_verify reports a valid chain (mock core)" } else { Fail "26 enterprise_active: expected an ok verify with the mock core, got: $v1" } } else { if ($v1 -eq '{"ok":true,"rows_verified":1}') { Pass "26 enterprise_active: fractal_ledger_verify confirms the 1-row chain" } else { Fail "26 enterprise_active: expected 1-row ok verify, got: $v1" } }
 
     # Cross-PROCESS rehydration: restart mariadbd.exe (in-memory ledgers
     # reset to empty by construction), then load must pull the persisted
@@ -3575,6 +3709,7 @@ function Gate-26-EnterpriseActive {
     # build_test.sh's python3 tamper step uses): both verify and load's
     # O(1) tip check must catch it (a shallow tamper, in scope for the
     # tip check). No python3 dependency here -- plain .NET file I/O.
+    if ($ent.Kind -eq 'real') {   # the mock core writes no ledger file: the tamper checks need the real core
     $bytes = [System.IO.File]::ReadAllBytes($ledgerPath)
     $idx = $bytes.Length - 5
     $bytes[$idx] = $bytes[$idx] -bxor 0xFF
@@ -3585,6 +3720,7 @@ function Gate-26-EnterpriseActive {
 
     $ld2 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_ledger_load(CONNECTION_ID());" 2>&1
     if ($ld2 -eq "NULL") { Pass "26 enterprise_active: load refuses a tampered latest record (O(1) tip check)" } else { Fail "26 enterprise_active: expected NULL (refused) loading a tampered ledger, got: $ld2" }
+    }
 
     Remove-Item Env:\FRACTALSQL_ENTERPRISE_LIB, Env:\FRACTALSQL_ENTERPRISE_LEDGER_PATH -ErrorAction SilentlyContinue
     Remove-Item $ledgerPath -ErrorAction SilentlyContinue
@@ -3771,7 +3907,7 @@ function Gate-48-T2SReviewIsolation {
 # These three groups are the SQL half of the surface the MCP's admin
 # tools sit on: the overlay is what fractalsql_session_config_* reads
 # and writes, the canonical vector form is what the vector tools carry
-# between calls, and fractal_search_debug is the convergence view the
+# between calls, and fractal_sfs_converge_debug is the convergence view the
 # search tool exposes. The MCP's own half of that contract is proven
 # by gate 39; this gate proves the ENGINE's half, so a failure here
 # names the engine rather than the plugin.
@@ -3936,10 +4072,10 @@ function Gate-49-ConfigOverlay {
     # each key's type and whether a session may override it.
     $keys = Invoke-Sql "SELECT fractal_config_keys();"
     $nkeys = ([regex]::Matches($keys, '"name":')).Count
-    if ($nkeys -eq 18) {
-        Pass "49 config_overlay: keys() lists all 18 configuration keys"
+    if ($nkeys -eq 21) {
+        Pass "49 config_overlay: keys() lists all 21 configuration keys"
     } else {
-        Fail "49 config_overlay: keys() listed $nkeys keys (expected 18): $keys"
+        Fail "49 config_overlay: keys() listed $nkeys keys (expected 21): $keys"
     }
     if ($keys -like '*"name":"think","type":"string","session_overridable":true*') {
         Pass "49 config_overlay: keys() marks the tuning keys session-overridable"
@@ -4171,15 +4307,15 @@ function Gate-49-ConfigOverlay {
         Fail "49 config_overlay: to_json('not a vector') answered '$bad' (expected NULL)"
     }
 
-    # --- fractal_search_debug: the convergence view. A pinned seed makes
+    # --- fractal_sfs_converge_debug: the convergence view. A pinned seed makes
     # the trace byte-stable, which is the point of the seed argument.
-    $sd = Invoke-Sql "SELECT fractal_search_debug('[1,2,3]', 20, 10, 2, 42);"
+    $sd = Invoke-Sql "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, 2, 42);"
     if ($sd -like '*"best_point"*' -and $sd -like '*"best_fit"*' -and $sd -like '*"trace"*') {
         Pass "49 config_overlay: search_debug() returns the convergence view (best_point/best_fit/trace)"
     } else {
         Fail "49 config_overlay: search_debug() did not return the convergence view: $sd"
     }
-    $sd2 = Invoke-Sql "SELECT fractal_search_debug('[1,2,3]', 20, 10, 2, 42);"
+    $sd2 = Invoke-Sql "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, 2, 42);"
     if ($sd -eq $sd2) {
         Pass "49 config_overlay: search_debug() with a pinned seed is byte-stable"
     } else {
@@ -4188,13 +4324,13 @@ function Gate-49-ConfigOverlay {
     # The adapter refuses the same parameter range the CORE refuses, so
     # an out-of-range argument is turned away here rather than travelling
     # to the core to fail with a generic message.
-    $bad = Invoke-Sql "SELECT fractal_search_debug('[1,2,3]', 0);"
+    $bad = Invoke-Sql "SELECT fractal_sfs_converge_debug('[1,2,3]', 0);"
     if ($bad -eq "NULL") {
         Pass "49 config_overlay: search_debug() refuses iterations=0"
     } else {
         Fail "49 config_overlay: search_debug(iterations=0) answered '$bad' (expected NULL)"
     }
-    $bad = Invoke-Sql "SELECT fractal_search_debug('[1,2,3]', 10, 20000);"
+    $bad = Invoke-Sql "SELECT fractal_sfs_converge_debug('[1,2,3]', 10, 20000);"
     if ($bad -eq "NULL") {
         Pass "49 config_overlay: search_debug() refuses a population above the core's own cap"
     } else {
@@ -4251,8 +4387,9 @@ function Gate-49-ConfigOverlay {
 # Test-Path check below is the actual runtime source of truth; if it's
 # not found, this SKIPs rather than assuming either way.
 function Gate-27-EnterpriseConnect {
-    $entDll = "$Here\include\windows-x86_64\fractalsql-enterprise-sovereign-c.dll"
-    if (-not (Test-Path $entDll)) { Skip "27 enterprise_connect: no enterprise library found (include/)"; return }
+    $ent = Resolve-EntLib
+    if (-not $ent) { Fail "27 enterprise_connect: no enterprise library (the mock core did not build)"; return }
+    $entDll = $ent.Path
 
     $connectDll = $null
     foreach ($p in @("$script:Bin\..\lib\plugin\ha_connect.dll", (Join-Path (Get-MdbBin) "ha_connect.dll"))) {
@@ -4303,13 +4440,13 @@ SELECT fractal_audit_log('gate27_test', JSON_OBJECT('probe', 1));
     if (-not $cr) { Pass "27 enterprise_connect: CREATE TABLE ... ENGINE=CONNECT succeeds" } else { Fail "27 enterprise_connect: CREATE TABLE failed: $cr" }
 
     $kc = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT COUNT(*) FROM fractalsql_ledger WHERE kind=1;" 2>&1
-    if ($kc -eq "1") { Pass "27 enterprise_connect: SELECT ... WHERE kind=1 sees the flushed QTL row" } else { Fail "27 enterprise_connect: expected 1 kind=1 row, got: $kc" }
+    if ($ent.Kind -eq 'real') { if ($kc -eq "1") { Pass "27 enterprise_connect: SELECT ... WHERE kind=1 sees the flushed QTL row" } else { Fail "27 enterprise_connect: expected 1 kind=1 row, got: $kc" } }   # the mock core flushes no QTL row
 
     $ac = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT COUNT(*) FROM fractalsql_ledger WHERE kind=2;" 2>&1
     if ($ac -eq "1") { Pass "27 enterprise_connect: SELECT ... WHERE kind=2 sees the fractal_audit_log row" } else { Fail "27 enterprise_connect: expected 1 kind=2 row, got: $ac" }
 
     $unpacked = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_audit_unpack(FROM_BASE64(blob_b64)) FROM fractalsql_ledger WHERE kind=1 ORDER BY id DESC LIMIT 1;" 2>&1
-    if ($unpacked -match '"doc_id":1' -and $unpacked -match '"signal":"truth"') { Pass "27 enterprise_connect: fractal_audit_unpack(FROM_BASE64(...)) decodes the real flushed entry from SQL" } else { Fail "27 enterprise_connect: expected a decoded truth entry for doc_id=1, got: $unpacked" }
+    if ($ent.Kind -eq 'real') { if ($unpacked -match '"doc_id":1' -and $unpacked -match '"signal":"truth"') { Pass "27 enterprise_connect: fractal_audit_unpack(FROM_BASE64(...)) decodes the real flushed entry from SQL" } else { Fail "27 enterprise_connect: expected a decoded truth entry for doc_id=1, got: $unpacked" } }
 
     $wr = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -e "INSERT INTO fractalsql_ledger (id,kind) VALUES (99,1);" 2>&1
     if ($wr -match "(?i)read only") { Pass "27 enterprise_connect: READONLY=1 blocks a stray INSERT (mirror can't be corrupted via SQL)" } else { Fail "27 enterprise_connect: expected a read-only rejection, got: $wr" }
@@ -4321,12 +4458,16 @@ SELECT fractal_audit_log('gate27_test', JSON_OBJECT('probe', 1));
 }
 
 function Gate-28-EnterpriseSignature {
-    $entDll = "$Here\include\windows-x86_64\fractalsql-enterprise-sovereign-c.dll"
+    $ent = Resolve-EntLib
+    if (-not $ent) { Fail "28 enterprise_signature: no enterprise library (the mock core did not build)"; return }
+    $entDll = $ent.Path
     $entSig = "$entDll.sig"
-    if (-not (Test-Path $entDll)) { Skip "28 enterprise_signature: no enterprise library found (include/)"; return }
-    if (-not (Test-Path $entSig)) { Skip "28 enterprise_signature: no signature file staged"; return }
+    # Phase 1 (a real, validly signed library loads) needs the real library with its .sig; phases 2-4 work with any library file, so they run
+    # against the mock core when the real one is not available.
+    $realSigned = ($ent.Kind -eq 'real') -and (Test-Path $entSig)
 
     # Phase 1: the REAL signature.
+    if ($realSigned) {
     Mdb-Teardown
     $env:FRACTALSQL_ENTERPRISE_LIB = $entDll
     $rc = Mdb-Setup $MdbMajor
@@ -4338,6 +4479,7 @@ function Gate-28-EnterpriseSignature {
     }
     $r1 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_ledger_truth_count(CONNECTION_ID());" 2>&1
     if ($r1 -eq "0") { Pass "28 enterprise_signature: a real, validly-signed DLL loads (embedded pubkey matches FractalSQLabs's real key)" } else { Fail "28 enterprise_signature: expected 0 with the real .sig present, got: $r1" }
+    }
 
     # Phase 2: corrupt .sig (64 random bytes, right length, wrong
     # content) -- always fatal, regardless of REQUIRE_SIGNATURE.
@@ -4363,15 +4505,16 @@ function Gate-28-EnterpriseSignature {
     $r3 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_ledger_truth_count(CONNECTION_ID());" 2>&1
     if ($r3 -eq "NULL") { Pass "28 enterprise_signature: a missing .sig refuses when REQUIRE_SIGNATURE is set" } else { Fail "28 enterprise_signature: expected NULL (refused), got: $r3" }
 
-    # Phase 4: missing .sig + REQUIRE_SIGNATURE unset -- loads
-    # unverified (backward-compatible default).
+    # Phase 4: missing .sig + REQUIRE_SIGNATURE=0 -- loads unverified
+    # (explicit operator opt-out; the default is now ON, so unsetting it refuses).
     Mdb-Teardown
-    Remove-Item Env:\FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE -ErrorAction SilentlyContinue
+    $env:FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = "0"
     Mdb-Setup $MdbMajor | Out-Null
     $r4 = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_ledger_truth_count(CONNECTION_ID());" 2>&1
-    if ($r4 -eq "0") { Pass "28 enterprise_signature: a missing .sig loads unverified by default" } else { Fail "28 enterprise_signature: expected 0 (loaded unverified), got: $r4" }
+    if ($r4 -eq "0") { Pass "28 enterprise_signature: a missing .sig loads when REQUIRE_SIGNATURE=0 (explicit opt-out)" } else { Fail "28 enterprise_signature: expected 0 (loaded unverified), got: $r4" }
 
-    Remove-Item Env:\FRACTALSQL_ENTERPRISE_LIB, Env:\FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE -ErrorAction SilentlyContinue
+    Remove-Item Env:\FRACTALSQL_ENTERPRISE_LIB -ErrorAction SilentlyContinue
+    $env:FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = "0"   # the harness default (line ~272); later gates use the unsigned mock core
     Remove-Item -Recurse -Force $badDir -ErrorAction SilentlyContinue
     Mdb-Teardown
     Mdb-Setup $MdbMajor | Out-Null
@@ -5103,7 +5246,7 @@ function Get-McpServerExe([string]$label) {
     # fail the link step with LNK1181.
     $client = $script:MariaDbClient
     if (-not $client) {
-        Skip "$label (no MariaDB Connector/C import library -- libmariadb.lib was not found in any candidate tree)"
+        Skip "$label (libmariadb.lib, the MariaDB Connector/C import library, was not found)"
         return $null
     }
     $prevMdbDir  = $env:MARIADB_DIR
@@ -5130,6 +5273,26 @@ function Get-McpServerExe([string]$label) {
         Fail "${label}: MCP server build failed"
     }
     return $null
+}
+
+# The MCP server refuses to start without its two lock files, and with no
+# path configured it looks for them BESIDE ITS OWN EXECUTABLE (the CWD is
+# only the first place it tries). On Windows the executable is built into
+# mcp\dist\windows-mcp\, not into mcp\ where the two committed lock files
+# live, so a server started from there finds neither and exits -- which is
+# what the CLI and conformance gates were hitting. Copy the committed locks
+# next to the executable, the way the installed server ships them.
+function Ensure-McpLocksBesideExe([string]$McpExe) {
+    if (-not $McpExe) { return }
+    $exeDir = Split-Path -Parent $McpExe
+    if (-not $exeDir) { return }
+    foreach ($lock in @('.mcp-schema-lock', '.mcp-safety-annotations-lock')) {
+        $src = Join-Path $script:Here ("mcp\" + $lock)
+        $dst = Join-Path $exeDir $lock
+        if ((Test-Path -LiteralPath $src) -and ($src -ne $dst)) {
+            Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Gate-39-McpSmoke {
@@ -5206,7 +5369,7 @@ function Gate-39-McpSmoke {
         & $py -u (Join-Path $script:Here 'mcp\tests\mcp_smoke_client.py') 2>&1 |
             ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -eq 0) {
-            Pass '39 mcp_smoke: full MCP session (initialize, 93-tool catalog, discovery/cognition/agency round trips, enterprise clean-error path, $/cancel, resources+prompts, partial-reasoning S-FT-004 via the admin tools, shutdown drain)'
+            Pass '39 mcp_smoke: full MCP session (initialize, 115-tool catalog, discovery/cognition/agency round trips, enterprise clean-error path, $/cancel, resources+prompts, partial-reasoning S-FT-004 via the admin tools, shutdown drain)'
         }
         else {
             Fail "39 mcp_smoke: client driver exited $LASTEXITCODE (server log: $smokeCwd\mcp_server.log)"
@@ -5625,6 +5788,13 @@ function Gate-41-ParseProbe {
 }
 
 function Gate-45-DomainAgents {
+    # the settings table in the reasoning-setup guide names every configuration key this build defines
+    $dcPy = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $dcPy) { $dcPy = Get-Command python3 -ErrorAction SilentlyContinue }
+    if ($dcPy) {
+        $dcOut = (& $dcPy.Source -I (Join-Path $Here 'tests\check_config_docs.py') $Here 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0) { Pass ("45 domain_agents: " + ($dcOut -replace '^check_config_docs: ', '')) } else { Fail ("45 domain_agents: " + ($dcOut -replace '^check_config_docs: ', '')) }
+    } else { Skip "45 domain_agents: the settings-table check needs python" }
     # Windows port of build_test.sh's gate_45_domain_agents: the
     # Agency-tier (Domain Agent) engine sweep -- one live CALL per
     # engine, this server's own result-JSON key names, this server's
@@ -5855,7 +6025,7 @@ SELECT @r;
         "CALL fractal_agent_feedback_audit(NULL,'emb','[0.5]','g45_fwarmup','vc',8,3,@r);"
 
     # --- Engine J: fractal_agent_schedule_workload --------------------
-    # fractal_search refinement + telemetry + reason. The assignment is
+    # fractal_sfs_converge refinement + telemetry + reason. The assignment is
     # the node table's own PRIMARY KEY (id 1, nearest to the refined
     # task vector), and the confidence is 1/(1+distance) -- a real
     # number in (0,1].
@@ -6019,22 +6189,34 @@ SELECT @r;
     # the rows -> reason. The mock's canned embedding is a real
     # 3-element vector, so the whole pipeline runs.
     $u1 = (Invoke-G45Sql @'
-CALL fractal_search_agent('alpha', 'g45_univ', 'emb', 20, 30, @r);
+CALL fractal_search_agent('alpha', 'g45_univ', 'emb', 20, 30, NULL, @r);
 SELECT @r;
 '@) -join "`n"
-    if ($u1 -match '"source_doc_ids" *: *\[[^\]]*\]') { Pass "45 domain_agents: search_agent resolves real source doc_ids from the corpus" } else { Fail "45 domain_agents: search_agent source_doc_ids missing: $u1" }
+    if ($u1 -match '"source_row_ids" *: *\[[^\]]*\]') { Pass "45 domain_agents: search_agent resolves real source_row_ids from the corpus" } else { Fail "45 domain_agents: search_agent source_row_ids missing: $u1" }
     Test-G45Canary "search_agent answers through the reasoning tier" $u1
     Test-G45Error "search_agent rejects NULL arguments" `
         "query, table_name and vector_col must not be NULL" `
-        "CALL fractal_search_agent(NULL,'g45_univ','emb',20,30,@r);"
+        "CALL fractal_search_agent(NULL,'g45_univ','emb',20,30,NULL,@r);"
+
+    if ($u1 -match '"used_index" *: *(false|0)' -and $u1 -match '"context_cut" *: *\{ *"cells" *: *0, *"rows" *: *0 *\}') { Pass "45 domain_agents: search_agent reports used_index false (the Scout search) and an untouched context" } else { Fail "45 domain_agents: search_agent used_index/context_cut missing: $u1" }
 
     # fractal_rag_agent: the same pipeline behind a thinner surface --
-    # the OUT is the bare answer scalar, not a document.
+    # the OUT is {answer, source_row_ids, used_index, context_cut}. A meta_filter limits the rows searched.
     $u2 = (Invoke-G45Sql @'
-CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('x',1), @r);
+CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('id',1), @r);
 SELECT @r;
 '@) -join "`n"
-    Test-G45Canary "rag_agent returns the reasoned answer as a bare scalar" $u2
+    Test-G45Canary "rag_agent returns the reasoned answer" $u2
+    if ($u2 -match '"source_row_ids" *: *\[ *1 *\]') { Pass "45 domain_agents: rag_agent's meta_filter limits the search to the matching row" } else { Fail "45 domain_agents: rag_agent meta_filter did not limit to row 1: $u2" }
+    Test-G45Error "rag_agent refuses a meta_filter column the table does not have" `
+        "does not exist" `
+        "CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('nosuch',1), @r);"
+    Test-G45Error "rag_agent refuses a meta_filter that matches no row" `
+        "for that meta_filter" `
+        "CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('id',99), @r);"
+    Test-G45Error "rag_agent refuses a meta_filter that is not an object" `
+        "must be a JSON object" `
+        "CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_ARRAY(1), @r);"
 
     # fractal_agent_plan_explore: each branch is a DISTINCT corpus row
     # with its OWN vector (the branch's plan_trajectory), not the query
@@ -6139,6 +6321,15 @@ function Rb-Mdb([string[]]$ClientArgs) {
     return @($out)
 }
 
+# Runs a SQL file through the client with the client's own diagnostics
+# included in the output. Rb-Mdb keeps stderr out of the way, but a gate
+# that has to notice a dropped connection needs to see what the client said
+# about it.
+function Rb-MdbFile([string]$Path) {
+    $out = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N --default-character-set=utf8mb4 --force -e "source $($Path -replace '\\', '/')" 2>&1
+    return ($out -join "`n")
+}
+
 function Rb-LogMark { return (Read-LogShared $script:FsqdLog).Length }
 function Rb-LogSince([int]$Mark) {
     $t = Read-LogShared $script:FsqdLog
@@ -6146,7 +6337,9 @@ function Rb-LogSince([int]$Mark) {
     return $t.Substring($Mark)
 }
 function Rb-LogFatal([string]$Text) {
-    return ($Text -split "`n" | Where-Object { $_ -match 'FATAL' } | Select-Object -First 1)
+    # Trimmed: the daemon writes CRLF, so the line carries a trailing \r
+    # that would otherwise land inside the message this is quoted in.
+    return (($Text -split "`n" | Where-Object { $_ -match 'FATAL' } | Select-Object -First 1) | ForEach-Object { $_.Trim() })
 }
 
 # $true when the daemon process is alive and a UDF round trip works.
@@ -6460,6 +6653,15 @@ function Gate-55-LedgerForged {
             if ($gotLoad -eq "0") { $gotLoad = "ok" }
             $gotV1 = Rb-Verdict ((Rb-Mdb @("-e", "SELECT fractal_ledger_verify(CONNECTION_ID(), 1);")) -join "")
             $gotV2 = Rb-Verdict ((Rb-Mdb @("-e", "SELECT fractal_ledger_verify(CONNECTION_ID(), 2);")) -join "")
+            # An EMPTY verdict and "ok:0" mean the same thing: the ledger holds
+            # no record of that kind, and nothing is wrong with it. Which of
+            # the two the daemon answers depends on whether it has ever seen
+            # a record of that kind -- and that depends on what an EARLIER
+            # gate left in the daemon -- so the case table's "ok:0" would
+            # otherwise fail (or pass) on the order the gates happened to run
+            # in. Normalise the empty one to "ok:0".
+            if ($gotV1 -eq '') { $gotV1 = 'ok:0' }
+            if ($gotV2 -eq '') { $gotV2 = 'ok:0' }
             if ($gotLoad -eq $wantLoad -and $gotV1 -eq $wantV1 -and $gotV2 -eq $wantV2) { $ok++ }
             else {
                 $bad++
@@ -6603,6 +6805,717 @@ function Gate-60-ScriptedReplies {
     Remove-Item -Force $dll -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# Gate 71: the audit-ledger settings the server reads from its OWN environment
+# once per process -- the ledger size cap (FRACTALSQL_LEDGER_MAX_BYTES), the
+# head anchor log (FSQL_LEDGER_ANCHOR_LOG), the audit redaction mode
+# (FSQL_AUDIT_REDACT), the signature policy
+# (FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE) and the ledger key. Every round
+# restarts the daemon with a different set of variables, so what is under
+# test is that the values in the daemon's environment at startup are the ones
+# that take effect.
+#
+# Mirrors build_test.sh's gate 71. The ledger-FILE damage sweep of that gate
+# is not carried over: it damages files with truncate/dd/chmod, which
+# Windows has no equivalent of -- gate 55 covers damaged ledgers here through
+# the forged-ledger case table, and gate 58 covers a refused enterprise
+# library.
+function Gate-71-LedgerEnv {
+    $lib = Rb-MockLib
+    if (-not $lib) { Skip "71 ledger_env: no cl.exe to build the mock enterprise core"; return }
+    Rb-Begin
+    $ledger = "$env:TEMP\fractalsql_bt_ledger_env.bin"
+    Remove-Item -Force $ledger, "$ledger.head", "$ledger.head.tmp" -ErrorAction SilentlyContinue
+
+    # Starts the daemon on the mock enterprise core with the given
+    # environment. The variables reach the daemon's own process (Rb-Restart
+    # sets them for the new process and takes them back out of this one
+    # afterwards), which is the whole point of the gate.
+    function Start-LedgerRound([string]$Lib, [string]$Ledger, [hashtable]$EnvVars) {
+        Rb-ConfSet enterprise_lib $Lib
+        Rb-ConfSet enterprise_ledger_path $Ledger
+        Rb-ConfSet enterprise_ledger_key ""
+        # enterprise_require_signature is deliberately NOT written here: the rounds'
+        # FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE environment values are the signal this
+        # gate varies, and a configuration-file value would outweigh them (the config file
+        # wins the precedence in ent_provider_apply). The POSIX harness restarts the daemon
+        # with environment only, and the same must hold here or the signature=1 round's
+        # refusal never happens.
+        if (-not (Rb-Restart $EnvVars)) { return $false }
+        return (Rb-WaitOk)
+    }
+
+    # The audit and ledger calls every round makes: six appends of different
+    # payload shapes, a verify, a flush, a second verify and the truth count.
+    $auditSql = @'
+SELECT IFNULL(fractal_audit_log('env.test', '{"q":"customer secret text","n":1}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":2}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '[1,2,3]'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":4}', CONNECTION_ID(), 'alice'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":5}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('env.test', '{"n":6}'), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID(), 2), '<NULL>');
+SELECT IFNULL(fractal_ledger_flush(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');
+'@
+
+    # The awkward payloads: a forged actor key, a quoted and escaped actor, a
+    # long actor, a malformed payload and a payload with control characters.
+    $awkwardSql = @'
+SELECT IFNULL(fractal_audit_log('e', '{"_actor":"forged"}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"x":{"_actor":1}}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":1}', CONNECTION_ID(), REPEAT('a', 300)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":2}', CONNECTION_ID(), 'a"b\\c'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{"n":3}', CONNECTION_ID(), REPEAT(CHAR(1), 100)), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', '{bad'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT('{', CHAR(9), CHAR(10), CHAR(13), ' }')), '<NULL>');
+SELECT IFNULL(fractal_audit_log('e', CONCAT(' ', CHAR(9), '[1]', CHAR(10))), '<NULL>');
+SELECT IFNULL(fractal_ledger_verify(CONNECTION_ID()), '<NULL>');
+'@
+
+    # Each round: a label, the environment the daemon is started with, and
+    # what the round must show -- "chain" (the chain that was kept verifies),
+    # "signed" (every audit append is refused, because the enterprise
+    # library is unsigned and a signature is required), "awkward" (the
+    # awkward payload sweep is survived) or "actor" (an append that names no
+    # session is refused when an actor is required).
+    $rounds = @(
+        @{ label = 'cap=300 anchor=stderr redact=hash';
+           env = @{ FRACTALSQL_LEDGER_MAX_BYTES = '300'; FSQL_LEDGER_ANCHOR_LOG = 'stderr'; FSQL_AUDIT_REDACT = 'hash';
+                    FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '0' };
+           want = 'chain' },
+        @{ label = 'cap=abc anchor=syslog redact=truncate signature=1';
+           env = @{ FRACTALSQL_LEDGER_MAX_BYTES = 'abc'; FSQL_LEDGER_ANCHOR_LOG = 'syslog'; FSQL_AUDIT_REDACT = 'truncate';
+                    FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '1' };
+           want = 'signed' },
+        @{ label = 'cap=0 anchor=bogus';
+           env = @{ FRACTALSQL_LEDGER_MAX_BYTES = '0'; FSQL_LEDGER_ANCHOR_LOG = 'bogus';
+                    FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '0' };
+           want = 'chain' },
+        @{ label = 'anchor=STDERR redact=truncate';
+           env = @{ FSQL_LEDGER_ANCHOR_LOG = 'STDERR'; FSQL_AUDIT_REDACT = 'truncate';
+                    FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '0' };
+           want = 'awkward' },
+        @{ label = 'anchor=Syslog redact=truncate';
+           env = @{ FSQL_LEDGER_ANCHOR_LOG = 'Syslog'; FSQL_AUDIT_REDACT = 'truncate';
+                    FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '0' };
+           want = 'chain' },
+        @{ label = 'audit actor required';
+           env = @{ FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '0'; FRACTALSQL_AUDIT_REQUIRE_ACTOR = '1' };
+           want = 'actor' }
+    )
+
+    $bad = 0; $firstBad = ""
+    foreach ($round in $rounds) {
+        $envVars = $round.env
+        $envVars['FRACTALSQL_ENTERPRISE_LEDGER_PATH'] = $ledger
+        Remove-Item -Force $ledger, "$ledger.head", "$ledger.head.tmp" -ErrorAction SilentlyContinue
+        if (-not (Start-LedgerRound $lib $ledger $envVars)) {
+            $bad++; if (-not $firstBad) { $firstBad = "$($round.label): the server did not start" }
+            continue
+        }
+        $sqlFile = "$env:TEMP\fractalsql_bt_ledger_env.sql"
+        [System.IO.File]::WriteAllText($sqlFile, $auditSql, (New-Object System.Text.UTF8Encoding $false))
+        $out = Rb-MdbFile $sqlFile
+        if ($out -match 'ERROR 2013|ERROR 2006|server has gone away|Lost connection') {
+            $bad++; if (-not $firstBad) { $firstBad = "$($round.label): the server dropped the connection -- $out" }
+            continue
+        }
+        $nulls = ([regex]::Matches($out, '<NULL>')).Count
+        switch ($round.want) {
+            'chain' {
+                if ($out -match '"ok":\s*true') { Pass "71 ledger_env [$($round.label)]: the chain that was kept verifies" }
+                else { $bad++; if (-not $firstBad) { $firstBad = "$($round.label): expected an ok verify, got: $out" } }
+            }
+            'signed' {
+                # verify is community-side, so it still answers; the audit appends
+                # are what the enterprise gate refuses.
+                if ($nulls -ge 6) { Pass "71 ledger_env [$($round.label)]: an unsigned enterprise library is refused when a signature is required (every audit append is refused)" }
+                else { $bad++; if (-not $firstBad) { $firstBad = "$($round.label): an unsigned library was used although a signature is required: $out" } }
+            }
+            'actor' {
+                $actorSql = @'
+SELECT IFNULL(fractal_audit_log('a', '{"n":1}'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":2}', CONNECTION_ID()), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":3}', CONNECTION_ID(), 'carol'), '<NULL>');
+SELECT IFNULL(fractal_audit_log('a', '{"n":4}', NULL, 'carol'), '<NULL>');
+'@
+                [System.IO.File]::WriteAllText($sqlFile, $actorSql, (New-Object System.Text.UTF8Encoding $false))
+                $out2 = (Rb-Mdb @("--force", "-e", "source $($sqlFile -replace '\\', '/')")) -join "`n"
+                if ($out2 -match 'ERROR 2013|ERROR 2006|server has gone away|Lost connection') {
+                    $bad++; if (-not $firstBad) { $firstBad = "$($round.label): the actor requirement killed the connection -- $out2" }
+                }
+                else {
+                    # The append that names no session is refused (the first line);
+                    # the one that names a session and an actor goes through.
+                    $lines = @($out2 -split "`n" | Where-Object { $_ -ne "" })
+                    if ($lines.Count -ge 2 -and $lines[0] -match '<NULL>' -and $lines[2] -notmatch '<NULL>') {
+                        Pass "71 ledger_env [$($round.label)]: an audit append without a session is refused when an actor is required"
+                    }
+                    else {
+                        $bad++; if (-not $firstBad) { $firstBad = "$($round.label): expected the actorless append to be refused and the actorful one to go through, got: $out2" }
+                    }
+                }
+            }
+            'awkward' {
+                [System.IO.File]::WriteAllText($sqlFile, $awkwardSql, (New-Object System.Text.UTF8Encoding $false))
+                $out2 = Rb-MdbFile $sqlFile
+                if ($out2 -match 'ERROR 2013|ERROR 2006|server has gone away|Lost connection') {
+                    $bad++; if (-not $firstBad) { $firstBad = "$($round.label): an awkward audit payload killed the connection -- $out2" }
+                }
+                else {
+                    Pass "71 ledger_env [$($round.label)]: padded, scalar, forged-actor, oversized and awkward-actor audit entries are handled"
+                }
+            }
+        }
+        if (-not (Rb-DaemonOk)) {
+            $bad++; if (-not $firstBad) { $firstBad = "$($round.label): the server did not survive" }
+        }
+    }
+    if ($bad -eq 0) { Pass "71 ledger_env: $($rounds.Count) environment rounds, and every server restart with them, behaved as the key table specifies" }
+    else { Fail "71 ledger_env: $bad problem(s) across $($rounds.Count) rounds, first: $firstBad" }
+    Rb-End
+    Remove-Item -Force $ledger, "$ledger.head", "$ledger.head.tmp", "$env:TEMP\fractalsql_bt_ledger_env.sql" -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Gate 73: the session-side settings and the verdicts the key table
+# specifies. Every setting is put through fractal_config_set (which is where
+# the daemon judges a name, a value and their shape) and read back with
+# fractal_config_get.
+#
+# The case table is the same one build_test.sh's gate 73 runs: a kind per
+# row -- OK (accepted), D (a daemon-wide setting that a session may not
+# change), L (too long), U (an unknown key), I (wants an integer), R (a
+# value out of range) and B (wants true/false) -- and the name and value
+# beside it. The @X9000@, @P5000@ and @X300@ markers stand for the long
+# values they name (a 9000-character token, a 5000-character path and a
+# 300-character key).
+#
+# The second half of the POSIX gate -- the conf file's own keys, applied
+# through a reload -- is covered here by gates 33 and 34, which push
+# conf values into the running daemon.
+function Gate-73-ConfigMatrix {
+    Rb-Begin
+    $tableText = @'
+D	reasoning_plugin	/opt/fsql/x.so
+D	reasoning_plugin	rel/x.so
+D	reasoning_plugin	/a/../b.so
+D	reasoning_plugin	C:\\x\\y.so
+D	reasoning_plugin	\\\\srv\\sh\\f.dll
+D	reasoning_plugin	/
+D	reasoning_plugin	@P5000@
+D	reasoning_plugin	
+D	fractalsql.reasoning_plugin	/opt/fsql/x.so
+U	REASONING_PLUGIN	/opt/fsql/x.so
+D	reasoning_url	value-1
+D	reasoning_url	
+L	reasoning_url	@X9000@
+D	reasoning_url	with space
+D	reasoning_url	ünï
+D	reasoning_url	a\nb
+D	fractalsql.reasoning_url	value-1
+U	REASONING_URL	value-1
+D	reasoning_token	value-1
+D	reasoning_token	
+L	reasoning_token	@X9000@
+D	reasoning_token	with space
+D	reasoning_token	ünï
+D	reasoning_token	a\nb
+D	fractalsql.reasoning_token	value-1
+U	REASONING_TOKEN	value-1
+OK	reasoning_model	value-1
+OK	reasoning_model	
+L	reasoning_model	@X9000@
+OK	reasoning_model	with space
+OK	reasoning_model	ünï
+OK	reasoning_model	a\nb
+OK	fractalsql.reasoning_model	value-1
+U	REASONING_MODEL	value-1
+D	reasoning_allow_plaintext	1
+D	reasoning_allow_plaintext	true
+D	reasoning_allow_plaintext	on
+D	reasoning_allow_plaintext	yes
+D	reasoning_allow_plaintext	0
+D	reasoning_allow_plaintext	false
+D	reasoning_allow_plaintext	off
+D	reasoning_allow_plaintext	no
+D	reasoning_allow_plaintext	
+D	reasoning_allow_plaintext	maybe
+D	reasoning_allow_plaintext	TRUE
+D	reasoning_allow_plaintext	2
+D	fractalsql.reasoning_allow_plaintext	1
+U	REASONING_ALLOW_PLAINTEXT	1
+D	embed_url	value-1
+D	embed_url	
+L	embed_url	@X9000@
+D	embed_url	with space
+D	embed_url	ünï
+D	embed_url	a\nb
+D	fractalsql.embed_url	value-1
+U	EMBED_URL	value-1
+OK	embed_model	value-1
+OK	embed_model	
+L	embed_model	@X9000@
+OK	embed_model	with space
+OK	embed_model	ünï
+OK	embed_model	a\nb
+OK	fractalsql.embed_model	value-1
+U	EMBED_MODEL	value-1
+OK	think	value-1
+OK	think	
+L	think	@X9000@
+OK	think	with space
+OK	think	ünï
+OK	think	a\nb
+OK	fractalsql.think	value-1
+U	THINK	value-1
+D	think_provider	value-1
+D	think_provider	
+L	think_provider	@X9000@
+D	think_provider	with space
+D	think_provider	ünï
+D	think_provider	a\nb
+D	fractalsql.think_provider	value-1
+U	THINK_PROVIDER	value-1
+D	think_native_url	value-1
+D	think_native_url	
+L	think_native_url	@X9000@
+D	think_native_url	with space
+D	think_native_url	ünï
+D	think_native_url	a\nb
+D	fractalsql.think_native_url	value-1
+U	THINK_NATIVE_URL	value-1
+OK	think_num_ctx	5
+OK	think_num_ctx	1
+OK	think_num_ctx	10
+R	think_num_ctx	0
+OK	think_num_ctx	11
+R	think_num_ctx	-1
+I	think_num_ctx	abc
+I	think_num_ctx	12x
+R	think_num_ctx	99999999999
+OK	think_num_ctx	
+I	think_num_ctx	3.5
+OK	think_num_ctx	10000000
+R	think_num_ctx	10000001
+OK	fractalsql.think_num_ctx	5
+U	THINK_NUM_CTX	5
+OK	t2s_max_attempts	5
+OK	t2s_max_attempts	1
+OK	t2s_max_attempts	10
+R	t2s_max_attempts	0
+R	t2s_max_attempts	11
+R	t2s_max_attempts	-1
+I	t2s_max_attempts	abc
+I	t2s_max_attempts	12x
+R	t2s_max_attempts	99999999999
+OK	t2s_max_attempts	
+I	t2s_max_attempts	3.5
+R	t2s_max_attempts	10000000
+R	t2s_max_attempts	10000001
+OK	fractalsql.t2s_max_attempts	5
+U	T2S_MAX_ATTEMPTS	5
+D	t2s_allowed_statements	select
+D	t2s_allowed_statements	select_insert_update
+D	t2s_allowed_statements	delete
+D	t2s_allowed_statements	SELECT
+D	t2s_allowed_statements	
+D	t2s_allowed_statements	
+D	fractalsql.t2s_allowed_statements	select
+U	T2S_ALLOWED_STATEMENTS	select
+OK	t2s_use_review	1
+OK	t2s_use_review	true
+OK	t2s_use_review	on
+OK	t2s_use_review	yes
+OK	t2s_use_review	0
+OK	t2s_use_review	false
+OK	t2s_use_review	off
+OK	t2s_use_review	no
+OK	t2s_use_review	
+B	t2s_use_review	maybe
+B	t2s_use_review	TRUE
+B	t2s_use_review	2
+OK	fractalsql.t2s_use_review	1
+U	T2S_USE_REVIEW	1
+D	enterprise_lib	/opt/fsql/x.so
+D	enterprise_lib	rel/x.so
+D	enterprise_lib	/a/../b.so
+D	enterprise_lib	C:\\x\\y.so
+D	enterprise_lib	\\\\srv\\sh\\f.dll
+D	enterprise_lib	/
+D	enterprise_lib	@P5000@
+D	enterprise_lib	
+D	fractalsql.enterprise_lib	/opt/fsql/x.so
+U	ENTERPRISE_LIB	/opt/fsql/x.so
+D	enterprise_ledger_path	/opt/fsql/x.so
+D	enterprise_ledger_path	rel/x.so
+D	enterprise_ledger_path	/a/../b.so
+D	enterprise_ledger_path	C:\\x\\y.so
+D	enterprise_ledger_path	\\\\srv\\sh\\f.dll
+D	enterprise_ledger_path	/
+D	enterprise_ledger_path	@P5000@
+D	enterprise_ledger_path	
+D	fractalsql.enterprise_ledger_path	/opt/fsql/x.so
+U	ENTERPRISE_LEDGER_PATH	/opt/fsql/x.so
+D	enterprise_ledger_key	value-1
+D	enterprise_ledger_key	
+L	enterprise_ledger_key	@X9000@
+D	enterprise_ledger_key	with space
+D	enterprise_ledger_key	ünï
+D	enterprise_ledger_key	a\nb
+D	fractalsql.enterprise_ledger_key	value-1
+U	ENTERPRISE_LEDGER_KEY	value-1
+D	enterprise_require_signature	1
+D	enterprise_require_signature	true
+D	enterprise_require_signature	on
+D	enterprise_require_signature	yes
+D	enterprise_require_signature	0
+D	enterprise_require_signature	false
+D	enterprise_require_signature	off
+D	enterprise_require_signature	no
+D	enterprise_require_signature	
+D	enterprise_require_signature	maybe
+D	enterprise_require_signature	TRUE
+D	enterprise_require_signature	2
+D	fractalsql.enterprise_require_signature	1
+U	ENTERPRISE_REQUIRE_SIGNATURE	1
+U	nope	1
+U		1
+L	@X300@	1
+U	fractalsql.	1
+U	fractalsql.nope	1
+U	reasoning_plugin 	1
+U	a;b	1
+OK	agent_use_index	off
+OK	agent_use_index	on
+OK	agent_use_index	auto
+OK	fractalsql.agent_use_index	auto
+R	agent_use_index	true
+R	agent_use_index	1
+R	agent_use_index	ON
+R	agent_use_index	maybe
+U	AGENT_USE_INDEX	on
+OK	agent_index_min_rows	10000
+OK	agent_index_min_rows	0
+OK	agent_index_min_rows	2000000
+OK	agent_index_min_rows	
+R	agent_index_min_rows	-1
+R	agent_index_min_rows	2000001
+I	agent_index_min_rows	abc
+I	agent_index_min_rows	3.5
+OK	fractalsql.agent_index_min_rows	5
+U	AGENT_INDEX_MIN_ROWS	5
+OK	agent_context_row_bytes	8192
+OK	agent_context_row_bytes	0
+OK	agent_context_row_bytes	1048576
+R	agent_context_row_bytes	1048577
+R	agent_context_row_bytes	-1
+I	agent_context_row_bytes	abc
+OK	fractalsql.agent_context_row_bytes	100
+U	AGENT_CONTEXT_ROW_BYTES	100
+'@ -split "`n" | Where-Object { $_ -ne "" }
+
+    function Expand-Marker([string]$s) {
+        switch ($s) {
+            '@X9000@' { return ('x' * 9000) }
+            '@P5000@' { return ('/' + ('p' * 5000)) }
+            '@X300@'  { return ('x' * 300) }
+            default   { return $s }
+        }
+    }
+
+    $sqlFile = "$env:TEMP\fractalsql_bt_cfg_matrix.sql"
+    $sb = New-Object System.Text.StringBuilder
+    $i = 0
+    foreach ($row in $rows) {
+        $i++
+        $c = $row.Split([char]9)
+        $name = Expand-Marker $c[1]
+        $val  = Expand-Marker $c[2]
+        $n = ($name -replace "'", "''")
+        $v = ($val  -replace "'", "''")
+        [void]$sb.AppendLine("SELECT $i, IFNULL(fractal_config_set('$n', '$v', CONNECTION_ID()), '<NULL>'), IFNULL(fractal_config_get('$n', CONNECTION_ID()), '<NULL>');")
+    }
+    [System.IO.File]::WriteAllText($sqlFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding $false))
+    $out = @(Rb-Mdb @("--force", "-e", "source $($sqlFile -replace '\\', '/')"))
+
+    $bad = 0; $firstBad = ""
+    $i = 0
+    foreach ($row in $rows) {
+        $i++
+        $c = $row.Split([char]9)
+        $kind = $c[0]
+        $name = Expand-Marker $c[1]
+        $val  = Expand-Marker $c[2]
+        $want = switch ($kind) {
+            'OK' { 'ok' }
+            'D'  { 'daemon-wide setting' }
+            'L'  { 'too long' }
+            'U'  { 'unknown configuration key' }
+            'I'  { 'expects an integer' }
+            'R'  { 'must be' }
+            'B'  { 'expects true/false' }
+            default { '' }
+        }
+        # The line for this case: the id, the verdict and the value read back.
+        $line = $out | Where-Object { $_ -match ("^" + $i + "`t") } | Select-Object -First 1
+        if (-not $line) {
+            $bad++; if (-not $firstBad) { $firstBad = "$kind $name=$val -> no answer" }
+            continue
+        }
+        $parts = $line.Split([char]9)
+        $verdict = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+        $readBack = if ($parts.Count -gt 2) { $parts[2] } else { "" }
+        if ($verdict -notlike "*$want*") {
+            $bad++; if ($bad -le 6) { Write-Host "         $kind $name=$val -> $verdict" }
+            if (-not $firstBad) { $firstBad = "$kind $name=$val -> $verdict" }
+        }
+        elseif ($kind -eq 'OK' -and $val -ne "" -and $val -notmatch '\\' -and $val -notmatch ([char]0xE9)) {
+            if ($readBack -ne $val) {
+                $bad++; if ($bad -le 6) { Write-Host "         read-back $name=$val -> $readBack" }
+                if (-not $firstBad) { $firstBad = "read-back $name=$val -> $readBack" }
+            }
+        }
+    }
+    if ($bad -eq 0) { Pass "73 config_matrix: all $i session-side settings got the verdict the key table specifies, and stored values read back" }
+    else { Fail "73 config_matrix: $bad of $i settings did not (first ones above)" }
+    Rb-End
+    Remove-Item -Force $sqlFile -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Gate 75: the three enterprise portfolio optimizers (the multimodal, the
+# multimodal_ex and the multimodal_pareto) with the mock enterprise core
+# loaded: ordinary calls, every argument the validation looks at (NULL,
+# empty, malformed or mismatched arrays, a restart count below what the core
+# returns, zero and negative counts, unknown diffusion modes), the core
+# failing (the mock's fail sentinel) and the core finding nothing (its
+# zero-found file). The server must answer every one of them.
+#
+# The same call list as build_test.sh's gate 75.
+function Gate-75-MultimodalEdge {
+    $lib = Rb-MockLib
+    if (-not $lib) { Skip "75 multimodal_edge: no cl.exe to build the mock enterprise core"; return }
+    Rb-Begin
+    $sentinel = "$env:TEMP\fractalsql_bt_mmedge_fail"
+    $zero     = "$env:TEMP\fractalsql_bt_mmedge_zero"
+    Remove-Item -Force $sentinel, $zero -ErrorAction SilentlyContinue
+    $sqlFile  = "$env:TEMP\fractalsql_bt_mmedge.sql"
+    $mmSql = @'
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 1, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2,3', '1,0,0,0,1,0,0,0,1', 2, 5, 0.9, 0.9, 7);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 0, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', -1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 0, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 99999999, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, -1, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, 0.5, 2, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2,3', '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('', '', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('x,y', 'a,b,c,d', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,nan', '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal(NULL, '1,0,0,1', 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', NULL, 1, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', NULL, 2, 0.5, 0.5, 42);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1', 1, 2, 0.5, 0.5);
+SELECT fractal_optimize_portfolio_multimodal('1,2', '1,0,0,1');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 1, 'levy');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 1, 0.5, 0.5, 42, 1, 'levy');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 0, 'bogus');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 2, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, -1, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, NULL, NULL);
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1', 1, 2, 0.5, 0.5, 42, 0, '');
+SELECT fractal_optimize_portfolio_multimodal_ex('1,2', '1,0,0,1');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, 1, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 5, 1, 3, 0, 'levy');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2,3', '1,0,0,0,1,0,0,0,1', 2, 5, 0.5, 100, 1, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, 0, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, -5, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1', 1, 1, 1, 1, 0, 'nope');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0', 1, 1, 1, 1, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto(NULL, NULL, 1, 1, 1, 1, 0, 'gaussian');
+SELECT fractal_optimize_portfolio_multimodal_pareto('1,2', '1,0,0,1');
+'@
+    [System.IO.File]::WriteAllText($sqlFile, $mmSql, (New-Object System.Text.UTF8Encoding $false))
+    $n = (Get-Content -LiteralPath $sqlFile | Where-Object { $_ -match '^SELECT' }).Count
+
+    $envVars = @{ FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE = '0'
+                  FSQL_MOCK_ENT_FAIL = $sentinel
+                  FSQL_MOCK_ENT_ZERO_FOUND = $zero }
+    Rb-ConfSet enterprise_lib $lib
+    Rb-ConfSet enterprise_ledger_path "$env:TEMP\fractalsql_bt_mmedge.bin"
+    Rb-ConfSet enterprise_ledger_key ""
+    Rb-ConfSet enterprise_require_signature "0"
+    if (-not (Rb-Restart $envVars) -or -not (Rb-WaitOk)) {
+        Fail "75 multimodal_edge: the server did not start with the enterprise core"
+        Rb-End
+        Remove-Item -Force $sentinel, $zero, $sqlFile -ErrorAction SilentlyContinue
+        return
+    }
+
+    $bad = 0; $firstBad = ""
+    # Three rounds: the core working, the core failing (the sentinel file
+    # exists) and the core finding nothing (the zero-found file exists).
+    foreach ($round in @('working', 'failing', 'finding nothing')) {
+        Remove-Item -Force $sentinel, $zero -ErrorAction SilentlyContinue
+        if ($round -eq 'failing') { New-Item -ItemType File -Path $sentinel | Out-Null }
+        if ($round -eq 'finding nothing') { New-Item -ItemType File -Path $zero | Out-Null }
+        $out = Rb-MdbFile $sqlFile
+        if ($out -match 'ERROR 2013|ERROR 2006|server has gone away|Lost connection') {
+            $bad++; if (-not $firstBad) { $firstBad = "the server dropped the connection while the core was $round -- $out" }
+        }
+        if (-not (Rb-DaemonOk)) {
+            $bad++; if (-not $firstBad) { $firstBad = "the server did not survive the round in which the core was $round" }
+        }
+    }
+    Remove-Item -Force $sentinel, $zero -ErrorAction SilentlyContinue
+    if ($bad -eq 0) { Pass "75 multimodal_edge: the server answered $n optimizer calls three times over (core working, core failing, core finding nothing)" }
+    else { Fail "75 multimodal_edge: $bad problem(s), first: $firstBad" }
+    Rb-End
+    Remove-Item -Force $sentinel, $zero, $sqlFile, "$env:TEMP\fractalsql_bt_mmedge.bin" -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Gate 76: every way the enterprise library can be refused, applied to the
+# RUNNING daemon through a reload (which is what the POSIX gate does): a
+# .sig of the wrong size (empty, short, long) or that does not verify, a
+# missing .sig with a signature required, a library that cannot be read, one
+# that is a directory, one without the core's symbols, a path that does not
+# exist, and the unsigned load the operator can opt into. Each is a fresh
+# library path, so a failed attempt is never served from a cache.
+#
+# The server must survive every one of them, the refused ones must leave the
+# ledger calls answering NULL, and the daemon's own log must say why it
+# refused. This is the reload-side mirror of gate 58, which applies the same
+# matrix through a restart.
+function Gate-76-EnterpriseRefusals {
+    $lib = Rb-MockLib
+    if (-not $lib) { Skip "76 enterprise_refusals: no cl.exe to build the mock enterprise core"; return }
+    $probe = Build-ReloadProbe
+    if (-not $probe) { Skip "76 enterprise_refusals: no clang-cl.exe to build the reload probe"; return }
+    Rb-Begin
+    $W = "$env:TEMP\fractalsql_bt_entref"
+    Remove-Item -Recurse -Force $W -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $W | Out-Null
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    function New-RandFile([string]$Path, [int]$Len) {
+        $b = New-Object byte[] $Len
+        if ($Len -gt 0) { $rng.GetBytes($b) }
+        [System.IO.File]::WriteAllBytes($Path, $b)
+    }
+    $ledger = "$W\ledger.bin"
+    Rb-ConfSet enterprise_ledger_path $ledger
+    Rb-ConfSet enterprise_ledger_key ""
+    if (-not (Rb-Restart)) { Fail "76 enterprise_refusals: the daemon did not start"; Rb-End; return }
+
+    # name | what the library path is | require_signature | loads (yes/no)
+    # "copy" puts a random 64-byte .sig beside the library -- the size the
+    # loader expects, but random bytes, so the signature verification FAILS.
+    # An invalid signature refuses the load whatever require_signature says
+    # (only a MISSING .sig is what the operator's opt-out covers), so the one
+    # row that expects a load ("unsigned_optout") gets a library with no .sig
+    # beside it at all -- that is what "unsigned" means.
+    $table = @(
+        @("sig_64_random",        "copy", "0", "no"),
+        @("sig_64_random_req",   "copy", "1", "no"),
+        @("sig_10_bytes",        "copy", "0", "no"),
+        @("sig_65_bytes",        "copy", "0", "no"),
+        @("sig_empty",           "copy", "0", "no"),
+        @("no_sig_req",          "unsigned", "1", "no"),
+        @("unsigned_optout",     "unsigned", "0", "yes"),
+        @("unreadable_req",      "locked", "1", "no"),
+        @("unreadable_optout",   "locked", "0", "no"),
+        @("directory_req",       "dir", "1", "no"),
+        @("directory_optout",    "dir", "0", "no"),
+        @("no_core_symbols",     "nosym", "0", "no"),
+        @("missing_path",        "missing", "0", "no"),
+        @("sig_only",            "sigonly", "1", "no")
+    )
+    $bad = 0; $firstBad = ""; $loaded = 0
+    $i = 0
+    $libLoaded = $false
+    foreach ($t in $table) {
+        $i++
+        $name = $t[0]; $kind = $t[1]; $req = $t[2]; $expectLoad = $t[3]
+        $L = "$W\lib_$i`_$name.dll"
+        # The .sig files are the same size the loader expects (64 bytes) but
+        # carry random bytes, so the verification fails.
+        switch ($kind) {
+            "copy"    { Copy-Item $lib $L; New-RandFile "$L.sig" 64 }
+            "unsigned" { Copy-Item $lib $L }   # no .sig at all: the library is unsigned
+            "locked"  { Copy-Item $lib $L; New-RandFile "$L.sig" 64
+                        $lock = [System.IO.File]::Open($L, 'Open', 'ReadWrite', 'None') }
+            "dir"     { New-Item -ItemType Directory -Path $L | Out-Null; New-RandFile "$L.sig" 64 }
+            "nosym"   { Copy-Item "$env:SystemRoot\System32\kernel32.dll" $L }
+            "missing" { }
+            "sigonly" { New-RandFile "$L.sig" 64 }
+        }
+        Rb-ConfSet enterprise_lib $L
+        Rb-ConfSet enterprise_require_signature $req
+        # The daemon loads the enterprise library LAZILY, on the first ledger
+        # call, and keeps it loaded until it is restarted -- a live change of
+        # enterprise_lib is refused while a library is loaded. So a variant
+        # that expects a REFUSAL has to be judged on a daemon that has not
+        # loaded anything yet: after the one variant the operator opted into
+        # (the unsigned library, which loads), the daemon is restarted here,
+        # on the configuration just written, before the next variant is
+        # judged. Without this, every variant after the loading one sees the
+        # library still loaded and answers instead of refusing.
+        if ($libLoaded) {
+            if (-not (Rb-Restart)) {
+                $bad++; if (-not $firstBad) { $firstBad = "$name`: the daemon did not restart for the next library" }; break
+            }
+            $libLoaded = $false
+        }
+        # The refusal is logged when the daemon next loads the library -- the first ledger call
+        # after the reload, not the reload itself -- so the log is sampled after that call,
+        # mirroring the order the refusal actually happens in (the POSIX gate asserts this
+        # whole gate on survival alone; this log assertion is the added one).
+        $mark = Rb-LogMark
+        $rd = (& $probe $script:FsqdPipe $script:FsqdKey 2>&1) -join " "
+        $got = (Rb-Mdb @("-e", "SELECT IFNULL(fractal_ledger_truth_count(CONNECTION_ID()), '<NULL>');")) -join ""
+        $newLog = Rb-LogSince $mark
+        # The daemon keeps the library it loaded until it is restarted, so
+        # any variant whose ledger call answered left one loaded.
+        if ($got -ne '<NULL>') { $libLoaded = $true }
+        if ($got -match 'ERROR 2013|ERROR 2006|server has gone away|Lost connection') {
+            $bad++; if (-not $firstBad) { $firstBad = "$name`: the connection dropped ($got)" }
+        }
+        elseif (-not (Rb-DaemonOk)) {
+            $bad++; if (-not $firstBad) { $firstBad = "$name`: the daemon stopped answering" }
+        }
+        elseif ($expectLoad -eq 'yes') {
+            # The one load the operator may opt into: the library is unsigned
+            # and no signature is required, so it is loaded and the ledger
+            # calls answer.
+            if ($got -ne '<NULL>') { $loaded++ }
+            else { $bad++; if (-not $firstBad) { $firstBad = "$name`: the unsigned library was not loaded although the operator opted out ($got)" } }
+        }
+        else {
+            # A refused library leaves the ledger calls answering NULL -- and
+            # the daemon says why it refused.
+            if ($got -ne '<NULL>') {
+                $bad++; if (-not $firstBad) { $firstBad = "$name`: a refused library still answered ($got)" }
+            }
+            if ($newLog -notmatch 'refus|could not be loaded|no signature found') {
+                $bad++; if (-not $firstBad) { $firstBad = "$name`: the daemon logged no refusal (reload said: $rd)" }
+            }
+        }
+        if ($lock) { $lock.Close(); $lock = $null }
+        Remove-Item -Recurse -Force $L, "$L.sig" -ErrorAction SilentlyContinue
+    }
+    if ($bad -eq 0) { Pass "76 enterprise_refusals: the server survived $($table.Count) ways of presenting a bad or unusual enterprise library ($loaded loaded on the operator's opt-in)" }
+    else { Fail "76 enterprise_refusals: $bad problem(s) across $($table.Count) variants, first: $firstBad" }
+    Rb-End
+    Remove-Item -Recurse -Force $W -ErrorAction SilentlyContinue
+}
+
 # Gates that only exist on POSIX hosts. Each one prints an explicit [SKIP]
 # with the reason, so a Windows transcript shows the gate was considered
 # and not silently left out.
@@ -6621,6 +7534,325 @@ function Gate-61-DaemonLimits  { Skip-PosixOnlyGate '61' 'daemon_limits' 'tests/
 function Gate-62-ProviderEnv   { Skip-PosixOnlyGate '62' 'provider_env' 'restarts the daemon under POSIX environment and socket handling; not ported' }
 function Gate-63-DirectCalls   { Skip-PosixOnlyGate '63' 'direct_calls' 'udf_direct harness loads the plugin with dlopen; Linux/macOS only' }
 function Gate-64-DirectFaults  { Skip-PosixOnlyGate '64' 'direct_faults' 'needs LD_PRELOAD; Linux only' }
+# Gate 78: MD-08 through the live allowlist (build_test.sh gate 78): MariaDB's own executable comment (M!)
+# is rejected like the MySQL (!) and hint (+) forms, in either case; a plain comment stays inert.
+function Gate-78-AuditRegress {
+    Write-Host "=== gate 78: audit_regress ==="
+    $cases = @(
+        "SELECT 1 /*M! , SLEEP(30) */",
+        "SELECT 1 /*m! , SLEEP(30) */",
+        "SELECT 1 INTO /*M! OUTFILE ''/tmp/fsql_audit_x'' */",
+        "SELECT 2 /*M!50700 +1 */",
+        "SELECT 1 /*! , SLEEP(30) */",
+        "SELECT /*+ MAX_EXECUTION_TIME(1) */ 1")
+    $bad = 0
+    foreach ($c in $cases) {
+        $r = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT IFNULL(fractal_t2s_check_allowlist('$c'), '<PASS>');" 2>&1
+        if ("$r" -eq "<PASS>") { $bad++; Write-Host "         allowlist passed: $c" }
+    }
+    if ($bad -eq 0) { Pass "78 audit_regress: MD-08 executable comments (M!, m!, !, +) are all rejected by the allowlist" }
+    else { Fail "78 audit_regress: MD-08 $bad executable-comment candidate(s) passed the allowlist" }
+    $p = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT IFNULL(fractal_t2s_check_allowlist('SELECT /* a plain comment */ 1'), '<PASS>');" 2>&1
+    if ("$p" -eq "<PASS>") { Pass "78 audit_regress: MD-08 a plain block comment is still inert" } else { Fail "78 audit_regress: MD-08 a plain comment was rejected: $p" }
+}
+
+# Gate 79: the precision contract of this host's SQL-visible distances
+# Every distance, norm and dot product
+# accumulates in DOUBLE, in a fixed sequential order, with no fused
+# multiply-add and no vectorised reduction, and is returned as a double;
+# there is ONE cosine implementation in the repo (src/fsql_precision.h),
+# so every SQL-visible cosine agrees to the last bit. The driver
+# (tests/test_precision.py) checks the results against the same
+# arithmetic in Python floats (IEEE double, no FMA): bit for bit, plus
+# the adversarial near-tie ranking, the cross-function agreement and the
+# float32 text round trip.
+function Gate-79-Precision {
+    $py = Get-PythonExe
+    if (-not $py) { Skip '79 precision (no python on PATH)'; return }
+    $script = Join-Path $script:Here 'tests\test_precision.py'
+    if (-not (Test-Path -LiteralPath $script)) { Skip '79 precision (tests/test_precision.py not present)'; return }
+    $out = & $py -u $script 2>&1 | Out-String
+    $rc = $LASTEXITCODE
+    $out.TrimEnd() -split "`r?`n" | ForEach-Object { if ($_ -ne '') { Write-Host "         $_" } }
+    if ($rc -ne 0) { Fail '79 precision: the precision contract gate failed (see the output above)' }
+    elseif ($out -match '(?m)^SKIP:') { Skip '79 precision: the driver skipped (no connector or no server; see the output above)' }
+    else { Pass '79 precision: every SQL-visible distance is bit-identical to the sequential double reference' }
+}
+
+# Gate 80: the table-free convergence function was RENAMED
+# fractal_search -> fractal_sfs_converge (it runs SFS toward the query
+# direction; it is not a retrieval function), and there is NO alias: the
+# old call is refused with a message that names the new name. The
+# indexed search is the stored PROCEDURE fractal_search(table, column,
+# query, k, options).
+function Gate-80-Rename {
+    # The params argument is a JSON object, so the statement carries double
+    # quotes: Mdb-Sql sources it from a file rather than putting it on the
+    # command line (see that function's comment). The statement is written
+    # as a single-quoted PowerShell string (the SQL's own single quotes
+    # doubled) so the JSON's double quotes are literal -- in a
+    # double-quoted PowerShell string a backslash does not escape a quote.
+    $r = Mdb-Sql 'SELECT fractal_sfs_converge(''[[1,0],[0,1],[0.6,0.8]]'', ''[0.6,0.8]'', 3, ''{"iterations":50,"population_size":30}'');'
+    if ($r -match '"best_point"') { Pass '80 rename: fractal_sfs_converge(vector_csv, query_csv, k, params) runs the convergence search' }
+    else { Fail "80 rename: fractal_sfs_converge='$r'" }
+    $old = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_search('[[1,0]]', '[1,0]', 1, '{}');" 2>&1 | Out-String
+    if ($old -match 'fractal_sfs_converge') { Pass '80 rename: the old fractal_search(vector, query, k, params) call is refused and names fractal_sfs_converge' }
+    else { Fail "80 rename: the old fractal_search call was not refused with the rename message: $old" }
+    $dbg = & $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N -e "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, 2, 42);" 2>&1 | Out-String
+    if ($dbg -match '"best_point"') { Pass '80 rename: fractal_sfs_converge_debug is the convergence trace' }
+    else { Fail "80 rename: fractal_sfs_converge_debug='$dbg'" }
+}
+
+# Gate 81: the native IVF index and the indexed fractal_search. The
+# driver (tests/test_index.py) builds an index, searches it and checks
+# THE "INDEX ACTUALLY USED" property: the rows the index scanned must be
+# far below the table's row count (a search that silently ran flat must
+# fail). It also checks the verified (exact) distances, the exact
+# fallback, the delta, the staleness report, the rebuild, the candidates
+# and the drop.
+#
+# The core must carry the IVF maths: when the vendored archive predates
+# it, every index operation reports "this build of fractalsql-core does
+# not carry the IVF index (rebuild the core and refresh
+# include/<platform>)" -- the documented behaviour, reported as a SKIP.
+function Gate-81-Index {
+    $py = Get-PythonExe
+    if (-not $py) { Skip '81 index (no python on PATH)'; return }
+    $script = Join-Path $script:Here 'tests\test_index.py'
+    if (-not (Test-Path -LiteralPath $script)) { Skip '81 index (tests/test_index.py not present)'; return }
+    $out = & $py -u $script 2>&1 | Out-String
+    $rc = $LASTEXITCODE
+    $out.TrimEnd() -split "`r?`n" | ForEach-Object { if ($_ -ne '') { Write-Host "         $_" } }
+    if ($rc -ne 0) { Fail '81 index: the index gate failed (see the output above)' }
+    elseif ($out -match '(?m)^SKIP:') { Skip '81 index: the driver skipped (the vendored core does not carry the IVF index, or no server; see the output above)' }
+    else { Pass '81 index: the IVF index is built, searched and verified, and the index (not a flat scan) did the work' }
+}
+
+
+# --- Gates 83, 84, 86: the ledger-payload, id-emission and kit-mutation drivers ---------
+# (gate 85, the allocation-failure sweep, is Linux only: it needs LD_PRELOAD and signals.)
+
+# The mariadb client command as the drivers expect it: a JSON list, so a python driver can run the
+# same client the shell gates run.
+function Get-MariadbCliJson {
+    $py = Get-PythonExe
+    if (-not $py) { return $null }
+    $args = @($script:MariadbExe, "--host=127.0.0.1", "--port=$script:Port", "--skip-ssl-verify-server-cert", "-uroot", "-D", "fractalsql_bt", "-N")
+    $json = & $py -c "import json,sys; print(json.dumps(sys.argv[1:]))" @args
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return $json
+}
+
+# Runs one python driver with the mariadb client in its environment. Returns its output.
+function Invoke-MariadbDriver {
+    param([string]$Driver, [hashtable]$Extra = @{})
+    $py = Get-PythonExe
+    if (-not $py) { return $null }
+    $json = Get-MariadbCliJson
+    if (-not $json) { return $null }
+    $saved = @{}
+    foreach ($k in $Extra.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $Extra[$k]) }
+    $savedJson = [Environment]::GetEnvironmentVariable("FSQL_MARIADB_JSON")
+    [Environment]::SetEnvironmentVariable("FSQL_MARIADB_JSON", $json)
+    try {
+        # Normalized like Mdb-Sql's: the driver's own output is CRLF on
+        # Windows, and a trailing \r left on the last line lands in the
+        # middle of the message the gate prints (the gate's own line then
+        # reads as if the log had been corrupted).
+        return (Normalize-Captured (& $py -I (Join-Path $Here $Driver) 2>&1 | Out-String))
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("FSQL_MARIADB_JSON", $savedJson)
+        foreach ($k in $Extra.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+    }
+}
+
+# Gate 83: what fractal_audit_log writes into the decision-audit chain for every shape of entry type
+# and payload. The audit chain is enterprise-gated, so the mock core stands in when the real library
+# is not vendored here.
+function Gate-83-LedgerPayloads {
+    $py = Get-PythonExe
+    if (-not $py) { Skip '83 ledger_payloads: no python found to run the driver'; return }
+    if (-not (Test-Path -LiteralPath (Join-Path $Here 'tests\mdb_ledger_payloads.py'))) {
+        Skip '83 ledger_payloads (tests\mdb_ledger_payloads.py not present)'; return
+    }
+    $lib = Rb-MockLib
+    if (-not $lib) { Skip '83 ledger_payloads (the mock enterprise core did not build)'; return }
+    Rb-Begin
+    Rb-ConfSet enterprise_lib $lib
+    Rb-ConfSet enterprise_ledger_path "$env:TEMP\fractalsql_bt_ledger83.bin"
+    Rb-ConfSet enterprise_ledger_key "ledger83-key"
+    Rb-ConfSet enterprise_require_signature 0
+    if (-not (Rb-Restart) -or -not (Rb-WaitOk)) { Fail '83 ledger_payloads: the daemon did not start with the enterprise core'; Rb-End; return }
+    $out = Invoke-MariadbDriver 'tests\mdb_ledger_payloads.py'
+    Rb-End
+    if ($out -match 'ledger payloads: (\d+) checks passed, 0 failed') {
+        Pass "83 ledger_payloads: $($Matches[1]) checks passed (every entry type and payload shape; the chain still verifies)"
+    }
+    else {
+        Fail '83 ledger_payloads: see the output above'
+        Write-Host (($out -split "`n" | Where-Object { $_ -match 'FAIL|Error|Traceback' } | Select-Object -First 10) -join "`n")
+    }
+}
+
+# Gate 84: how the agents write a row's id into their JSON result.
+# 87 api_func: the SQL-visible function surface -- the version and edition answer, the vector functions answer on a small fixture, and a
+# malformed vector is refused rather than answered with a value.
+function Gate-87-ApiFunc {
+    $r = Mdb-Sql 'SELECT fractal_version();'
+    if ("$r" -match '^[0-9]+\.[0-9]+') { Pass "87 api_func: fractal_version() answers ($r)" }
+    else { Fail "87 api_func: fractal_version()='$r'" }
+    $r = Mdb-Sql 'SELECT fractal_edition();'
+    if ("$r".Trim() -eq 'Community') { Pass '87 api_func: fractal_edition() answers (Community)' }
+    else { Fail "87 api_func: fractal_edition()='$r'" }
+    $r = Mdb-Sql 'SELECT fractal_vector_dims(''[0.1,0.2,0.3]'');'
+    if ("$r".Trim() -eq '3') { Pass '87 api_func: fractal_vector_dims answers' }
+    else { Fail "87 api_func: fractal_vector_dims='$r'" }
+    $r = Mdb-Sql 'SELECT fractal_vector_dims(''bad!vec'');'
+    if ("$r".Trim() -eq 'NULL' -or "$r" -match 'fractalsql') { Pass '87 api_func: fractal_vector_dims refuses a malformed vector' }
+    else { Fail "87 api_func: a malformed vector answered with a value: $r" }
+    $r = Mdb-Sql 'SELECT fractal_vector_norm(''[0.1,0.2,0.3]'');'
+    # Trimmed before the anchored match: the value is a bare number, and the
+    # $ anchor is only reached once the trailing newline is out of the way.
+    if ("$r".Trim() -match '^[0-9.]+$') { Pass '87 api_func: fractal_vector_norm answers' }
+    else { Fail "87 api_func: fractal_vector_norm='$r'" }
+    $r = Mdb-Sql 'SELECT fractal_vector_cosine_distance(''[1,0,0]'',''[1,0,0]'');'
+    if ("$r".Trim() -match '^[0-9.eE+-]+$') { Pass '87 api_func: fractal_vector_cosine_distance answers' }
+    else { Fail "87 api_func: fractal_vector_cosine_distance='$r'" }
+    $r = Mdb-Sql 'SELECT fractal_sfs_converge(''bad!vec'',''bad!vec'',1,''{}'');'
+    if ("$r".Trim() -eq 'NULL' -or "$r" -match 'fractalsql') { Pass '87 api_func: fractal_sfs_converge refuses a malformed vector' }
+    else { Fail "87 api_func: a malformed vector answered with a value: $r" }
+}
+
+function Gate-84-IdEmission {
+    $py = Get-PythonExe
+    if (-not $py) { Skip '84 id_emission: no python found to run the driver'; return }
+    if (-not (Test-Path -LiteralPath (Join-Path $Here 'tests\mdb_id_emission.py'))) {
+        Skip '84 id_emission (tests\mdb_id_emission.py not present)'; return
+    }
+    $out = Invoke-MariadbDriver 'tests\mdb_id_emission.py'
+    if ($out -match 'id emission: (\d+) checks passed, 0 failed') {
+        Pass "84 id_emission: $($Matches[1]) checks passed (the row ids and the caller's text come back exactly)"
+    }
+    else {
+        Fail '84 id_emission: see the output above'
+        Write-Host (($out -split "`n" | Where-Object { $_ -match 'FAIL|Error|Traceback' } | Select-Object -First 10) -join "`n")
+    }
+}
+
+# Gate 86: every kit statement re-run with one literal swapped for an awkward value and with its
+# argument list changed.
+function Gate-86-KitMutation {
+    $py = Get-PythonExe
+    if (-not $py) { Skip '86 kit_mutation: no python found to run the driver'; return }
+    if (-not (Test-Path -LiteralPath (Join-Path $Here 'tests\mdb_kit_mutation.py'))) {
+        Skip '86 kit_mutation (tests\mdb_kit_mutation.py not present)'; return
+    }
+    $out = Invoke-MariadbDriver 'tests\mdb_kit_mutation.py'
+    if ($out -match 'kit mutation: .*?(\d+) crashed') {
+        if ([int]$Matches[1] -eq 0) {
+            $last = ($out -split "`n" | Where-Object { $_ -match 'kit mutation:' } | Select-Object -Last 1)
+            Pass "86 kit_mutation: $last (every kit statement with an awkward argument: no crash)"
+        }
+        else {
+            Fail "86 kit_mutation: $($Matches[1]) mutated statement(s) crashed the daemon"
+            Write-Host (($out -split "`n" | Where-Object { $_ -match 'FAIL|Error|Traceback' } | Select-Object -First 10) -join "`n")
+        }
+    }
+    else {
+        Fail '86 kit_mutation: see the output above'
+        Write-Host (($out -split "`n" | Where-Object { $_ -match 'FAIL|Error|Traceback' } | Select-Object -First 10) -join "`n")
+    }
+}
+
+function Gate-82-Retrieval {
+    # build_test.sh gate 82 (the Windows leg is a port of the Linux checks; not yet run on Windows).
+    # Retrieval agents (meta_filter, the index path, the context budget), fractal_index_ensure, recall_hybrid through the index,
+    # fractal_chunk_text and the chunking vectorizer. The mock embeds every text to [0.1,0.2,0.3].
+    function G82([string]$sql) { return ((Mdb-Sql $sql) -split "`r?`n" | Where-Object { $_.Trim() -ne '' }) }
+    function G82Last([string]$sql) { return (G82 $sql | Select-Object -Last 1) }
+    G82 "DROP TABLE IF EXISTS g82_rt; CREATE TABLE g82_rt (id BIGINT PRIMARY KEY, parent INT, body TEXT, emb JSON); INSERT INTO g82_rt SELECT seq, seq MOD 4, CONCAT('row ', seq, ' ', REPEAT('x', 60)), CONCAT('[', 0.1 + seq*0.001, ',', 0.2 - seq*0.0005, ',', 0.3 + (seq MOD 3)*0.002, ']') FROM seq_1_to_40;" | Out-Null
+    $r = G82Last "CALL fractal_index_ensure('g82_rt','emb','{\`"name\`":\`"g82_rt_ix\`",\`"vector_format\`":\`"FP32\`",\`"nlist\`":4}',@r); SELECT JSON_VALUE(@r,'`$.action');"
+    if ($r -eq 'created') { Pass "82 retrieval: fractal_index_ensure builds the index when there is none (created)" } else { Fail "82 retrieval: ensure create: $r" }
+    $r = G82Last "CALL fractal_index_ensure('g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'`$.action');"
+    if ($r -eq 'unchanged') { Pass "82 retrieval: ensure on a fit index changes nothing (unchanged)" } else { Fail "82 retrieval: ensure unchanged: $r" }
+    G82 "INSERT INTO g82_rt SELECT seq+40, (seq+40) MOD 4, CONCAT('row ', seq+40), CONCAT('[', 0.1 + (seq+40)*0.001, ',', 0.2 - (seq+40)*0.0005, ',0.3]') FROM seq_1_to_4;" | Out-Null
+    $r = G82Last "CALL fractal_index_ensure('g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'`$.action');"
+    if ($r -eq 'refreshed') { Pass "82 retrieval: ensure folds in a few added rows (refreshed)" } else { Fail "82 retrieval: ensure refresh: $r" }
+    G82 "INSERT INTO g82_rt SELECT seq+44, (seq+44) MOD 4, CONCAT('row ', seq+44), CONCAT('[', 0.1 + (seq+44)*0.001, ',', 0.2 - (seq+44)*0.0005, ',0.3]') FROM seq_1_to_26;" | Out-Null
+    $r = G82Last "CALL fractal_index_ensure('g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'`$.action');"
+    if ($r -eq 'rebuilt') { Pass "82 retrieval: ensure rebuilds after more than a quarter of the rows were added (rebuilt)" } else { Fail "82 retrieval: ensure rebuild: $r" }
+
+    G82 "DROP TABLE IF EXISTS g82_wide; CREATE TABLE g82_wide (id BIGINT PRIMARY KEY, emb JSON); INSERT INTO g82_wide SELECT seq, CONCAT('[', REPEAT(CONCAT(0.01 * seq, ','), 699), '0.5]') FROM seq_1_to_12;" | Out-Null
+    $r = (G82 "CALL fractal_index_ensure('g82_wide','emb','{\`"name\`":\`"g82_wide_ix\`",\`"vector_format\`":\`"FP32\`",\`"nlist\`":2}',@r); SELECT JSON_VALUE(@r,'`$.action'), JSON_VALUE(@r,'`$.rows');") -join ' '
+    if ($r -eq "created`t12") { Pass "82 retrieval: an FP32 index over 700-dimension vectors builds (the codes are not cut short)" } else { Fail "82 retrieval: wide FP32 index: $r" }
+    $r = (G82 "CALL fractal_search('g82_wide','emb',CONCAT('[', REPEAT('0.05,', 699), '0.5]'), 3, '{\`"index\`":\`"g82_wide_ix\`"}', @r, @s); SELECT JSON_LENGTH(@r), JSON_VALUE(@s,'`$.used_index');") -join ' '
+    if ($r -eq "3`t1") { Pass "82 retrieval: the wide FP32 index answers a search" } else { Fail "82 retrieval: wide FP32 search: $r" }
+
+    $q = "CALL fractal_rag_agent('q','g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'`$.used_index');"
+    $r = G82Last $q
+    if ($r -eq '0') { Pass "82 retrieval: rag_agent scans by default (used_index false)" } else { Fail "82 retrieval: rag default: $r" }
+    $r = G82Last "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; $q"
+    if ($r -eq '1') { Pass "82 retrieval: agent_use_index on sends rag_agent through the index (used_index true)" } else { Fail "82 retrieval: rag on: $r" }
+    $r = (G82 "SELECT fractal_config_set('agent_use_index','auto',CONNECTION_ID()) INTO @x; $q SELECT fractal_config_set('agent_index_min_rows','5',CONNECTION_ID()) INTO @y; $q") -join ' '
+    if ($r -eq '0 1') { Pass "82 retrieval: auto scans exactly on a table under agent_index_min_rows, and uses the ready, calibrated index once the table is over it" } else { Fail "82 retrieval: rag auto: $r" }
+    $r = (G82 "CALL fractal_index_info('g82_rt_ix',@r); SELECT JSON_VALUE(@r,'`$.calibration.reaches_target'), JSON_VALUE(@r,'`$.nprobe_default') > 0, JSON_VALUE(@r,'`$.status');") -join ' '
+    if ($r -eq "1`t1`tready") { Pass "82 retrieval: the index was calibrated at build time (a recall estimate from a sample) and reports nprobe_default and reaches_target" } else { Fail "82 retrieval: calibration info: $r" }
+    G82 "DROP TABLE IF EXISTS g82_few; CREATE TABLE g82_few (id BIGINT PRIMARY KEY, emb JSON); INSERT INTO g82_few SELECT seq, CONCAT('[', seq, ',1,2]') FROM seq_1_to_8; CALL fractal_index_create('g82_few','emb','{\`"name\`":\`"g82_few_ix\`",\`"vector_format\`":\`"FP32\`",\`"nlist\`":2}',@r);" | Out-Null
+    $r = (G82 "CALL fractal_index_info('g82_few_ix',@r); SELECT JSON_VALUE(@r,'`$.calibration.skipped') IS NOT NULL, JSON_VALUE(@r,'`$.status');") -join ' '
+    if ($r -eq "1`tready") { Pass "82 retrieval: an index over fewer than 12 rows is built uncalibrated (calibration skipped), not refused" } else { Fail "82 retrieval: uncalibrated info: $r" }
+    $r = G82Last "SELECT fractal_config_set('agent_use_index','auto',CONNECTION_ID()) INTO @x; SELECT fractal_config_set('agent_index_min_rows','1',CONNECTION_ID()) INTO @y; CALL fractal_rag_agent('q','g82_few','emb',NULL,@r); SELECT JSON_VALUE(@r,'`$.used_index');"
+    if ($r -eq '0') { Pass "82 retrieval: auto scans exactly through an uncalibrated index" } else { Fail "82 retrieval: auto uncalibrated: $r" }
+    $r = (G82 "SELECT fractal_config_set('agent_use_index','sometimes',CONNECTION_ID());") -join ' '
+    if ($r -match 'must be one of: off\|on\|auto') { Pass "82 retrieval: agent_use_index refuses a value that is not off, on or auto" } else { Fail "82 retrieval: bad mode: $r" }
+
+    $q = "CALL fractal_rag_agent('q','g82_rt','emb',JSON_OBJECT('parent',2),@r); SELECT (SELECT COUNT(*) FROM g82_rt WHERE parent = 2 AND JSON_CONTAINS(JSON_EXTRACT(@r,'`$.source_row_ids'), CAST(id AS CHAR))) = JSON_LENGTH(JSON_EXTRACT(@r,'`$.source_row_ids')), JSON_LENGTH(JSON_EXTRACT(@r,'`$.source_row_ids')) > 0;"
+    $r = (G82Last $q) -replace '\s+', ' '
+    if ($r -eq '1 1') { Pass "82 retrieval: meta_filter limits the scan to the rows that match" } else { Fail "82 retrieval: filter scan: $r" }
+    $r = (G82Last "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; $q") -replace '\s+', ' '
+    if ($r -eq '1 1') { Pass "82 retrieval: meta_filter through the index passes the matching keys as the ids option, same rows" } else { Fail "82 retrieval: filter index: $r" }
+    $r = (G82 "CALL fractal_rag_agent('q','g82_rt','emb',JSON_OBJECT('nosuch',1),@r);") -join ' '
+    if ($r -match 'does not exist') { Pass "82 retrieval: a meta_filter column the table does not have is an error" } else { Fail "82 retrieval: filter bad column: $r" }
+    $r = (G82 "CALL fractal_rag_agent('q','g82_rt','emb',JSON_OBJECT('parent',99),@r);") -join ' '
+    if ($r -match 'for that meta_filter') { Pass "82 retrieval: a meta_filter that matches no row is an error, never ignored" } else { Fail "82 retrieval: filter no match: $r" }
+    $r = (G82Last "SELECT fractal_config_set('agent_context_row_bytes','10',CONNECTION_ID()) INTO @x; CALL fractal_search_agent('q','g82_rt','emb',10,5,NULL,@r); SELECT JSON_VALUE(@r,'`$.context_cut.cells') > 0, JSON_VALUE(@r,'`$.execution_time_ms') >= 0;") -replace '\s+', ' '
+    if ($r -eq '1 1') { Pass "82 retrieval: a text cell over agent_context_row_bytes is cut and counted in context_cut; search_agent reports a measured time" } else { Fail "82 retrieval: context cut: $r" }
+
+    $q = "CALL fractal_agent_recall_hybrid('g82_rt','emb','[0.1,0.2,0.3]','parent','1',5,NULL,@r); SELECT GROUP_CONCAT(j.mem_id ORDER BY j.mem_id) FROM JSON_TABLE(@r,'`$[*]' COLUMNS(mem_id BIGINT PATH '`$.mem_id')) j;"
+    $rs = G82Last $q
+    $ri = G82Last "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; $q"
+    if ($rs -and $rs -eq $ri) { Pass "82 retrieval: recall_hybrid through the index returns the rows the cohort scan returns ($ri)" } else { Fail "82 retrieval: recall_hybrid index '$ri' vs scan '$rs'" }
+    G82 "CALL fractal_index_drop('g82_rt_ix',@d); DROP TABLE IF EXISTS g82_rt;" | Out-Null
+
+    $r = G82Last "SELECT JSON_COMPACT(fractal_chunk_text('abcdefghij', 4, 1, 'fixed'));"
+    if ($r -eq '[{"no":0,"start":0,"end":4,"text":"abcd"},{"no":1,"start":3,"end":7,"text":"defg"},{"no":2,"start":6,"end":10,"text":"ghij"}]') { Pass "82 retrieval: chunk_text fixed, size 4, overlap 1" } else { Fail "82 retrieval: chunk_text fixed: $r" }
+    $r = G82Last "SELECT GROUP_CONCAT(CONCAT(j.s, '-', j.e, ':', j.t) ORDER BY j.n SEPARATOR '|') FROM JSON_TABLE(fractal_chunk_text('One. Two sentences! Is this three? Yes.  Four is a long one that keeps on going and going.', 30, 5, 'sentence'), '`$[*]' COLUMNS(n INT PATH '`$.no', s INT PATH '`$.start', e INT PATH '`$.end', t TEXT PATH '`$.text')) j;"
+    if ($r -eq '0-19:One. Two sentences!|20-39:Is this three? Yes.|41-71:Four is a long one that keeps |66-90:eeps on going and going.') { Pass "82 retrieval: chunk_text sentence packing, a long sentence split with overlap" } else { Fail "82 retrieval: chunk_text sentence: $r" }
+    $r = (G82Last "SELECT fractal_chunk_text('', 10, 0), fractal_chunk_text(NULL, 10, 0) IS NULL;") -replace '\s+', ' '
+    if ($r -eq '[] 1') { Pass "82 retrieval: chunk_text of empty text is [] and of NULL is NULL" } else { Fail "82 retrieval: chunk_text empty: $r" }
+    $r = G82Last "SELECT fractal_chunk_text('x', 5, 5);"
+    if ($r -eq 'NULL') { Pass "82 retrieval: chunk_text refuses an overlap of size or more (NULL, as every UDF argument error does)" } else { Fail "82 retrieval: chunk_text overlap: $r" }
+
+    G82 "DROP TABLE IF EXISTS g82_cdocs_chunks; DROP TABLE IF EXISTS g82_cdocs; CREATE TABLE g82_cdocs (id BIGINT PRIMARY KEY, body TEXT); INSERT INTO g82_cdocs VALUES (1, CONCAT('First paragraph here.', CHAR(10), CHAR(10), 'Second one is short.')), (2, 'A single short document.');" | Out-Null
+    $vid = G82Last "CALL fractal_vectorizer_create('g82_cdocs','body','embedding','{\`"chunk_size\`":30,\`"chunk_overlap\`":0}',@v); SELECT @v;"
+    if ($vid -match '^\d+$') { Pass "82 retrieval: a vectorizer with chunk_size is created (id $vid)" } else { Fail "82 retrieval: chunking vectorizer: $vid" }
+    $r = G82Last "SELECT GROUP_CONCAT(CONCAT(parent_id, '/', chunk_no, ':', chunk_text) ORDER BY parent_id, chunk_no SEPARATOR '|') FROM g82_cdocs_chunks;"
+    if ($r -eq '1/0:First paragraph here.|1/1:Second one is short.|2/0:A single short document.') { Pass "82 retrieval: existing rows are chunked into the chunk table" } else { Fail "82 retrieval: chunk table: $r" }
+    G82 "CALL fractal_vectorizer_process_queue(50, 600);" | Out-Null
+    $r = G82Last "SELECT CONCAT(SUM(embedding IS NOT NULL), '/', COUNT(*)) FROM g82_cdocs_chunks;"
+    if ($r -eq '3/3') { Pass "82 retrieval: the chunks are what the vectorizer embeds" } else { Fail "82 retrieval: chunk embeddings: $r" }
+    G82 "INSERT INTO g82_cdocs VALUES (3, 'Added later.'); UPDATE g82_cdocs SET body = 'Only one now.' WHERE id = 1; DELETE FROM g82_cdocs WHERE id = 2;" | Out-Null
+    $r = G82Last "SELECT GROUP_CONCAT(CONCAT(parent_id, ':', chunk_text) ORDER BY parent_id, chunk_no SEPARATOR '|') FROM g82_cdocs_chunks;"
+    if ($r -eq '1:Only one now.|3:Added later.') { Pass "82 retrieval: insert adds chunks, an update of the text rechunks the row, a delete removes them" } else { Fail "82 retrieval: chunk follow: $r" }
+    G82 "CALL fractal_vectorizer_drop($vid); INSERT INTO g82_cdocs VALUES (4, 'After the drop.');" | Out-Null
+    $r = G82Last "SELECT COUNT(*) FROM g82_cdocs_chunks WHERE parent_id = 4;"
+    if ($r -eq '0') { Pass "82 retrieval: dropping the vectorizer stops the chunking and leaves the chunk table" } else { Fail "82 retrieval: after drop: $r" }
+    $r = (G82 "CALL fractal_vectorizer_create('g82_cdocs','body','embedding','{\`"chunk_size\`":0}',@v);") -join ' '
+    if ($r -match 'chunk_size must be 1\.\.100000') { Pass "82 retrieval: chunk_size out of range is refused" } else { Fail "82 retrieval: chunk_size 0: $r" }
+    G82 "DROP TABLE IF EXISTS g82_cdocs_chunks; DROP TABLE IF EXISTS g82_cdocs;" | Out-Null
+}
+
+function Gate-77-FrameAuth     { Skip-PosixOnlyGate '77' 'frame_auth' 'needs LD_PRELOAD (fail_size_preload.so), /proc and a Unix socket; Linux/macOS only' }
 function Gate-65-McpFaults     { Skip-PosixOnlyGate '65' 'mcp_faults' 'needs LD_PRELOAD (oom_preload.so) and signals; Linux only' }
 
 # Gate 66: the MCP server's command line and environment, every flag and
@@ -6643,10 +7875,24 @@ function Gate-66-McpCli {
     $env:MARIADB_DATABASE = 'fractalsql_bt'
     $env:MARIADB_USER = 'root'
     $env:MARIADB_PASSWORD = ''
+    # The MCP server is fail-closed about a missing lock file (a hard startup
+    # exit), and it looks for its two lock files beside its own executable
+    # when no path is configured -- which is what lets it start from any
+    # working directory. On Windows the executable lives in
+    # mcp\dist\windows-mcp\, not next to the two committed lock files, and
+    # this driver deliberately strips FSQL_MCP_SCHEMA_LOCK and
+    # FSQL_MCP_SAFETY_LOCK from the environment it hands the server (it
+    # exercises the default resolution), so the files have to be beside the
+    # executable. Same arrangement gate 68 below uses.
+    Ensure-McpLocksBesideExe $mcpExe
     try {
         & $py -u $client 2>&1 | ForEach-Object { Write-Host "    $_" }
-        if ($LASTEXITCODE -eq 0) { Pass '66 mcp_cli: every command line and environment ended as expected' }
-        else { Fail "66 mcp_cli: driver exited $LASTEXITCODE" }
+        $cliExit = $LASTEXITCODE
+        # the HTTP transport's origin check and repeated headers; needs no engine
+        & $py -u (Join-Path $script:Here 'mcp\tests\mcp_audit_http.py') 2>&1 | ForEach-Object { Write-Host "    $_" }
+        if ($LASTEXITCODE -ne 0) { $cliExit = $LASTEXITCODE }
+        if ($cliExit -eq 0) { Pass '66 mcp_cli: every command line and environment ended as expected' }
+        else { Fail "66 mcp_cli: driver exited $cliExit" }
     }
     finally {
         foreach ($v in @('MCP_SERVER_EXE','MCP_SERVER_CWD','MCP_MARIADB_BIN','MARIADB_HOST','MARIADB_PORT',
@@ -6705,7 +7951,15 @@ function Gate-67-McpFuzz {
         $log = Join-Path $outDir "$t.build.log"
         $compileArgs = $common + $fz + @("tests\fuzz\$t.cpp") + $srcs + @("/Fe$bin") + $libs
         & $script:ClangCl $compileArgs *> $log
-        if ($LASTEXITCODE -ne 0) { Fail "67 mcp_fuzz: $t failed to build; see $log"; continue }
+        if ($LASTEXITCODE -ne 0) {
+            Fail "67 mcp_fuzz: $t failed to build; see $log"
+            # CI cannot open that path, so the compiler's own words go into the
+            # job output: without them a build failure is a dead end (caught
+            # live on the Windows cell, 2026-11-23).
+            Get-Content -LiteralPath $log -Tail 40 -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Host "    | $_" }
+            continue
+        }
         $seed = Join-Path $outDir "${t}_seed"; New-Item -ItemType Directory -Force -Path $seed | Out-Null
         $corpus = Join-Path $script:Here "tests\fuzz\corpus_$($t -replace '^fuzz_','')"
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -6755,14 +8009,7 @@ function Gate-68-McpConformance {
     # The server looks for its two lock files beside the executable when no
     # path is configured, and that is what lets it start from any working
     # directory.
-    $exeDir = Split-Path -Parent $mcpExe
-    foreach ($lock in @('.mcp-schema-lock', '.mcp-safety-annotations-lock')) {
-        $src = Join-Path $script:Here ("mcp\" + $lock)
-        $dst = Join-Path $exeDir $lock
-        if ((Test-Path -LiteralPath $src) -and ($src -ne $dst)) {
-            Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Ensure-McpLocksBesideExe $mcpExe
 
     # The config-write checks edit the daemon's configuration file and ask the
     # daemon to reload it. The driver gets a COPY of that file, so a test
@@ -6854,16 +8101,364 @@ function Run-Gates([string[]]$Gates) {
     if ($Gates -contains "64") { Gate-64-DirectFaults }
     if ($Gates -contains "65") { Gate-65-McpFaults }
     if ($Gates -contains "67") { Gate-67-McpFuzz }
-    $needDb = $Gates | Where-Object { $_ -in @("02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31","32","33","34","35","36","39","40","42","43","44","45","47","48","49","50","51","52","55","58","60","66","68") }
+    if ($Gates -contains "77") { Gate-77-FrameAuth }
+    # Every gate below needs the cluster: it either talks to the server
+    # through the client or drives a python driver that does. 72, 74 and 87
+    # were missing from this list once, so a selection containing ONLY one
+    # of them set up no cluster and reported PASS without running anything.
+    $needDb = $Gates | Where-Object { $_ -in @("02","03","04","05","06","07","08","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","31","32","33","34","35","36","39","40","42","43","44","45","47","48","49","50","51","52","55","58","60","66","68","72","74","78","79","80","81","82","83","84","86","87") }
     if ($needDb) {
         $rc = Mdb-Setup $MdbMajor
         if ($rc -eq 1) { Skip "MariaDB $MdbMajor runtime gates (mariadbd.exe not found, pass -MdbDir)"; return }
         if ($rc -ne 0) { Fail "MariaDB $MdbMajor cluster setup"; return }
-        foreach ($g in $Gates) {
+    }
+    # The dispatch loop itself ALWAYS runs, whether or not a cluster was
+    # needed. It used to sit inside the "if ($needDb)" block above, which
+    # meant a selection of gates that need no cluster -- 69, 70, 85 -- was
+    # never dispatched at all and the run reported PASS having run nothing.
+    # The gate FUNCTIONS are defined inside this loop's body, so they only
+    # exist once it has run at least once; running the loop unconditionally
+    # is what makes them available to the switch below.
+    foreach ($g in $Gates) {
+
+# build_test.sh gate 69: every vendored reasoning plugin ships with a 64-byte detached signature
+# beside it. The static half of the gate (the runtime half is the sqlite gate's, because the plugin
+# path is the extension's own and this engine loads it differently).
+function Gate-69-PluginSigVendored {
+    $n = 0; $bad = 0
+    foreach ($f in (Get-ChildItem -Path (Join-Path $Here 'include') -Recurse -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -match '^fractalsql-reasoning-http\.(so|dll)$' })) {
+        $n++
+        $sig = "$($f.FullName).sig"
+        if (-not (Test-Path -LiteralPath $sig) -or (Get-Item -LiteralPath $sig).Length -ne 64) {
+            Write-Host "      $($f.FullName.Substring($Here.Length + 1)): missing or not 64 bytes: $sig"
+            $bad++
+        }
+    }
+    if ($n -eq 0) { Skip '69 plugin_sig_vendored (no vendored plugins under include/)'; return }
+    if ($bad -ne 0) { Fail "69 plugin_sig_vendored: $bad of $n vendored plugin(s) lack a valid .sig"; return }
+    Pass "69 plugin_sig_vendored: all $n vendored plugins have a 64-byte .sig beside them"
+}
+
+# build_test.sh gate 70: the header-level unit test of src\fsql_audit_redact.h -- the audit trail's
+# redaction, which the SQL gates reach only through the ledger's audit path. The test drives the mode
+# by setting and clearing an environment variable, and neither MSVC's CRT nor mingw's has
+# setenv/unsetenv, so the small POSIX shim is force-included and the test source stays portable.
+function Gate-70-RedactUnit {
+    $testFile = Join-Path $Here 'tests\redact_unit.c'
+    if (-not (Test-Path -LiteralPath $testFile)) { Skip '70 redact_unit (tests\redact_unit.c not present)'; return }
+    $work = Join-Path $env:TEMP ("fractalsql_bt_redact_unit_" + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $work -Force
+    $obj = Join-Path $work 'redact_unit.obj'
+    $bin = Join-Path $work 'redact_unit.exe'
+    $log = Join-Path $work 'redact_unit.log'
+    $shim = Join-Path $Here 'tests\windows\win_env_compat.h'
+    $srcDir = Join-Path $Here 'src'
+    $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    $gcc = if (-not $cl) { Get-Command gcc -ErrorAction SilentlyContinue } else { $null }
+    if (-not $cl -and -not $gcc) { Skip '70 redact_unit (no C compiler on PATH)'; return }
+    if ($cl) {
+        & cl.exe /nologo /MT /std:c11 /O1 /W0 "/FI$shim" "/I$srcDir" /c $testFile "/Fo$obj" 1>$log 2>&1
+        if ($LASTEXITCODE -eq 0) { & cl.exe /nologo /MT "$obj" "/Fe$bin" 1>>$log 2>&1 }
+    }
+    else {
+        & gcc -std=c11 -O1 -g "-I$srcDir" -include $shim -c $testFile -o $obj 1>$log 2>&1
+        if ($LASTEXITCODE -eq 0) { & gcc $obj -o $bin 1>>$log 2>&1 }
+    }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $bin)) {
+        Get-Content -LiteralPath $log -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "         $_" }
+        Fail "70 redact_unit: the unit test did not build (see $log)"
+        return
+    }
+    $out = & $bin 2>&1
+    $rc = $LASTEXITCODE
+    Remove-Item -LiteralPath $obj, $bin -Force -ErrorAction SilentlyContinue
+    if ($rc -eq 0) {
+        Pass "70 redact_unit: $(($out | Select-Object -Last 1))"
+    }
+    else {
+        $out | Select-Object -Last 12 | ForEach-Object { Write-Host "         $_" }
+        Fail '70 redact_unit: see the output above'
+    }
+}
+
+# build_test.sh gate 72: the text-to-SQL allowlist's verdicts. Every candidate statement is put to the
+# engine's own allowlist checker, and the verdict it gives must be the one the allowlist is specified
+# to give: P = permitted, E = an empty statement, X = versioned (slash-star-bang), M = more than one
+# statement, O = INTO OUTFILE/DUMPFILE, F = a function that changes state, T = a statement type that is
+# not permitted.
+function Gate-72-AllowlistMatrix {
+    $rows = @'
+P	SELECT 1
+P	select * from bt_customers where id = 1
+P	WITH x AS (SELECT 1) SELECT * FROM x
+P	SELECT 1;
+P	SELECT 1; 
+P	-- c\nSELECT 1
+P	# c\nSELECT 1
+P	/* c */ SELECT 1
+P	SELECT /* c */ 1
+E	/* never closed SELECT 1
+E	-- only a comment
+P	SELECT 1 -- trailing
+P	SELECT 1 # trailing
+X	/*! SELECT 1 */
+X	/*!50000 SELECT 1 */
+X	/*+ HINT */ SELECT 1
+X	SELECT /*! 1 */ 1
+X	SELECT /*+ MAX_EXECUTION_TIME(1) */ 1
+M	SELECT 1; SELECT 2
+M	SELECT 1; DROP TABLE bt_customers
+P	SELECT 'a;b'
+P	SELECT "a;b"
+P	SELECT `a;b` FROM bt_customers
+P	SELECT 'it''s'
+M	SELECT 'a\\'' ; DROP TABLE x; -- '
+O	SELECT 1 INTO OUTFILE '/tmp/x'
+O	SELECT 1 INTO DUMPFILE '/tmp/x'
+P	SELECT 1 INTO @v
+O	select * from bt_customers into outfile '/tmp/y'
+P	SELECT 'into outfile' AS s
+F	SELECT LOAD_FILE('/etc/passwd')
+F	SELECT SLEEP(5)
+F	SELECT BENCHMARK(1000000, MD5('a'))
+T	DO SLEEP(1)
+T	SET @a = 1
+T	CALL some_proc()
+T	INSERT INTO bt_customers (name) VALUES ('x')
+T	UPDATE bt_customers SET name = 'x'
+T	DELETE FROM bt_customers
+T	REPLACE INTO bt_customers (id) VALUES (1)
+T	DROP TABLE bt_customers
+T	TRUNCATE TABLE bt_customers
+T	CREATE TABLE t (a INT)
+T	ALTER TABLE bt_customers ADD COLUMN z INT
+T	SHOW TABLES
+T	EXPLAIN SELECT 1
+T	DESCRIBE bt_customers
+T	USE mysql
+T	GRANT ALL ON *.* TO 'x'@'%'
+T	LOCK TABLES bt_customers READ
+T	HANDLER bt_customers OPEN
+T	LOAD DATA INFILE '/etc/passwd' INTO TABLE bt_customers
+T	PREPARE s FROM 'SELECT 1'
+T	EXECUTE s
+T	BEGIN
+T	COMMIT
+T	KILL 1
+T	FLUSH TABLES
+T	`SELECT` 1
+T	"SELECT" 1
+P	(SELECT 1)
+P	(SELECT 1) UNION (SELECT 2)
+P	SELECT 1 UNION SELECT 2
+P	SELECT * FROM bt_customers FOR UPDATE
+P	SELECT * FROM bt_customers LOCK IN SHARE MODE
+F	SELECT GET_LOCK('x', 1)
+P	SELECT @@version
+P	SELECT user()
+P	SELECT * FROM information_schema.tables
+P	SELECT * FROM mysql.user
+P	  \n\t SELECT 1
+P	SELECT\n1
+P	sElEcT 1
+T	SELECTED 1
+T	SELECT1
+T	123 not a keyword
+E	;
+E	;;
+P	SELECT 1;;
+P	SELECT 1 ; -- x
+P	SELECT '\0'
+P	SELECT 0x41
+P	SELECT * FROM (SELECT 1) t
+P	WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3) SELECT * FROM n
+T	WITH x AS (SELECT 1) DELETE FROM bt_customers
+T	WITH x AS (SELECT 1) INSERT INTO bt_customers SELECT * FROM x
+P	SELECT 1 FROM DUAL
+P	SELECT SQL_NO_CACHE 1
+P	SELECT 'unterminated
+P	SELECT "unterminated
+P	SELECT `unterminated
+P	SELECT 1 /* x */ ; /* y */
+P	SELECT 1; /* only a comment after */
+P	SELECT 1; -- comment after
+P	SELECT 1; # comment after
+M	SELECT 1;\nSELECT 2
+T	(DELETE FROM bt_customers)
+T	(INSERT INTO bt_customers (id) VALUES (1))
+T	(UPDATE bt_customers SET name = 'x')
+T	((DELETE FROM bt_customers))
+P	((SELECT 1))
+F	SELECT SLEEP/**/(5)
+F	SELECT SLEEP -- c\n (5)
+F	SELECT SLEEP # c\n (5)
+F	SELECT 1--SLEEP(5)
+F	SELECT BENCHMARK/**/(1000000, MD5('a'))
+F	SELECT `sleep`(0)
+F	SELECT "sleep"(0)
+P	SELECT `sleep` FROM bt_customers
+'@
+    $rows = $tableText -split "`n" | Where-Object { $_ -ne "" }
+    $sql = New-Object System.Collections.Generic.List[string]
+    $expect = @()
+    $i = 0
+    foreach ($line in ($rows -split "`r?`n")) {
+        if (-not $line.Trim()) { continue }
+        $i++
+        $parts = $line -split "`t", 2
+        $cand = $parts[1] -replace "'", "''"
+        $sql.Add("SELECT $i, IFNULL(fractal_t2s_check_allowlist('$cand'), '<PASS>');")
+        switch ($parts[0]) {
+            'P' { $expect += '<PASS>' }
+            'E' { $expect += 'SQL is empty' }
+            'X' { $expect += 'versioned (slash-star-bang)' }
+            'M' { $expect += 'expected exactly one SQL statement' }
+            'O' { $expect += 'INTO OUTFILE/DUMPFILE' }
+            'F' { $expect += 'a function that changes state' }
+            'T' { $expect += 'is not permitted' }
+        }
+    }
+    $out = (Mdb-Sql ($sql -join "`n"))
+    $got = @{}
+    foreach ($line in ($out -split "`r?`n")) {
+        if ($line -match '^(\d+)\t(.*)$') { $got[[int]$Matches[1]] = $Matches[2] }
+    }
+    $bad = 0; $n = 0
+    for ($k = 1; $k -le $i; $k++) {
+        $n++
+        $want = $expect[$k - 1]
+        $have = if ($got.ContainsKey($k)) { $got[$k] } else { '<no answer>' }
+        if ($have -notlike "*$want*") {
+            $bad++
+            if ($bad -le 6) { Write-Host "         $k -> $have (want $want)" }
+        }
+    }
+    if ($bad -eq 0) { Pass "72 allowlist_matrix: all $n candidate statements got the verdict the allowlist is specified to give" }
+    else { Fail "72 allowlist_matrix: $bad of $n candidates got a different verdict (first ones above)" }
+}
+
+# build_test.sh gate 74: every awkward vector, search, diversify and reasoning argument shape, one
+# statement per line, run with the client's --force so a refusal does not stop the batch. The gate is
+# about the server SURVIVING them: no statement may crash the backend.
+function Gate-74-UdfInputs {
+    $sql = @'
+SELECT fractal_sfs_converge('', '1e5,2E-3,3e+2');
+SELECT fractal_sfs_converge('', '.5,5.,1e,1e+');
+SELECT fractal_sfs_converge('', '-.5e-2,+1');
+SELECT fractal_sfs_converge('', 'nan,inf,-inf');
+SELECT fractal_sfs_converge('', '1e999,1');
+SELECT fractal_sfs_converge('', CONCAT(REPEAT('9', 70), ',1'));
+SELECT fractal_sfs_converge('', CONCAT('1e', REPEAT('9', 70), ',1'));
+SELECT fractal_sfs_converge('', CONCAT('1.', REPEAT('0', 70), '1,1'));
+SELECT fractal_sfs_converge('[[1,2],[3,4]]', '1,2,3', 1, '{}');
+SELECT fractal_sfs_converge('[[1,2],[3,4]]', '1,2', 1, '{}');
+SELECT fractal_sfs_converge('[[1,2],[3]]', '1,2', 1, '{}');
+SELECT fractal_sfs_converge('', '', 1, '{}');
+SELECT fractal_sfs_converge('', ',', 1, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"iterations":10000,"population_size":10000,"diffusion_factor":32}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"iterations":"x"}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"iterations":-1}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"population_size":1e10}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"diffusion_factor":0}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"walk":"a","debug":1}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"debug":true,"iterations":3,"population_size":5}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, 'not json');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '[1]');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, NULL);
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 0, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', -1, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1000000, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"session_id":0,"iterations":3,"population_size":5}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"session_id":99999999,"iterations":3,"population_size":5}');
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_diversify_enable(CONNECTION_ID());
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_sfs_converge('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
+SELECT fractal_sfs_converge('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_detect_collapse(CONNECTION_ID());
+SELECT fractal_diversify_disable(CONNECTION_ID());
+SELECT fractal_explain_result(CONNECTION_ID());
+SELECT fractal_explain_result(NULL);
+SELECT fractal_explain_result(99999999);
+SELECT fractal_sfs_converge_debug('');
+SELECT fractal_sfs_converge_debug(',');
+SELECT fractal_sfs_converge_debug('1e5,2E-3');
+SELECT fractal_sfs_converge_debug('1,2', 0, 0, 0, 0);
+SELECT fractal_sfs_converge_debug('1,2', 100000, 100000, 32, 1);
+SELECT fractal_search_explore('', '', '{}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2,3', '{}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', '{"population_size":10000,"iterations":10000}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', '{"population_size":1}');
+SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', 'x');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'on');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'off');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'ON');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'Off');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), 'x');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), '');
+SELECT fractal_agent_partial_fail(NULL, 'on');
+SELECT fractal_agent_partial_fail(CONNECTION_ID(), NULL);
+SELECT fractal_reason(CONNECTION_ID(), 'q', NULL);
+SELECT fractal_reason(CONNECTION_ID(), 'q', '{}');
+SELECT fractal_reason(CONNECTION_ID(), 'q', REPEAT('x', 5242880));
+SELECT fractal_reason(CONNECTION_ID(), REPEAT('x', 5242880));
+SELECT fractal_reason(NULL, 'q');
+SELECT fractal_reason(CONNECTION_ID(), NULL);
+SELECT fractal_reason(CONNECTION_ID(), '');
+SELECT fractal_session_close(CONNECTION_ID());
+SELECT fractal_session_close(CONNECTION_ID());
+SELECT fractal_session_close(NULL);
+SELECT fractal_version(), fractal_edition();
+'@
+    $f = Join-Path $env:TEMP ("fsql_bt_udf_inputs_" + [guid]::NewGuid().ToString('N') + ".sql")
+    Set-Content -LiteralPath $f -Value $sql -Encoding ascii
+    try {
+        $out = (& $script:MariadbExe --host=127.0.0.1 --port=$script:Port --skip-ssl-verify-server-cert -uroot -D fractalsql_bt -N --force -e "source $f" 2>&1 | Out-String)
+        $n = ($sql -split "`r?`n" | Where-Object { $_ -match '^SELECT' }).Count
+        $alive = (Mdb-Sql "SELECT 1;").Trim()
+        if (($alive -eq '1') -and ($out -notmatch 'ERROR 2013|ERROR 2006|server has gone away|Lost connection')) {
+            Pass "74 udf_inputs: the server answered all $n awkward vector, search, diversify and reasoning statements"
+        }
+        else {
+            ($out -split "`r?`n" | Select-Object -Last 5) | ForEach-Object { Write-Host "         $_" }
+            Fail "74 udf_inputs: the server did not survive (alive=$alive)"
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# build_test.sh gate 85: the OOM sweep. It interposes the allocator with LD_PRELOAD and drives the server
+# under allocation failures -- Linux only, and the POSIX gate skips itself anywhere else.
+function Gate-85-OomSweep {
+    Skip '85 oom_sweep (Linux only: it needs LD_PRELOAD and signals, which Windows has no equivalent of)'
+}
+
             switch ($g) {
                 "02" { Gate-02-Smoke }
                 "03" { Gate-03-SchemaContext }
                 "04" { Gate-04-TextToSql }
+                "78" { Gate-78-AuditRegress }
+                "79" { Gate-79-Precision }
+                "80" { Gate-80-Rename }
+                "81" { Gate-81-Index }
+                "82" { Gate-82-Retrieval }
+                "72" { Gate-72-AllowlistMatrix }
+                "74" { Gate-74-UdfInputs }
+                "83" { Gate-83-LedgerPayloads }
+                "84" { Gate-84-IdEmission }
+                "87" { Gate-87-ApiFunc }
+                "86" { Gate-86-KitMutation }
+                # These three need no cluster (69 reads .sig files off disk,
+                # 70 compiles and runs a unit test, 85 skips itself), but
+                # they are dispatched from here because their functions are
+                # defined inside this loop's body.
+                "69" { Gate-69-PluginSigVendored }
+                "70" { Gate-70-RedactUnit }
+                "85" { Gate-85-OomSweep }
                 "05" { Gate-05-EvilOverread }
                 "06" { Gate-06-CrashRecovery }
                 "07" { Gate-07-EvilLyingLength }
@@ -6911,10 +8506,14 @@ function Run-Gates([string[]]$Gates) {
                 "60" { Gate-60-ScriptedReplies }
                 "66" { Gate-66-McpCli }
                 "68" { Gate-68-McpConformance }
+                "71" { Gate-71-LedgerEnv }
+                "73" { Gate-73-ConfigMatrix }
+                "75" { Gate-75-MultimodalEdge }
+                "76" { Gate-76-EnterpriseRefusals }
             }
-        }
-        Mdb-Teardown
     }
+    # The cluster is torn down only if one was set up above.
+    if ($needDb) { Mdb-Teardown }
 }
 
 try {
@@ -6924,6 +8523,7 @@ try {
     else { Run-Gates $DefaultGates }
 } finally {
     Mdb-Teardown
+    Remove-MockEnterpriseArtifacts
 }
 
 # The coverage report runs AFTER the teardown: the daemon is stopped by

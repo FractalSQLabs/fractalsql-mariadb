@@ -30,7 +30,7 @@ REM
 REM Environment
 REM   MARIADB_MAJOR 10.6 ^| 10.11 ^| 11.4 ^| 12.3: selects UpgradeCode and install-folder name
 REM   MSI_ARCH      x64 ^| arm64: passed to candle -arch
-REM   MSI_VERSION   overrides Product Version (default 2.0.13, read from src\fractalsql.c's FSQL_VERSION if not set)
+REM   MSI_VERSION   overrides Product Version (default 2.0.14, read from src\fractalsql.c's FSQL_VERSION if not set)
 
 setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 
@@ -69,9 +69,12 @@ if not exist "%DAEMON%" (
     exit /b 1
 )
 
-REM The MCP server, built by mcp\scripts\windows\build.bat (libmariadb.dll is staged next to it).
+REM The MCP server, built by mcp\scripts\windows\build.bat (the build output
+REM tree stages libmariadb.dll beside the exe for the local test gates; the
+REM MSI stages only the exe -- the connector is an install prerequisite, like
+REM libmariadb3 on Linux, and fractalsql-mcp.cmd resolves it at start).
 set MCPDIST=mcp\dist\windows-mcp
-for %%F in (fractalsql-mariadb-mcp.exe libmariadb.dll) do if not exist "%MCPDIST%\%%F" (
+for %%F in (fractalsql-mariadb-mcp.exe) do if not exist "%MCPDIST%\%%F" (
     echo ==^> ERROR: %MCPDIST%\%%F missing: run mcp\scripts\windows\build.bat first
     popd
     exit /b 1
@@ -102,13 +105,16 @@ copy /Y LICENSES\GPL-2.0-only.txt "%STAGE%\LICENSE"  > nul
 copy /Y GPL-SOURCE-OFFER.txt "%STAGE%\GPL-SOURCE-OFFER.txt" > nul
 copy /Y THIRD-PARTY-NOTICES.md "%STAGE%\LICENSE-THIRD-PARTY" > nul
 
-REM MCP server: the executable, its client library and the two lock files go into one folder (the server looks for
-REM the locks beside itself); the README and manifest ride along as documentation.
+REM MCP server: the executable and its launcher go into one folder with the two lock files (the server looks for
+REM the locks beside itself); the README and manifest ride along as documentation. libmariadb.dll is NOT
+REM staged: MariaDB Connector/C is an install prerequisite (the launch condition checks it), and
+REM fractalsql-mcp.cmd resolves the installed connector at start.
 copy /Y "%MCPDIST%\fractalsql-mariadb-mcp.exe"  "%STAGE%\fractalsql-mariadb-mcp.exe" > nul
-copy /Y "%MCPDIST%\libmariadb.dll"              "%STAGE%\libmariadb.dll"              > nul
+copy /Y scripts\windows\fractalsql-mcp.cmd      "%STAGE%\fractalsql-mcp.cmd"        > nul
 copy /Y mcp\.mcp-schema-lock                    "%STAGE%\.mcp-schema-lock"            > nul
 copy /Y mcp\.mcp-safety-annotations-lock        "%STAGE%\.mcp-safety-annotations-lock" > nul
 copy /Y mcp\README.md                           "%STAGE%\mcp-README.md"               > nul
+copy /Y mcp\RUN.txt                             "%STAGE%\mcp-RUN.txt"                 > nul
 copy /Y mcp\manifest.json                       "%STAGE%\mcp-manifest.json"           > nul
 
 REM Per-cell README ships in the MSI so users who only grab the .msi
@@ -147,8 +153,12 @@ REM hopping to GitHub.
   echo.
   echo The MCP ^(Model Context Protocol^) server is installed under
   echo     C:\Program Files\MariaDB %MARIADB_MAJOR%\fractalsql-mcp\fractalsql-mariadb-mcp.exe
-  echo with its schema and safety lock files in the same folder. See
-  echo README.md there for usage.
+  echo with its schema and safety lock files in the same folder. The MCP
+  echo server is a database client: it needs MariaDB Connector/C installed
+  echo ^(the same libmariadb3 dependency the Linux package declares^). Start
+  echo it with fractalsql-mcp.cmd in that folder, which places the installed
+  echo connector's lib directory on PATH and launches the server. See
+  echo RUN.txt there for how to start it, and README.md for every setting.
   echo.
   echo After install, activate the UDFs once per server. Note the SONAME
   echo rewrite: MariaDB's UDF loader takes SONAME literally, so install_

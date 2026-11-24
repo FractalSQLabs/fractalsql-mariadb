@@ -1,7 +1,7 @@
 // bench/tester/run.js
 //
 // Minimal Node.js 24 driver for the fractalsql-mariadb UDF. Generates a
-// random corpus + query in JS, calls fractal_search() BENCH_ITERATIONS
+// random corpus + query in JS, calls fractal_sfs_converge() BENCH_ITERATIONS
 // times, records wall-clock latency, and prints mean / p50 / p95 / p99.
 //
 // Env knobs:
@@ -44,12 +44,12 @@ async function waitForReady(conn, retries = 30) {
   for (let i = 0; i < retries; i++) {
     try {
       const [rows] = await conn.query(
-        "SELECT COUNT(*) AS c FROM mysql.func WHERE name = 'fractal_search'");
+        "SELECT COUNT(*) AS c FROM mysql.func WHERE name = 'fractal_sfs_converge'");
       if (rows[0].c === 1) return;
     } catch (e) { /* retry */ }
     await new Promise(r => setTimeout(r, 1000));
   }
-  throw new Error("fractal_search UDF never became available");
+  throw new Error("fractal_sfs_converge UDF never became available");
 }
 
 async function main() {
@@ -76,7 +76,7 @@ async function main() {
   for (let i = 0; i < ITERATIONS; i++) {
     const q = queryCsv(DIM);
     const t0 = process.hrtime.bigint();
-    await conn.query("SELECT fractal_search(?, ?, ?, ?) AS r",
+    await conn.query("SELECT fractal_sfs_converge(?, ?, ?, ?) AS r",
                      [corpus, q, K, params]);
     const t1 = process.hrtime.bigint();
     timings.push(Number(t1 - t0) / 1e6);   // ms

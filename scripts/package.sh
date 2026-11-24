@@ -77,6 +77,10 @@ HAVE_MCP=0
 if [[ -f "${MCP_BIN}" ]]; then
     HAVE_MCP=1
 else
+    if [[ "${FSQL_REQUIRE_MCP:-0}" = "1" ]]; then
+        echo "${MCP_BIN} not found and FSQL_REQUIRE_MCP=1: refusing to package without the MCP server" >&2
+        exit 1
+    fi
     echo "warning: ${MCP_BIN} not found: packaging without the MCP server (run ./build.sh ${PKG_ARCH})" >&2
 fi
 for f in "${SHIM}" "${DAEMON}"; do
@@ -173,7 +177,7 @@ stage_mcp() {
     for f in .mcp-schema-lock .mcp-safety-annotations-lock; do
         install -Dm0644 "${REPO_ROOT}/mcp/${f}" "${stage}/usr/bin/${f}"
     done
-    for f in README.md manifest.json; do
+    for f in README.md RUN.txt manifest.json; do
         install -Dm0644 "${REPO_ROOT}/mcp/${f}" "${stage}/usr/share/doc/${PKG_NAME}/mcp/${f}"
     done
 }

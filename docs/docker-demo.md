@@ -40,14 +40,14 @@ docker compose up -d
 **Quick test** (works with no model; base Sniper search needs no LLM):
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
-  "SELECT fractal_search('[[0.6,0.8,0.0]]', '[0.6,0.8,0.0]', 1, '{\"iterations\":100}');"
+  "SELECT fractal_sfs_converge('[[0.6,0.8,0.0]]', '[0.6,0.8,0.0]', 1, '{\"iterations\":100}');"
 ```
 
 Confirm the UDF set loaded:
 ```bash
 docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo -e \
   "SELECT fractal_edition(), fractal_version();"
-# expect: Community, 2.0.13
+# expect: Community, 2.0.14
 ```
 
 Run any demo (re-runnable; each recreates its own fixture tables):
@@ -117,7 +117,7 @@ docker compose exec mariadb mariadb -uroot -pfractalsql fractalsql_demo < demo/d
 The demo image stages the **MCP client helpers** — `demo/mcp/call-tool.sh`
 and `demo/mcp/call-tool.py` — a one-shot JSON-RPC client that drives the
 real MCP server binary with its tool table narrowed (launch-time `--tool`
-filter) to exactly four tools (`fractal_search`, `fractal_reason`,
+filter) to exactly four tools (`fractal_sfs_converge`, `fractal_reason`,
 `fractal_agent_data_analyst`, `fractal_agent_diverse_portfolios`),
 chosen to prove the MCP call shapes end to end on real demo data. There
 is no second demo-server implementation to keep in sync: the helpers
@@ -148,7 +148,7 @@ production posture.
 One-liner real tool call round-trip (search needs no model):
 
 ```bash
-docker compose exec mariadb /demo/mcp/call-tool.sh fractal_search \
+docker compose exec mariadb /demo/mcp/call-tool.sh fractal_sfs_converge \
   '{"query":[0.6,0.8,0.0],"corpus":[[0.1,0.9,0.0],[0.6,0.8,0.0]],"k":1}'
 ```
 
@@ -172,7 +172,7 @@ docker compose exec mariadb /demo/mcp/call-tool.sh fractal_agent_diverse_portfol
 If you have Node available and want the richer, interactive Explorer,
 the MCP inspector talks to the same binary's stdio transport like any
 other MCP client (inside the container:
-`npx @modelcontextprotocol/inspector /usr/local/bin/fractalsql-mariadb-mcp --tool fractal_search`,
+`npx @modelcontextprotocol/inspector /usr/local/bin/fractalsql-mariadb-mcp --tool fractal_sfs_converge`,
 or drop the `--tool` list to see the full catalog); optional, not
 required.
 

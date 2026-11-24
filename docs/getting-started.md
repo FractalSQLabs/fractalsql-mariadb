@@ -57,7 +57,7 @@ You should see:
 
 ```
 edition   version
-Community 2.0.13
+Community 2.0.14
 ```
 
 MariaDB has no `CREATE EXTENSION` mechanism and nothing equivalent to
@@ -78,9 +78,14 @@ functions above return a value, both scripts already ran successfully.
 FractalSQL's core is a **Stochastic Fractal Search** optimizer. It comes in
 two flavours that solve different problems:
 
-- **Sniper** (`fractal_search`): converge to the single best point in a
+- **Sniper** (`fractal_sfs_converge`): converge to the single best point in a
   continuous space.
 - **Scout** (`fractal_search_explore`): discover the *diverse* structure of your
+
+A third entry point, the indexed `fractal_search(table, column, query, k)`,
+returns the nearest rows of a stored table through a native IVF index
+(`fractal_index_create`), and still returns exact distances -- the index only
+chooses which rows to look at. See [Discovery](api-discovery.md).
   own data, finding distinct "islands" instead of collapsing to one
   nearest neighbour.
 
@@ -302,6 +307,11 @@ into Homebrew MariaDB's `plugin_dir`, the daemon under
 `/usr/local/libexec/fractalsql`, and loads it as a per-user LaunchAgent)
 and registers the UDFs. See the release asset's own `README.txt` for the
 manual steps if you'd rather not run `install.sh`.
+
+Install Homebrew's OpenSSL first: the daemon uses it, and `install.sh` checks
+for it before installing anything (`brew install openssl@3`). The optional MCP
+server in the zip's `mcp/` folder also needs Homebrew's MariaDB client library
+(`brew install mariadb-connector-c`); the shim inside `mariadbd` needs neither.
 
 → Package paths, version matrices, and the reasoning plugin's
 configuration surface (`fractalsqld.conf` keys plus their environment

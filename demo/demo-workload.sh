@@ -227,10 +227,10 @@ worker() {
         case "$op" in
             sniper)
                 # Pure SFS convergence, no stored corpus needed -- '' as
-                # the corpus arg is fractal_search's own documented
+                # the corpus arg is fractal_sfs_converge's own documented
                 # convergence-only mode (same pattern benchmark.sql uses).
                 out=$("${MDB[@]}" -e "
-                    SELECT fractal_search('',
+                    SELECT fractal_sfs_converge('',
                         (SELECT JSON_ARRAYAGG(RAND()*2-1) FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<128) SELECT n FROM seq) s),
                         1, '{\"iterations\":30,\"population_size\":30}');" 2>&1) ;;
             scout)

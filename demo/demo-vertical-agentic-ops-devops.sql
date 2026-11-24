@@ -38,13 +38,15 @@
 --     hashes directly (log_hashes), a pure numeric function with no
 --     table argument at all.
 --   - fractal_search_agent's trailing args are (pop_size, iterations,
---     OUT result): result is one JSON object
---     {"answer":..,"source_doc_ids":..,"execution_time_ms":..}, not a
---     RETURNS TABLE row. execution_time_ms is a real wall-clock
---     measurement here (SYSDATE(6) start/end).
---   - fractal_rag_agent's trailing args are (meta_filter, OUT answer):
---     meta_filter is accepted but currently UNUSED, reserved for a
---     future WHERE clause; for now the whole corpus is scanned.
+--     meta_filter, OUT result): result is one JSON object
+--     {"answer":..,"source_row_ids":..,"execution_time_ms":..,
+--     "used_index":..,"context_cut":{..}}, not a RETURNS TABLE row.
+--     execution_time_ms is a real wall-clock measurement here
+--     (SYSDATE(6) start/end). meta_filter is a flat JSON object of
+--     column: value pairs (NULL for none) that limits the rows searched.
+--   - fractal_rag_agent's trailing args are (meta_filter, OUT result):
+--     result is {"answer":..,"source_row_ids":..,"used_index":..,
+--     "context_cut":{..}}.
 --   - fractal_agent_outlier_intercept and fractal_agent_anomaly_triage
 --     calls below follow their argument order/count exactly as defined
 --     in sql/install_agents.sql.
@@ -287,22 +289,25 @@ CALL fractal_search_agent(
     'Why is bot-deploy-01 looping on auth?',
     'vao_incident_logs', 'embedding',
     10, 5,   -- pop_size, iterations
+    NULL,    -- meta_filter: none (a flat JSON object such as '{"agent_id":"bot-deploy-01"}' would limit the rows searched)
     @r);
 SELECT JSON_VALUE(@r, '$.answer') AS answer,
-       JSON_EXTRACT(@r, '$.source_doc_ids') AS source_doc_ids,
+       JSON_EXTRACT(@r, '$.source_row_ids') AS source_row_ids,
        JSON_VALUE(@r, '$.execution_time_ms') AS execution_time_ms;
 
 -- === 9. RAG Agent: retrieve-then-reason over the incident corpus ===
 -- Thin wrapper around fractal_search_agent (Section 8): same embed ->
 -- scan -> Scout search -> content-refetch -> reason pipeline, fixed
--- pop_size=50/iterations=15, returning only the answer text.
--- p_meta_filter is accepted but currently unused (NULL).
+-- pop_size=50/iterations=15, returning {answer, source_row_ids,
+-- used_index, context_cut}. The meta_filter (NULL here) limits the rows
+-- searched.
 CALL fractal_rag_agent(
     'What events led to the auth retry loop on bot-deploy-01?',
     'vao_incident_logs', 'embedding',
     NULL,
     @vao_answer);
-SELECT @vao_answer AS answer;
+SELECT JSON_VALUE(@vao_answer, '$.answer') AS answer,
+       JSON_EXTRACT(@vao_answer, '$.source_row_ids') AS source_row_ids;
 
 -- Demo complete. Tables left in place for inspection. Clean up with:
 --   DROP TABLE vao_incident_logs, vao_agent_capabilities, vao_known_bad_states;

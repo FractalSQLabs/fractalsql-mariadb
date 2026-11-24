@@ -107,7 +107,7 @@
 #   01  build            compile the shim + fractalsqld via          ~5s
 #                        `make -C service`, scan, self-test
 #   02  smoke            install + fractal_version/_edition +      ~5s
-#                        fractal_search convergence
+#                        fractal_sfs_converge convergence
 #   03  schema_context   fractal_schema_context: real table/column/     ~1s
 #                        comment/FK introspection
 #   04  text_to_sql      fractal_text_to_sql GENERATE/ALLOWLIST/        ~2s
@@ -126,7 +126,7 @@
 #                        CTE-feeding-DELETE all rejected
 #   11  scout            fractal_search_explore: full population returned,   ~2s
 #                        disperses across the 3-cluster inline corpus
-#   12  soak             30x fractal_search in a row, no crash          ~3s
+#   12  soak             30x fractal_sfs_converge in a row, no crash          ~3s
 #   13  vectorizer_embed real INSERT -> trigger -> enqueue ->            ~2s
 #                        process_queue -> embed write-back round trip
 #                        (mock embeddings endpoint), plus a
@@ -146,7 +146,7 @@
 #                        the failed row goes back to 'pending' with
 #                        attempts incremented, and the next
 #                        process_queue call retries it
-#   19  sfs_bounds       fractal_search's k bounds (1..1000000) and    ~1s
+#   19  sfs_bounds       fractal_sfs_converge's k bounds (1..1000000) and    ~1s
 #                        MAX_QUERY_BYTES (4 MiB) rejection
 #   20  analytics        fractal_dimension_dfa/_boxcount/_drift,         ~2s
 #                        fractal_optimize_portfolio, real results
@@ -221,7 +221,7 @@
 #                        (dead port -> no reply, mock -> the canned
 #                        reply, key removed -> env fallback)
 #   39  mcp_smoke       the full MCP session against the scratch        ~10s
-#                        cluster: initialize, the 93-tool catalog,
+#                        cluster: initialize, the 115-tool catalog,
 #                        per-tier tools/call round trips (happy paths
 #                        and clean error paths), $/cancel with KILL
 #                        QUERY, resources+prompts, and the S-FT-004
@@ -303,6 +303,28 @@
 #                        each, refused invalid values leave the running
 #                        settings alone, and fractal_t2s_config() shows
 #                        what the daemon is using
+#   83  ledger_payloads  what fractal_audit_log writes into the decision-audit
+#                        chain for every shape of entry type and payload
+#                        (tests/mdb_ledger_payloads.py): an object payload
+#                        takes the actor inside it, a scalar or an array is
+#                        wrapped as a value, the entry type is escaped, a
+#                        payload that is not JSON is refused cleanly, and
+#                        the chain still verifies
+#   84  id_emission      how the agents write a row's id into their JSON
+#                        result (tests/mdb_id_emission.py): the id column
+#                        is the caller's data, so the id comes back byte
+#                        for byte -- quotes, backslashes, control
+#                        characters, unicode, an empty id, a 400-digit id
+#   85  oom_sweep        every kit statement re-run with an allocation
+#                        failure injected inside the daemon
+#                        (tests/mdb_oom_sweep.py): the daemon must still
+#                        answer or refuse, and must not crash or hang
+#   86  kit_mutation     every kit statement re-run with one literal
+#                        swapped for an awkward value and with its
+#                        argument list changed (tests/mdb_kit_mutation.py):
+#                        NULL, an empty string, a huge number, a malformed
+#                        JSON fragment, an argument dropped, an extra
+#                        argument; the daemon may not crash
 #   60  scripted_replies  tests/scripted_reasoning_plugin.c returns
 #                        scripted replies (normal, empty, an error code, no
 #                        summary at all, past the 16 MiB limit): fractal_
@@ -447,6 +469,8 @@
 
 set -uo pipefail
 # Test fixtures ship an unsigned mock enterprise core; the product default (signature required) is exercised explicitly in gate 28.
+# The destructive ledger operations are off unless the server's environment enables them; the gates exercise them.
+export FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE="${FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE:-1}"
 export FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE="${FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE:-0}"
 # Test fixtures load unsigned mock reasoning plugins; the product default (a valid signature required) is bypassed explicitly here.
 export FSQL_REASONING_REQUIRE_SIGNATURE="${FSQL_REASONING_REQUIRE_SIGNATURE:-0}"
@@ -470,7 +494,7 @@ cd "$HERE"
 
 TMPROOT="$(cd /tmp && pwd -P)"
 
-DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 29 31 32 33 34 35 36 39 40 41 42 43 44 45 47 48 49 50 51 52 53 54 55 56 58 59 60 61 62 63 66 68 69 70 71 72 73 74 75 76)
+DEFAULT_GATES=(01 02 03 04 05 06 07 08 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 29 31 32 33 34 35 36 39 40 41 42 43 44 45 47 48 49 50 51 52 53 54 55 56 58 59 60 61 62 63 66 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87)
 QUICK_GATES=(01 02)
 FUZZ_GATES=(30 67)
 FAULT_GATES=(37 38 57 64 65)
@@ -824,6 +848,19 @@ fsql_ent_so_path() {
   echo "$HERE/include/$(fsql_ent_platform_dir)/libfractalsql-enterprise-sovereign-c.$(fsql_ent_so_ext)"
 }
 
+# The enterprise core the enterprise gates run against: the REAL library when it exists (FSQL_ENT_SO, or include/), otherwise the mock core
+# (tests/mock_enterprise_core.c, built here). Sets ENT_SO and ENT_KIND (real | mock); returns 1 when neither is available. The mock answers
+# the same entry points but not the real ledger's content or signature, so the checks that need the real core test ENT_KIND.
+ENT_SO=""; ENT_KIND="mock"
+fsql_ent_resolve() {
+  local real; real="$(fsql_ent_so_path)"
+  if [ -f "$real" ]; then ENT_SO="$real"; ENT_KIND="real"; return 0; fi
+  ENT_KIND="mock"
+  ENT_SO="${TMPDIR:-/tmp}/fractalsql_bt_mdb_mock_enterprise_$$.so"
+  [ -f "$ENT_SO" ] && return 0
+  cc -shared -fPIC -std=c99 -I"$HERE/include/$(fsql_ent_platform_dir)" -I"$HERE/include" tests/mock_enterprise_core.c -o "$ENT_SO" 2>/dev/null
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --quick)   MODE="quick" ;;
@@ -1058,6 +1095,29 @@ daemon_stop() {
   return 0
 }
 
+# Waits until nothing is listening on the given TCP port any more.
+# A server that has been asked to shut down keeps its listening socket
+# until the shutdown has actually finished, so a replacement started
+# too early fails to bind and never comes up -- which surfaced as
+# "the server did not start" and "plugin swap did not take effect" on
+# a loaded host (the swap gates restart the cluster, and the old
+# mariadbd was still closing when the new one started). 60s is far
+# longer than any local shutdown takes.
+wait_port_free() {
+  local port="$1" w
+  for w in $(seq 1 60); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 0
+    # Close the probe's fd 3 and nothing else: `exec` applies its
+    # redirections to the CURRENT shell, so a `2>/dev/null` here would
+    # silence this script's own stderr for the rest of the run -- and with
+    # it every diagnostic the gates print on failure.
+    exec 3>&-
+    sleep 0.5
+  done
+  echo "wait_port_free: port $port is still in use" >&2
+  return 1
+}
+
 # mdb_setup <major>: builds a scratch plugin-dir containing
 # fractalsql.so + the evil-crash UDF .so, initializes a throwaway
 # datadir, and starts mariadbd against it (via mysqld_safe if
@@ -1102,6 +1162,15 @@ mdb_setup() {
   PIDFILE="/tmp/fractalsql_bt_pid_${v//./_}.pid"
   CNF="$TMPROOT/fractalsql_bt_cnf_${v//./_}.cnf"
   PORT=$(( 13300 + $(echo "$v" | tr -d '.') % 100 ))
+  # The DB-backed gate drivers (tests/test_precision.py, tests/test_index.py,
+  # tests/_t2s_common.py) reach the server over TCP through the MariaDB
+  # Connector/Python, whose defaults are 127.0.0.1:3306 -- not this
+  # cluster's port. Without these the drivers print SKIP and the gates
+  # record a skip, which is a pass in the log but proves nothing.
+  export FRACTALSQL_HOST=127.0.0.1
+  export FRACTALSQL_PORT="$PORT"
+  export FRACTALSQL_USER=root
+  export FRACTALSQL_DB=fractalsql_bt
   rm -rf "$DATADIR" "$(dirname "$SOCK")" "$PLUGDIR"
   mkdir -p "$DATADIR" "$(dirname "$SOCK")" "$PLUGDIR"
   # Config isolation: hand every server process below a minimal
@@ -1140,6 +1209,12 @@ mdb_setup() {
   install -m 0755 "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so" "$PLUGDIR/fractalsql-reasoning-http.so" || return 2
   install -m 0644 "$HERE/include/$fsql_platform/fractalsql-reasoning-http.so.sig" "$PLUGDIR/fractalsql-reasoning-http.so.sig" || return 2
   local mock_port=$(( 18300 + $(echo "$v" | tr -d '.') % 100 ))
+  # The previous mock is killed by mdb_teardown, but a killed process
+  # releases its listening socket only once it has actually exited. A
+  # replacement started in that window dies with "Address already in
+  # use" -- and then the reasoning gates have no mock to talk to.
+  # Waiting for the port to be free first makes the swap deterministic.
+  wait_port_free "$mock_port"
   python3 "$HERE/scripts/ci/mock_llm.py" "$mock_port" \
     >/tmp/fractalsql_bt_mockllm_${v//./_}.log 2>&1 &
   MOCK_LLM_PID=$!
@@ -1149,10 +1224,22 @@ mdb_setup() {
   # bash's own /proc/net/tcp-backed /dev/tcp pseudo-device needs nothing
   # extra).
   local mi
-  for mi in $(seq 1 20); do
+  for mi in $(seq 1 100); do
     (exec 3<>"/dev/tcp/127.0.0.1/$mock_port") 2>/dev/null && { exec 3>&-; break; }
     sleep 0.2
   done
+  # The mock has to be listening: without it every HTTP-backed gate
+  # (04, 13, 15, 17, 18, 23) silently degrades to a NULL reply, which
+  # reads as a product bug rather than a missing fixture.
+  (exec 3<>"/dev/tcp/127.0.0.1/$mock_port") 2>/dev/null || {
+    echo "mock_llm.py did not listen on port $mock_port" >&2
+    tail -20 /tmp/fractalsql_bt_mockllm_${v//./_}.log >&2
+    return 2
+  }
+  # Close the probe's fd 3 and nothing else (see wait_port_free: `exec`
+  # applies its redirections to the current shell, so a `2>/dev/null` here
+  # would silence this script's own stderr for the rest of the run).
+  exec 3>&-
   # ${VAR:-default}, not a plain export: gates 05/07/14/15/18 need
   # FRACTALSQL_REASONING_PLUGIN pointed at a reasoning-VFS-ABI-level
   # fixture (evil/retry, no HTTP involved at all) INSTEAD of the real
@@ -1331,7 +1418,12 @@ mdb_setup() {
   fi
 
   local i
-  for i in $(seq 1 $(( 30 * TIMEOUT_MULT ))); do
+  # 120 polls at 0.5s = 60s for the server to accept connections. The
+  # old budget (15s) was too tight on a loaded host: the replacement
+  # mariadbd started against a freshly installed datadir while the
+  # previous one was still closing, and the whole setup then failed
+  # with "the server did not start".
+  for i in $(seq 1 $(( 120 * TIMEOUT_MULT ))); do
     "$client_bin" --socket="$SOCK" -uroot -e "SELECT 1;" >/dev/null 2>&1 && break
     sleep 0.5
   done
@@ -1348,8 +1440,13 @@ mdb_setup() {
     >/tmp/fractalsql_bt_setup_${v//./_}.log 2>&1 \
     || { cat /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
 
-  MARIADB=("$client_bin" --socket="$SOCK" -uroot -D fractalsql_bt)
-  ADMIN=("$admin_bin" --socket="$SOCK" -uroot)
+  # --connect-timeout bounds the CONNECTION (the socket connect and the server's
+  # greeting), not the query. Without it a server that has died but left its
+  # socket file behind -- the supervisor restarting it after a crash, say --
+  # turns the client's greeting wait into an unbounded hang, and the sweep
+  # stops with no report at all. 30s is far longer than any local handshake.
+  MARIADB=("$client_bin" --socket="$SOCK" --connect-timeout=30 -uroot -D fractalsql_bt)
+  ADMIN=("$admin_bin" --socket="$SOCK" --connect-timeout=30 -uroot)
 
   "${MARIADB[@]}" < sql/install_udf.sql >/tmp/fractalsql_bt_setup_${v//./_}.log 2>&1 \
     || { cat /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
@@ -1367,6 +1464,28 @@ mdb_teardown() {
   [ -n "${ADMIN:-}" ] && "${ADMIN[@]}" shutdown >/dev/null 2>&1
   sleep 1
   [ -n "$DATADIR" ] && pkill -f "mariadbd.*$DATADIR" >/dev/null 2>&1 || true
+  # Wait for the old server to be really gone before the caller starts a
+  # replacement: a mariadbd that is still shutting down keeps both its
+  # listening socket and its unix socket, and the replacement would fail
+  # to bind. The pkill above is asynchronous, so this wait is what makes
+  # a restart deterministic. The bracket in the pattern keeps the grep
+  # from matching its own command line (which carries the same pattern) --
+  # a self-match would make this loop run out its whole budget every time.
+  #
+  # The pattern matches on --datadir=, not on the datadir path alone: the
+  # server's own command line is "mariadbd --defaults-file=... --datadir=
+  # /tmp/...", so a pattern that expects the path straight after the
+  # binary name matches NOTHING -- the loop broke on its first pass and
+  # this wait was a no-op. An old mariadbd that outlived the swap could
+  # then land a reasoning call on the NEW daemon (same socket path) and
+  # advance the adversarial plugin's call counter, which is what made
+  # gate 07's lying-length fixture stop lying under load.
+  local tw
+  for tw in $(seq 1 60); do
+    ps ax 2>/dev/null | grep -q "[m]ariadbd.*--datadir=$DATADIR" || break
+    sleep 0.5
+  done
+  [ -n "$PORT" ] && wait_port_free "$PORT"
   [ -n "$MOCK_LLM_PID" ] && kill "$MOCK_LLM_PID" >/dev/null 2>&1
   # Preserve mariadbd's own stderr log before the wipe: mysqld_safe/
   # mariadbd-safe route mariadbd's stderr into the datadir <hostname>.err,
@@ -1461,7 +1580,7 @@ mdb_restart_inplace_reasoning_plugin() {
   # the pid file it leaves behind.
   local w
   for w in $(seq 1 120); do
-    ps ax 2>/dev/null | grep -q "mariadbd [.]*$DATADIR" || break
+    ps ax 2>/dev/null | grep -q "[m]ariadbd.*--datadir=$DATADIR" || break
     sleep 0.5
   done
   rm -f "$PIDFILE"
@@ -1489,7 +1608,10 @@ mdb_restart_inplace_reasoning_plugin() {
   fi
 
   local i
-  for i in $(seq 1 $(( 30 * TIMEOUT_MULT ))); do
+  # 120 polls at 0.5s = 60s, like every other server wait in this file: a
+  # respawned mariadbd initialises InnoDB before it accepts connections
+  # again, and that took 10.4s once on a loaded host.
+  for i in $(seq 1 $(( 120 * TIMEOUT_MULT ))); do
     "${MARIADB[@]}" -e "SELECT 1;" >/dev/null 2>&1 && return 0
     sleep 0.5
   done
@@ -1573,26 +1695,26 @@ gate_01_build() {
 }
 
 gate_02_smoke() {
-  local want_ver; want_ver="$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' src/fractalsql.c | head -1)"
+  local want_ver; want_ver="$(tr -d '\r' < src/fractalsql.c | sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' | head -1)"   # tr: a CRLF checkout must not defeat the anchor
   local ver; ver=$("${MARIADB[@]}" -N -e "SELECT fractal_version();" 2>&1)
   [ "$ver" = "$want_ver" ] && pass "02 smoke: version=$ver" || fail "02 smoke: version='$ver' (want $want_ver)"
 
   local ed; ed=$("${MARIADB[@]}" -N -e "SELECT fractal_edition();" 2>&1)
   [ -n "$ed" ] && ! grep <<< "$ed" -q "ERROR" && pass "02 smoke: edition=$ed" || fail "02 smoke: edition='$ed'"
 
-  # fractal_search(vector_csv, query_csv, k, params) -> JSON string.
+  # fractal_sfs_converge(vector_csv, query_csv, k, params) -> JSON string.
   # Convergence check: cosine similarity of
   # best_point to the query should be ~1 (best_point lies on the ray
   # through the origin and the query for a cosine-distance objective).
   local r; r=$("${MARIADB[@]}" -N -e "
-    SELECT fractal_search(
+    SELECT fractal_sfs_converge(
       '[[1,0],[0,1],[0.6,0.8]]', '[0.6,0.8]', 3,
       '{\"iterations\":50,\"population_size\":30}'
     );" 2>&1)
   if echo "$r" | grep -q '"best_point"'; then
-    pass "02 smoke: fractal_search returns best_point"
+    pass "02 smoke: fractal_sfs_converge returns best_point"
   else
-    fail "02 smoke: fractal_search='$r'"
+    fail "02 smoke: fractal_sfs_converge='$r'"
   fi
 
   # A UDF error message is NEVER empty.
@@ -1656,7 +1778,11 @@ gate_06_crash_recovery() {
     fail "06 crash_recovery: expected the connection to drop, got: $r"
   fi
 
-  local up=0 i tries=$(( 30 * TIMEOUT_MULT ))
+  # 120 polls at 0.5s = 60s: a respawned mariadbd initialises InnoDB before it
+  # accepts connections again, and that took 10.4s once on a loaded host --
+  # past the old 15s budget's reach on a bad day, which turned into
+  # "mariadbd did not come back" for a server that was on its way back.
+  local up=0 i tries=$(( 120 * TIMEOUT_MULT ))
   for i in $(seq 1 "$tries"); do
     "${MARIADB[@]}" -e "SELECT 1;" >/dev/null 2>&1 && { up=1; break; }
     sleep 0.5
@@ -1718,20 +1844,20 @@ gate_11_scout() {
   fi
 }
 
-# fractal_search's k bounds (1..1000000, checked at UDF init time) and
+# fractal_sfs_converge's k bounds (1..1000000, checked at UDF init time) and
 # MAX_QUERY_BYTES (4 MiB) rejection -- a bounds-check gate, scoped to
-# what fractal_search
+# what fractal_sfs_converge
 # actually validates today (see the bounds check in
-# fractal_search()/fractal_search_explore() in src/fractalsql.c).
+# fractal_sfs_converge()/fractal_search_explore() in src/fractalsql.c).
 gate_19_sfs_bounds() {
   local r; r=$("${MARIADB[@]}" -N -e "
-    SELECT fractal_search('[[1,0]]', '[1,0]', 0, '{}');" 2>&1)
+    SELECT fractal_sfs_converge('[[1,0]]', '[1,0]', 0, '{}');" 2>&1)
   echo "$r" | grep -qiE "k must be 1\.\.1000000|error" \
     && pass "19 sfs_bounds: k=0 rejected" \
     || fail "19 sfs_bounds: expected k=0 rejection, got: $r"
 
   local r2; r2=$("${MARIADB[@]}" -N -e "
-    SELECT fractal_search('[[1,0]]', '[1,0]', 2000000, '{}');" 2>&1)
+    SELECT fractal_sfs_converge('[[1,0]]', '[1,0]', 2000000, '{}');" 2>&1)
   echo "$r2" | grep -qiE "k must be 1\.\.1000000|error" \
     && pass "19 sfs_bounds: k=2000000 rejected" \
     || fail "19 sfs_bounds: expected k=2000000 rejection, got: $r2"
@@ -1745,8 +1871,8 @@ gate_19_sfs_bounds() {
   # limit ("Argument list too long") before mariadb even starts --
   # confirmed directly (this is what -e originally did here). Piping
   # avoids argv entirely; the byte count still reaches
-  # fractal_search's args->lengths[1] check the same way.
-  local r3; r3=$(printf "SELECT fractal_search('[[1,0]]', '%s', 1, '{}');" "$big" \
+  # fractal_sfs_converge's args->lengths[1] check the same way.
+  local r3; r3=$(printf "SELECT fractal_sfs_converge('[[1,0]]', '%s', 1, '{}');" "$big" \
                  | "${MARIADB[@]}" -N 2>&1)
   echo "$r3" | grep -qiE "error|NULL" \
     && pass "19 sfs_bounds: oversized query (>4MiB) rejected" \
@@ -1756,9 +1882,9 @@ gate_19_sfs_bounds() {
   # (2^32 plus a valid value) must be refused, not run as the smaller value;
   # a refused call answers NULL. Each row is "label|call with {N}|valid value".
   local wrap_rows=(
-    "search_debug iterations|SELECT fractal_search_debug('[1,2,3]', {N}, 10, 2, 42);|20"
-    "search_debug population|SELECT fractal_search_debug('[1,2,3]', 20, {N}, 2, 42);|10"
-    "search_debug diffusion|SELECT fractal_search_debug('[1,2,3]', 20, 10, {N}, 42);|2"
+    "search_debug iterations|SELECT fractal_sfs_converge_debug('[1,2,3]', {N}, 10, 2, 42);|20"
+    "search_debug population|SELECT fractal_sfs_converge_debug('[1,2,3]', 20, {N}, 2, 42);|10"
+    "search_debug diffusion|SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, {N}, 42);|2"
     "state_fingerprint n_bits|SELECT fractal_state_fingerprint('1,2,3', {N}, 42);|64"
   )
   local wrap_row wrap_label wrap_sql wrap_base wrap_val wrap_out wrap_bad=()
@@ -1777,7 +1903,7 @@ gate_19_sfs_bounds() {
   else
     fail "19 sfs_bounds: integer arguments past int range: ${wrap_bad[*]}"
   fi
-  local rk; rk=$("${MARIADB[@]}" -N -e "SELECT fractal_search('[[1,0]]', '[1,0]', 4294967297, '{}');" 2>&1)
+  local rk; rk=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge('[[1,0]]', '[1,0]', 4294967297, '{}');" 2>&1)
   echo "$rk" | grep -qiE "k must be 1\.\.1000000|error" \
     && pass "19 sfs_bounds: k=4294967297 (wraps to 1) rejected" \
     || fail "19 sfs_bounds: k that wraps to 1 was accepted: $rk"
@@ -1793,7 +1919,7 @@ gate_19_sfs_bounds() {
   # The other bounded costs. Values are built in SQL so no argument is large;
   # a refused call answers NULL.
   local rbig
-  rbig=$("${MARIADB[@]}" -N -e "SELECT fractal_search_debug(CONCAT('[', REPEAT('0.5,', 999), '0.5]'), 1000, 1000, 8, 42);" 2>&1)
+  rbig=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge_debug(CONCAT('[', REPEAT('0.5,', 999), '0.5]'), 1000, 1000, 8, 42);" 2>&1)
   [ "$rbig" = "NULL" ] \
     && pass "19 sfs_bounds: search_debug refuses iterations x population x diffusion x dim past the work bound" \
     || fail "19 sfs_bounds: search_debug accepted a search past the work bound: ${rbig:0:60}"
@@ -2566,16 +2692,16 @@ gate_10_dos_and_injection() {
     || fail "10 dos_and_injection: expected 'no visible tables found', got: $r_empty"
 }
 
-# 30x fractal_search in a row. No crash, no leak-driven slowdown.
+# 30x fractal_sfs_converge in a row. No crash, no leak-driven slowdown.
 # Same soak idea (repeated
 # calls hold up), scoped to what's cheap to run in CI (no LLM).
 gate_12_soak() {
   local i ok=1
   for i in $(seq 1 30); do
-    "${MARIADB[@]}" -N -e "SELECT fractal_search('[[1,0,0],[0,1,0],[0,0,1]]', '[0.6,0.8,0]', 2, '{}');" \
+    "${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge('[[1,0,0],[0,1,0],[0,0,1]]', '[0.6,0.8,0]', 2, '{}');" \
       2>/tmp/fractalsql_bt_soak.log | grep -q '"best_point"' || { ok=0; break; }
   done
-  [ "$ok" -eq 1 ] && pass "12 soak: 30x fractal_search all returned a valid result" \
+  [ "$ok" -eq 1 ] && pass "12 soak: 30x fractal_sfs_converge all returned a valid result" \
                    || fail "12 soak: a soak iteration failed: $(cat /tmp/fractalsql_bt_soak.log)"
 }
 
@@ -3075,7 +3201,9 @@ gate_18_embed_crash() {
 
   "${MARIADB[@]}" -N -e "CALL fractal_vectorizer_process_queue(10, 600);" >/tmp/fractalsql_bt_gate18.log 2>&1
 
-  local up=0 i tries=$(( 30 * TIMEOUT_MULT )) within_budget=0
+  # The same 60s budget as gate 06: a respawned mariadbd initialises InnoDB
+  # before it accepts connections again.
+  local up=0 i tries=$(( 120 * TIMEOUT_MULT )) within_budget=0
   for i in $(seq 1 $(( tries * 2 ))); do
     "${MARIADB[@]}" -N -e "SELECT 1;" >/dev/null 2>&1 && { up=1; [ "$i" -le "$tries" ] && within_budget=1; break; }
     sleep 0.5
@@ -3829,6 +3957,10 @@ print(','.join('%.6f' % (0.5*math.sin(2*math.pi*i/8)) for i in range(64)))
   echo "$pg" | grep -q '"freqs"' \
     && pass "32 new_primitives: periodogram returned peaks" \
     || fail "32 new_primitives: periodogram='$pg'"
+  local pg_shape; pg_shape=$("${MARIADB[@]}" -N -e "SELECT CONCAT(JSON_LENGTH(JSON_KEYS('$pg')), '|', JSON_CONTAINS_PATH('$pg', 'all', '\$.freqs', '\$.power'), '|', JSON_LENGTH('$pg', '\$.freqs') = JSON_LENGTH('$pg', '\$.power'));" 2>&1)
+  [ "$pg_shape" = "2|1|1" ] \
+    && pass "32 new_primitives: periodogram document has exactly the keys freqs and power, of equal length" \
+    || fail "32 new_primitives: periodogram document shape: $pg_shape"
 
   local pg_top; pg_top=$("${MARIADB[@]}" -N -e "SELECT JSON_EXTRACT('$pg', '\$.freqs[0]');" 2>&1)
   if awk "BEGIN{exit !($pg_top > 0.124 && $pg_top < 0.126)}" 2>/dev/null; then
@@ -4331,7 +4463,7 @@ print(','.join(f'{random.uniform(0, 10):.6f}' for _ in range(2000 * 2)))
 # tests/oom_preload.c's FSQL_OOM_FAIL_AT over 1..max_n for each of 7
 # UDFs spanning every layer reachable without extra per-trial setup --
 # fractalsql_vector.c (fractal_vector_scale), the vendored core's main
-# search engine (fractal_search), fractalsql.c's two CSV parsers
+# search engine (fractal_sfs_converge), fractalsql.c's two CSV parsers
 # (fractal_morphological_complexity for parse_vector_csv,
 # fractal_search_explore for parse_corpus), fractalsql_cognition.c's
 # dispatch path (fractal_reason), fractalsql_textsql.c's allowlist
@@ -4396,7 +4528,7 @@ gate_37_oom_injection() {
   local names=(vector_scale search morphological_complexity search_explore reason allowlist diversify_enable)
   local sqls=(
     "SELECT fractal_vector_scale('[1,2,3]', 2);"
-    "SELECT fractal_search('[[1,0],[0,1],[0.6,0.8]]', '[0.6,0.8]', 3, '{\"iterations\":20,\"population_size\":10}');"
+    "SELECT fractal_sfs_converge('[[1,0],[0,1],[0.6,0.8]]', '[0.6,0.8]', 3, '{\"iterations\":20,\"population_size\":10}');"
     "SELECT fractal_morphological_complexity('0.1,0.2,0.4,0.9,0.8,0.1,0.3,0.7,0.6,0.6,0.2,0.8,0.9,0.3,0.5,0.5,0.7,0.2,0.1,0.9', 2);"
     "SELECT fractal_search_explore('[[0.1,0.1],[0.9,0.9],[0.2,0.8]]', '[0.5,0.5]', '{\"population_size\":10,\"iterations\":5,\"walk\":0}');"
     "SELECT fractal_reason(CONNECTION_ID(), 'ping');"
@@ -4556,11 +4688,8 @@ gate_25_enterprise() {
 # verify, and by load's O(1) tip check when the tamper is in the
 # latest record).
 gate_26_enterprise_active() {
-  local ent_so; ent_so="$(fsql_ent_so_path)"
-  if [ ! -f "$ent_so" ]; then
-    skip "26 enterprise_active: no enterprise library found (include/)"
-    return
-  fi
+  fsql_ent_resolve || { fail "26 enterprise_active: no enterprise library (the mock core did not build)"; return; }
+  local ent_so="$ENT_SO"
 
   local ledger_path="$HERE/.gate26_ledger.dat"
   rm -f "$ledger_path"
@@ -4588,6 +4717,7 @@ gate_26_enterprise_active() {
 
   "${MARIADB[@]}" -e "SELECT fractal_feedback_report(CONNECTION_ID(), 1, 'positive', 500);" >/dev/null 2>&1
   local fl; fl=$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_flush(CONNECTION_ID());" 2>&1)
+  if [ "$ENT_KIND" = real ]; then
   [ "$fl" = "0" ] && [ -s "$ledger_path" ] \
                    && pass "26 enterprise_active: flush genuinely persists to a real ledger file" \
                    || fail "26 enterprise_active: expected flush=0 and a non-empty $ledger_path, got flush=$fl, file: $(ls -la "$ledger_path" 2>&1)"
@@ -4595,6 +4725,14 @@ gate_26_enterprise_active() {
   local v1; v1=$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_verify(CONNECTION_ID());" 2>&1)
   [ "$v1" = '{"ok":true,"rows_verified":1}' ] && pass "26 enterprise_active: fractal_ledger_verify confirms the 1-row chain" \
                                                || fail "26 enterprise_active: expected 1-row ok verify, got: $v1"
+  else
+  # the mock core writes nothing through the storage VFS: the file, the row count and the tamper checks need the real core
+  [ "$fl" = "0" ] && pass "26 enterprise_active: flush answers through the mock core (the real core persists a ledger file)" \
+                   || fail "26 enterprise_active: expected flush=0 with the mock core, got: $fl"
+  local v1; v1=$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_verify(CONNECTION_ID());" 2>&1)
+  [[ "$v1" == '{"ok":true,'* ]] && pass "26 enterprise_active: fractal_ledger_verify reports a valid chain (mock core)" \
+                                 || fail "26 enterprise_active: expected an ok verify with the mock core, got: $v1"
+  fi
 
   # Cross-PROCESS rehydration: restart mariadbd (in-memory ledgers reset
   # to empty by construction), then load must pull the persisted blob
@@ -4606,7 +4744,8 @@ gate_26_enterprise_active() {
                    || fail "26 enterprise_active: expected load=0 after restart, got: $ld"
 
   # Tamper the latest record: both verify and load's O(1) tip check must
-  # catch it (a shallow tamper, in scope for the tip check).
+  # catch it (a shallow tamper, in scope for the tip check). Real core only: the mock writes no ledger file.
+  if [ "$ENT_KIND" = real ]; then
   python3 -c "
 import sys
 p = sys.argv[1]
@@ -4624,6 +4763,7 @@ with open(p, 'r+b') as f:
   local ld2; ld2=$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_load(CONNECTION_ID());" 2>&1)
   [ "$ld2" = "NULL" ] && pass "26 enterprise_active: load refuses a tampered latest record (O(1) tip check)" \
                        || fail "26 enterprise_active: expected NULL (refused) loading a tampered ledger, got: $ld2"
+  fi
 
   unset FRACTALSQL_ENTERPRISE_LIB FRACTALSQL_ENTERPRISE_LEDGER_PATH
   rm -f "$ledger_path"
@@ -4644,11 +4784,8 @@ with open(p, 'r+b') as f:
 # fractal_audit_unpack(FROM_BASE64(blob_b64)) decodes a real persisted
 # QTL blob straight from SQL with no export UDF needed.
 gate_27_enterprise_connect() {
-  local ent_so; ent_so="$(fsql_ent_so_path)"
-  if [ ! -f "$ent_so" ]; then
-    skip "27 enterprise_connect: no enterprise library found (include/)"
-    return
-  fi
+  fsql_ent_resolve || { fail "27 enterprise_connect: no enterprise library (the mock core did not build)"; return; }
+  local ent_so="$ENT_SO"
 
   # MariaDB's own plugin-naming convention keeps the .so extension even
   # on macOS (unlike general Mach-O shared libraries' usual .dylib) --
@@ -4721,19 +4858,24 @@ $(cat "$HERE/sql/install_enterprise_connect.sql")"
                 || fail "27 enterprise_connect: CREATE TABLE failed: $cr"
 
   local kc; kc=$("${MARIADB[@]}" -N -e "SELECT COUNT(*) FROM fractalsql_ledger WHERE kind=1;" 2>&1)
+  # the mock core flushes no QTL row: the kind=1 row and its decoded entry need the real core
+  if [ "$ENT_KIND" = real ]; then
   [ "$kc" = "1" ] && pass "27 enterprise_connect: SELECT ... WHERE kind=1 sees the flushed QTL row" \
                    || fail "27 enterprise_connect: expected 1 kind=1 row, got: $kc"
+  fi
 
   local ac; ac=$("${MARIADB[@]}" -N -e "SELECT COUNT(*) FROM fractalsql_ledger WHERE kind=2;" 2>&1)
   [ "$ac" = "1" ] && pass "27 enterprise_connect: SELECT ... WHERE kind=2 sees the fractal_audit_log row" \
                    || fail "27 enterprise_connect: expected 1 kind=2 row, got: $ac"
 
+  if [ "$ENT_KIND" = real ]; then
   local unpacked; unpacked=$("${MARIADB[@]}" -N -e \
     "SELECT fractal_audit_unpack(FROM_BASE64(blob_b64)) FROM fractalsql_ledger WHERE kind=1 ORDER BY id DESC LIMIT 1;" 2>&1)
   case "$unpacked" in
     *'"doc_id":1'*'"signal":"truth"'*) pass "27 enterprise_connect: fractal_audit_unpack(FROM_BASE64(...)) decodes the real flushed entry from SQL" ;;
     *) fail "27 enterprise_connect: expected a decoded truth entry for doc_id=1, got: $unpacked" ;;
   esac
+  fi
 
   local wr; wr=$("${MARIADB[@]}" -e "INSERT INTO fractalsql_ledger (id,kind) VALUES (99,1);" 2>&1)
   case "$wr" in
@@ -4761,20 +4903,18 @@ $(cat "$HERE/sql/install_enterprise_connect.sql")"
 # FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE is set; a missing .sig with
 # that unset still loads (backward-compatible default).
 gate_28_enterprise_signature() {
-  local ent_so; ent_so="$(fsql_ent_so_path)"
+  fsql_ent_resolve || { fail "28 enterprise_signature: no enterprise library (the mock core did not build)"; return; }
+  local ent_so="$ENT_SO"
   local ent_sig="$ent_so.sig"
-  if [ ! -f "$ent_so" ]; then
-    skip "28 enterprise_signature: no enterprise library found (include/)"
-    return
-  fi
-  if [ ! -f "$ent_sig" ]; then
-    skip "28 enterprise_signature: no signature file staged"
-    return
-  fi
+  # Phase 1 (a real, validly signed library loads) needs the real library with its .sig; phases 2-4 (a corrupt .sig, a missing .sig with and
+  # without REQUIRE_SIGNATURE) work with any library file, so they run against the mock core when the real one is not available.
+  local real_signed=0
+  [ "$ENT_KIND" = real ] && [ -f "$ent_sig" ] && real_signed=1
 
   # Phase 1: the REAL signature -- proves the embedded pubkey actually
   # matches FractalSQLabs's real signing key, not just that the
   # verification code runs without crashing.
+  if [ "$real_signed" -eq 1 ]; then
   mdb_teardown
   export FRACTALSQL_ENTERPRISE_LIB="$ent_so"
   mdb_setup "$MDB_MAJOR" >/dev/null 2>&1
@@ -4788,6 +4928,7 @@ gate_28_enterprise_signature() {
   local r1; r1=$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_truth_count(CONNECTION_ID());" 2>&1)
   [ "$r1" = "0" ] && pass "28 enterprise_signature: a real, validly-signed .so loads (embedded pubkey matches FractalSQLabs's real key)" \
                    || fail "28 enterprise_signature: expected 0 with the real .sig present, got: $r1"
+  fi
 
   # Phase 2: corrupt .sig (64 random bytes, right length, wrong content)
   # -- always fatal, regardless of FRACTALSQL_ENTERPRISE_REQUIRE_SIGNATURE.
@@ -5323,7 +5464,7 @@ open(p, 'w').write(s)
 # FRACTALSQL_HTTP_EMBED_URL points at, i.e. genuinely attacker-
 # controlled bytes if that endpoint is malicious or merely buggy. The
 # other two (parse_corpus, parse_index_csv) parse SQL-caller-supplied
-# text (fractal_search's corpus argument, the Analytics-tier edge/face
+# text (fractal_sfs_converge's corpus argument, the Analytics-tier edge/face
 # index arguments) -- lower external-adversary risk, included as
 # defense-in-depth for the same hand-rolled-strtod-scan class of bug.
 #
@@ -5470,7 +5611,7 @@ gate_39_mcp_smoke() {
   if [[ $rc -ne 0 ]]; then
     fail "39 mcp_smoke: client driver exited $rc (server log: $smoke_cwd/mcp_server.log)"
   else
-    pass "39 mcp_smoke: full MCP session (initialize, 93-tool catalog, discovery/cognition/agency round trips, enterprise clean-error path, \$ / cancel, resources+prompts, partial-reasoning S-FT-004 via the admin tools, shutdown drain)"
+    pass "39 mcp_smoke: full MCP session (initialize, 115-tool catalog, discovery/cognition/agency round trips, enterprise clean-error path, \$ / cancel, resources+prompts, partial-reasoning S-FT-004 via the admin tools, shutdown drain)"
   fi
 }
 
@@ -5963,6 +6104,11 @@ gate_44_concurrency_probe() {
 # assertion.
 # =====================================================================
 gate_45_domain_agents() {
+  # the settings table in the reasoning-setup guide names every configuration key this build defines
+  if command -v python3 >/dev/null 2>&1; then
+    local dcout; dcout="$(python3 -I "$HERE/tests/check_config_docs.py" "$HERE" 2>&1)" \
+      && pass "45 domain_agents: ${dcout#check_config_docs: }" || fail "45 domain_agents: ${dcout#check_config_docs: }"
+  else skip "45 domain_agents: the settings-table check needs python3"; fi
   local g45log="/tmp/fractalsql_bt_gate45.log"
 
   # g45_call <sql> : run one statement batch and return its STDOUT.
@@ -6171,7 +6317,7 @@ gate_45_domain_agents() {
     "CALL fractal_agent_feedback_audit(NULL,'emb','[0.5]','g45_fwarmup','vc',8,3,@r);"
 
   # --- Engine J: fractal_agent_schedule_workload --------------------
-  # fractal_search refinement + telemetry + reason. The assignment is
+  # fractal_sfs_converge refinement + telemetry + reason. The assignment is
   # the node table's own PRIMARY KEY (id 1, nearest to the refined
   # task vector), and the confidence is 1/(1+distance) -- a real
   # number in (0,1].
@@ -6375,27 +6521,43 @@ gate_45_domain_agents() {
   # 3-element vector, so the whole pipeline runs.
   local u1
   u1="$(g45_call "
-    CALL fractal_search_agent('alpha', 'g45_univ', 'emb', 20, 30, @r);
+    CALL fractal_search_agent('alpha', 'g45_univ', 'emb', 20, 30, NULL, @r);
     SELECT @r;")"
-  printf '%s' "$u1" | grep -Eq '"source_doc_ids" *: *\[[^]]*\]' \
-    && pass "45 domain_agents: search_agent resolves real source doc_ids from the corpus" \
-    || fail "45 domain_agents: search_agent source_doc_ids missing: $u1"
+  printf '%s' "$u1" | grep -Eq '"source_row_ids" *: *\[[^]]*\]' \
+    && pass "45 domain_agents: search_agent returns source_row_ids (the rows' primary keys, resolved from the corpus)" \
+    || fail "45 domain_agents: search_agent source_row_ids missing: $u1"
   printf '%s' "$u1" | grep -q 'SELECT 1' \
     && pass "45 domain_agents: search_agent answers through the reasoning tier" \
     || fail "45 domain_agents: search_agent answer missing the reasoning canary: $u1"
   g45_expect_err "search_agent rejects NULL arguments" \
     "query, table_name and vector_col must not be NULL" \
-    "CALL fractal_search_agent(NULL,'g45_univ','emb',20,30,@r);"
+    "CALL fractal_search_agent(NULL,'g45_univ','emb',20,30,NULL,@r);"
+
+  printf '%s' "$u1" | grep -Eq '"used_index" *: *(false|0)' && printf '%s' "$u1" | grep -Eq '"context_cut" *: *\{ *"cells" *: *0, *"rows" *: *0 *\}' \
+    && pass "45 domain_agents: search_agent reports used_index false (the Scout search) and an untouched context" \
+    || fail "45 domain_agents: search_agent used_index/context_cut missing: $u1"
 
   # fractal_rag_agent: the same pipeline behind a thinner surface --
-  # the OUT is the bare answer scalar, not a document.
+  # the OUT is {answer, source_row_ids, used_index, context_cut}. A meta_filter limits the rows searched.
   local u2
   u2="$(g45_call "
-    CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('x',1), @r);
+    CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('id',1), @r);
     SELECT @r;")"
   printf '%s' "$u2" | grep -q 'SELECT 1' \
-    && pass "45 domain_agents: rag_agent returns the reasoned answer as a bare scalar" \
+    && pass "45 domain_agents: rag_agent returns the reasoned answer" \
     || fail "45 domain_agents: rag_agent answer missing the reasoning canary: $u2"
+  printf '%s' "$u2" | grep -Eq '"source_row_ids" *: *\[ *1 *\]' \
+    && pass "45 domain_agents: rag_agent's meta_filter limits the search to the matching row" \
+    || fail "45 domain_agents: rag_agent meta_filter did not limit to row 1: $u2"
+  g45_expect_err "rag_agent refuses a meta_filter column the table does not have" \
+    "does not exist" \
+    "CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('nosuch',1), @r);"
+  g45_expect_err "rag_agent refuses a meta_filter that matches no row" \
+    "for that meta_filter" \
+    "CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_OBJECT('id',99), @r);"
+  g45_expect_err "rag_agent refuses a meta_filter that is not an object" \
+    "must be a JSON object" \
+    "CALL fractal_rag_agent('alpha', 'g45_univ', 'emb', JSON_ARRAY(1), @r);"
 
   # fractal_agent_plan_explore: each branch is a DISTINCT corpus row
   # with its OWN vector (the branch's plan_trajectory), not the query
@@ -6782,7 +6944,7 @@ gate_48_t2s_review_isolation() {
 # These three groups are the SQL half of the surface the MCP's admin
 # tools sit on: the overlay is what fractalsql_session_config_* reads
 # and writes, the canonical vector form is what the vector tools carry
-# between calls, and fractal_search_debug is the convergence view the
+# between calls, and fractal_sfs_converge_debug is the convergence view the
 # search tool exposes. The MCP's own half of that contract is proven
 # by gate 39; this gate proves the ENGINE's half, so a failure here
 # names the engine rather than the plugin.
@@ -6799,10 +6961,10 @@ gate_49_config_overlay() {
   # each key's type and whether a session may override it.
   keys=$("${MARIADB[@]}" -N -e "SELECT fractal_config_keys();" 2>&1)
   nkeys=$(echo "$keys" | grep -o '"name":' | wc -l | tr -d ' ')
-  if [ "$nkeys" = "18" ]; then
-    pass "49 config_overlay: keys() lists all 18 configuration keys"
+  if [ "$nkeys" = "21" ]; then
+    pass "49 config_overlay: keys() lists all 21 configuration keys"
   else
-    fail "49 config_overlay: keys() listed $nkeys keys (expected 18): $keys"
+    fail "49 config_overlay: keys() listed $nkeys keys (expected 21): $keys"
   fi
   if echo "$keys" | grep -q '"name":"think","type":"string","session_overridable":true'; then
     pass "49 config_overlay: keys() marks the tuning keys session-overridable"
@@ -7031,15 +7193,15 @@ gate_49_config_overlay() {
     fail "49 config_overlay: to_json('not a vector') answered '$bad' (expected NULL)"
   fi
 
-  # --- fractal_search_debug: the convergence view. A pinned seed makes
+  # --- fractal_sfs_converge_debug: the convergence view. A pinned seed makes
   # the trace byte-stable, which is the point of the seed argument.
-  local sd; sd=$("${MARIADB[@]}" -N -e "SELECT fractal_search_debug('[1,2,3]', 20, 10, 2, 42);" 2>&1)
+  local sd; sd=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, 2, 42);" 2>&1)
   if echo "$sd" | grep -q '"best_point"' && echo "$sd" | grep -q '"best_fit"' && echo "$sd" | grep -q '"trace"'; then
     pass "49 config_overlay: search_debug() returns the convergence view (best_point/best_fit/trace)"
   else
     fail "49 config_overlay: search_debug() did not return the convergence view: $sd"
   fi
-  local sd2; sd2=$("${MARIADB[@]}" -N -e "SELECT fractal_search_debug('[1,2,3]', 20, 10, 2, 42);" 2>&1)
+  local sd2; sd2=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, 2, 42);" 2>&1)
   if [ "$sd" = "$sd2" ]; then
     pass "49 config_overlay: search_debug() with a pinned seed is byte-stable"
   else
@@ -7048,13 +7210,13 @@ gate_49_config_overlay() {
   # The adapter refuses the same parameter range the CORE refuses, so
   # an out-of-range argument is turned away here rather than travelling
   # to the core to fail with a generic message.
-  bad=$("${MARIADB[@]}" -N -e "SELECT fractal_search_debug('[1,2,3]', 0);" 2>&1)
+  bad=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge_debug('[1,2,3]', 0);" 2>&1)
   if [ "$bad" = "NULL" ]; then
     pass "49 config_overlay: search_debug() refuses iterations=0"
   else
     fail "49 config_overlay: search_debug(iterations=0) answered '$bad' (expected NULL)"
   fi
-  bad=$("${MARIADB[@]}" -N -e "SELECT fractal_search_debug('[1,2,3]', 10, 20000);" 2>&1)
+  bad=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge_debug('[1,2,3]', 10, 20000);" 2>&1)
   if [ "$bad" = "NULL" ]; then
     pass "49 config_overlay: search_debug() refuses a population above the core's own cap"
   else
@@ -7620,6 +7782,13 @@ gate_55_ledger_forged() {
       [ "$got_load" = 0 ] && got_load=ok
       got_v1=$(rb_verdict "$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_verify(CONNECTION_ID(), 1);" 2>&1)")
       got_v2=$(rb_verdict "$("${MARIADB[@]}" -N -e "SELECT fractal_ledger_verify(CONNECTION_ID(), 2);" 2>&1)")
+      # An EMPTY verdict and "ok:0" mean the same thing: the ledger holds no record of that kind,
+      # and nothing is wrong with it. Which of the two the daemon answers depends on whether it has
+      # ever seen a record of that kind -- and that depends on what an EARLIER gate left in the
+      # daemon -- so the case table's "ok:0" would otherwise fail (or pass) on the order the gates
+      # happened to run in. Normalise the empty one to "ok:0".
+      [ -z "$got_v1" ] && got_v1="ok:0"
+      [ -z "$got_v2" ] && got_v2="ok:0"
       if [ "$got_load" = "$want_load" ] && [ "$got_v1" = "$want_v1" ] && [ "$got_v2" = "$want_v2" ]; then
         mode_ok=$((mode_ok + 1))
       else
@@ -8509,6 +8678,9 @@ gate_66_mcp_cli() {
   FSQLCTL_CONF="$FSQD_CONF" \
     "$mcp_py" -u "$HERE/mcp/tests/mcp_cli.py" 2>&1 | sed -u 's/^/    /'
   local rc=${PIPESTATUS[0]}
+  # the HTTP transport's origin check and repeated headers; needs no engine
+  MCP_SERVER_EXE="$mcp_exe" "$mcp_py" -u "$HERE/mcp/tests/mcp_audit_http.py" 2>&1 | sed -u 's/^/    /'
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || rc=1
   mcp_san_check "$san_dir" "66 mcp_cli" || { rm -rf "$W"; return; }
   if [[ $rc -ne 0 ]]; then
     fail "66 mcp_cli: a start-up case ended badly (see the output above)"
@@ -8974,50 +9146,50 @@ gate_76_enterprise_refusals() {
 gate_74_udf_inputs() {
   local sqlf="$TMPROOT/fractalsql_bt_udf_inputs.sql" out alive n
   cat > "$sqlf" <<'SQL'
-SELECT fractal_search('', '1e5,2E-3,3e+2');
-SELECT fractal_search('', '.5,5.,1e,1e+');
-SELECT fractal_search('', '-.5e-2,+1');
-SELECT fractal_search('', 'nan,inf,-inf');
-SELECT fractal_search('', '1e999,1');
-SELECT fractal_search('', CONCAT(REPEAT('9', 70), ',1'));
-SELECT fractal_search('', CONCAT('1e', REPEAT('9', 70), ',1'));
-SELECT fractal_search('', CONCAT('1.', REPEAT('0', 70), '1,1'));
-SELECT fractal_search('[[1,2],[3,4]]', '1,2,3', 1, '{}');
-SELECT fractal_search('[[1,2],[3,4]]', '1,2', 1, '{}');
-SELECT fractal_search('[[1,2],[3]]', '1,2', 1, '{}');
-SELECT fractal_search('', '', 1, '{}');
-SELECT fractal_search('', ',', 1, '{}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"iterations":10000,"population_size":10000,"diffusion_factor":32}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"iterations":"x"}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"iterations":-1}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"population_size":1e10}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"diffusion_factor":0}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"walk":"a","debug":1}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"debug":true,"iterations":3,"population_size":5}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, 'not json');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '[1]');
-SELECT fractal_search('[[1,2]]', '1,2', 1, NULL);
-SELECT fractal_search('[[1,2]]', '1,2', 0, '{}');
-SELECT fractal_search('[[1,2]]', '1,2', -1, '{}');
-SELECT fractal_search('[[1,2]]', '1,2', 1000000, '{}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"session_id":0,"iterations":3,"population_size":5}');
-SELECT fractal_search('[[1,2]]', '1,2', 1, '{"session_id":99999999,"iterations":3,"population_size":5}');
+SELECT fractal_sfs_converge('', '1e5,2E-3,3e+2');
+SELECT fractal_sfs_converge('', '.5,5.,1e,1e+');
+SELECT fractal_sfs_converge('', '-.5e-2,+1');
+SELECT fractal_sfs_converge('', 'nan,inf,-inf');
+SELECT fractal_sfs_converge('', '1e999,1');
+SELECT fractal_sfs_converge('', CONCAT(REPEAT('9', 70), ',1'));
+SELECT fractal_sfs_converge('', CONCAT('1e', REPEAT('9', 70), ',1'));
+SELECT fractal_sfs_converge('', CONCAT('1.', REPEAT('0', 70), '1,1'));
+SELECT fractal_sfs_converge('[[1,2],[3,4]]', '1,2,3', 1, '{}');
+SELECT fractal_sfs_converge('[[1,2],[3,4]]', '1,2', 1, '{}');
+SELECT fractal_sfs_converge('[[1,2],[3]]', '1,2', 1, '{}');
+SELECT fractal_sfs_converge('', '', 1, '{}');
+SELECT fractal_sfs_converge('', ',', 1, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"iterations":10000,"population_size":10000,"diffusion_factor":32}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"iterations":"x"}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"iterations":-1}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"population_size":1e10}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"diffusion_factor":0}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"walk":"a","debug":1}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"debug":true,"iterations":3,"population_size":5}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, 'not json');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '[1]');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, NULL);
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 0, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', -1, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1000000, '{}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"session_id":0,"iterations":3,"population_size":5}');
+SELECT fractal_sfs_converge('[[1,2]]', '1,2', 1, '{"session_id":99999999,"iterations":3,"population_size":5}');
 SELECT fractal_explain_result(CONNECTION_ID());
 SELECT fractal_diversify_enable(CONNECTION_ID());
 SELECT fractal_explain_result(CONNECTION_ID());
-SELECT fractal_search('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
-SELECT fractal_search('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
+SELECT fractal_sfs_converge('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
+SELECT fractal_sfs_converge('[[1,2],[2,3]]', '1,2', 1, CONCAT('{"session_id":', CONNECTION_ID(), ',"iterations":3,"population_size":5}'));
 SELECT fractal_explain_result(CONNECTION_ID());
 SELECT fractal_detect_collapse(CONNECTION_ID());
 SELECT fractal_diversify_disable(CONNECTION_ID());
 SELECT fractal_explain_result(CONNECTION_ID());
 SELECT fractal_explain_result(NULL);
 SELECT fractal_explain_result(99999999);
-SELECT fractal_search_debug('');
-SELECT fractal_search_debug(',');
-SELECT fractal_search_debug('1e5,2E-3');
-SELECT fractal_search_debug('1,2', 0, 0, 0, 0);
-SELECT fractal_search_debug('1,2', 100000, 100000, 32, 1);
+SELECT fractal_sfs_converge_debug('');
+SELECT fractal_sfs_converge_debug(',');
+SELECT fractal_sfs_converge_debug('1e5,2E-3');
+SELECT fractal_sfs_converge_debug('1,2', 0, 0, 0, 0);
+SELECT fractal_sfs_converge_debug('1,2', 100000, 100000, 32, 1);
 SELECT fractal_search_explore('', '', '{}');
 SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2,3', '{}');
 SELECT fractal_search_explore('[[1,2],[3,4]]', '1,2', '{"population_size":10000,"iterations":10000}');
@@ -9055,11 +9227,494 @@ SQL
 }
 
 # 73 config_matrix: every configuration key through both ways of setting it (src/fractalsql_config.c). Part 1: the SQL functions fractal_config_set / _get
-# for all 18 keys with 189 values (accepted, wrong type, out of range, too long, empty, prefixed and upper-cased names, unknown keys), asserted by verdict:
+# for all 21 keys with 216 values (accepted, wrong type, out of range, too long, empty, prefixed and upper-cased names, unknown keys), asserted by verdict:
 # OK stored, D daemon-wide setting a session may not change, L too long, U unknown key, I not an integer, R out of range, B not a boolean; a stored
 # value reads back as it was set. Part 2: the daemon's own conf file, where the daemon-wide keys DO get set -- the path rules (relative, "..", drive
 # letter, UNC, root, spaces, empty), the integer, boolean, enum and string keys, unknown keys and malformed lines -- each applied with a reload; the
 # daemon must keep answering and the conf is put back.
+# 78 audit_regress: security regressions reachable from SQL, asserted through the live allowlist.
+#   MD-08  MariaDB's own executable comment (M!) is rejected like the MySQL (!) and hint (+) forms, in either case, and
+#          the contents it would run (SLEEP, INTO OUTFILE) never reach the server; a plain comment is still inert.
+gate_78_audit_regress() {
+  local bad=0 c r esc q="'"
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    esc=${c//$q/$q$q}
+    r=$("${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_t2s_check_allowlist('$esc'), '<PASS>');" 2>&1)
+    if [ "$r" = "<PASS>" ]; then bad=$((bad + 1)); echo "         allowlist passed: $c" >&2; fi
+  done <<'CASES'
+SELECT 1 /*M! , SLEEP(30) */
+SELECT 1 /*m! , SLEEP(30) */
+SELECT 1 INTO /*M! OUTFILE '/tmp/fsql_audit_x' */
+SELECT 2 /*M!50700 +1 */
+SELECT 1 /*! , SLEEP(30) */
+SELECT /*+ MAX_EXECUTION_TIME(1) */ 1
+CASES
+  if [ "$bad" -eq 0 ]; then pass "78 audit_regress: MD-08 executable comments (M!, m!, !, +) are all rejected by the allowlist"
+  else fail "78 audit_regress: MD-08 $bad executable-comment candidate(s) passed the allowlist"; fi
+  r=$("${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_t2s_check_allowlist('SELECT /* a plain comment */ 1'), '<PASS>');" 2>&1)
+  [ "$r" = "<PASS>" ] && pass "78 audit_regress: MD-08 a plain block comment is still inert" \
+                      || fail "78 audit_regress: MD-08 a plain comment was rejected: $r"
+  r=$("${MARIADB[@]}" -N -e "SELECT IFNULL(fractal_t2s_check_allowlist('SELECT 1 /* M! not executable */'), '<PASS>');" 2>&1)
+  [ "$r" = "<PASS>" ] && pass "78 audit_regress: MD-08 a comment that merely mentions M! after a space is not over-rejected" \
+                      || fail "78 audit_regress: MD-08 ' M!' inside a plain comment was rejected: $r"
+}
+
+# 79 precision: the precision contract of this host's SQL-visible distances
+# Every distance, norm and dot product
+# accumulates in DOUBLE, in a fixed sequential order, with no fused
+# multiply-add and no vectorised reduction, and is returned as a double;
+# there is ONE cosine implementation in the repo (src/fsql_precision.h),
+# so every SQL-visible cosine agrees to the last bit. The driver
+# (tests/test_precision.py) checks the results against the same
+# arithmetic in Python floats (IEEE double, no FMA): bit for bit, plus
+# the adversarial near-tie ranking, the cross-function agreement and the
+# float32 text round trip.
+gate_79_precision() {
+  local py; py="$(mcp_python)"
+  if [ -z "$py" ]; then skip "79 precision (no python3 on PATH)"; return; fi
+  local out rc
+  out="$("$py" -u "$HERE/tests/test_precision.py" 2>&1)"; rc=$?
+  printf '%s\n' "$out" | sed 's/^/         /'
+  if [ "$rc" -ne 0 ]; then
+    fail "79 precision: the precision contract gate failed (see the output above)"
+  elif printf '%s' "$out" | grep -q '^SKIP:'; then
+    skip "79 precision: the driver skipped (no connector or no server; see the output above)"
+  else
+    pass "79 precision: every SQL-visible distance is bit-identical to the sequential double reference"
+  fi
+}
+
+# 80 rename: the table-free convergence function was RENAMED
+# fractal_search -> fractal_sfs_converge (it runs SFS toward the query
+# direction; it is not a retrieval function), and there is NO alias: the
+# old call is refused with a message that names the new name. The
+# indexed search is the stored PROCEDURE fractal_search(table, column,
+# query, k, options).
+gate_80_rename() {
+  local r old dbg
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge('[[1,0],[0,1],[0.6,0.8]]', '[0.6,0.8]', 3, '{\"iterations\":50,\"population_size\":30}');" 2>&1)
+  if echo "$r" | grep -q '"best_point"'; then
+    pass "80 rename: fractal_sfs_converge(vector_csv, query_csv, k, params) runs the convergence search"
+  else
+    fail "80 rename: fractal_sfs_converge='$r'"
+  fi
+  old=$("${MARIADB[@]}" -N -e "SELECT fractal_search('[[1,0]]', '[1,0]', 1, '{}');" 2>&1)
+  if echo "$old" | grep -q 'fractal_sfs_converge'; then
+    pass "80 rename: the old fractal_search(vector, query, k, params) call is refused and names fractal_sfs_converge"
+  else
+    fail "80 rename: the old fractal_search call was not refused with the rename message: $old"
+  fi
+  dbg=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge_debug('[1,2,3]', 20, 10, 2, 42);" 2>&1)
+  if echo "$dbg" | grep -q '"best_point"'; then
+    pass "80 rename: fractal_sfs_converge_debug is the convergence trace"
+  else
+    fail "80 rename: fractal_sfs_converge_debug='$dbg'"
+  fi
+}
+
+# 81 index: the native IVF index and the indexed fractal_search. The
+# driver (tests/test_index.py) builds an index, searches it and checks
+# THE "INDEX ACTUALLY USED" property: the rows the index scanned must be
+# far below the table's row count (a search that silently ran flat must
+# fail). It also checks the verified (exact) distances, the exact
+# fallback, the delta, the staleness report, the rebuild, the candidates
+# and the drop.
+#
+# The core must carry the IVF maths: when the vendored archive predates
+# it, every index operation reports "this build of fractalsql-core does
+# not carry the IVF index (rebuild the core and refresh
+# include/<platform>)" -- the documented behaviour, reported as a SKIP.
+gate_81_index() {
+  local py; py="$(mcp_python)"
+  if [ -z "$py" ]; then skip "81 index (no python3 on PATH)"; return; fi
+  local out rc
+  out="$("$py" -u "$HERE/tests/test_index.py" 2>&1)"; rc=$?
+  printf '%s\n' "$out" | sed 's/^/         /'
+  if [ "$rc" -ne 0 ]; then
+    fail "81 index: the index gate failed (see the output above)"
+  elif printf '%s' "$out" | grep -q '^SKIP:'; then
+    skip "81 index: the driver skipped (the vendored core does not carry the IVF index, or no server; see the output above)"
+  else
+    pass "81 index: the IVF index is built, searched and verified, and the index (not a flat scan) did the work"
+  fi
+}
+
+# 82 retrieval: the retrieval agents (fractal_rag_agent, fractal_search_agent) with a meta_filter, the index path (the session key
+# agent_use_index off/on/auto) and the context budget; fractal_index_ensure; fractal_agent_recall_hybrid through the index;
+# fractal_chunk_text and the chunking vectorizer. The mock embeds every text to [0.1,0.2,0.3] and answers with a canned reply.
+
+# 83 ledger_payloads: what fractal_audit_log writes into the decision-audit chain for every shape of entry type and payload
+# (tests/mdb_ledger_payloads.py): an object payload takes the actor inside it, a scalar or an array is wrapped as a value, the
+# entry type is escaped (quote, backslash, control characters, unicode), a payload that is not JSON is refused cleanly, and the
+# chain still verifies.
+gate_83_ledger_payloads() {
+  local lib py
+  lib="$(rb_mock_lib)" || { fail "83 ledger_payloads: the mock enterprise core did not build"; return; }
+  [ -n "$lib" ] || { skip "83 ledger_payloads (no enterprise core)"; return; }
+  py="$(mcp_python)"; [ -n "$py" ] || { skip "83 ledger_payloads (no python3 on PATH)"; return; }
+  rb_reset_daemon
+  rb_conf_set enterprise_lib "$lib"; rb_conf_set enterprise_ledger_path "$TMPROOT/ledger83.bin"
+  rb_conf_set enterprise_ledger_key "ledger83-key"; rb_conf_set enterprise_require_signature 0
+  rb_daemon_restart || { fail "83 ledger_payloads: the daemon did not start with the enterprise core"; return; }
+  local out
+  out=$(FSQL_MARIADB_JSON="$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "${MARIADB[@]}" -N)" \
+        python3 -u -I "$HERE/tests/mdb_ledger_payloads.py" 2>&1)
+  if [[ "$out" == *" 0 failed"* ]]; then
+    pass "83 ledger_payloads: ${out##*$'\n'} (every entry type and payload shape; the chain still verifies)"
+  else
+    printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2; fail "83 ledger_payloads: see the output above"
+  fi
+}
+
+# 87 api_func: the SQL-visible function surface -- the version and edition answers, the vector functions answer on a small fixture and
+# refuse a malformed one, and the search functions refuse a malformed vector.
+gate_87_api_func() {
+  local r
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_version();" 2>&1)
+  [[ "$r" =~ ^[0-9]+\.[0-9]+ ]] && pass "87 api_func: fractal_version() answers ($r)" \
+                                || fail "87 api_func: fractal_version()='$r'"
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_edition();" 2>&1)
+  [ "$r" = "Community" ] && pass "87 api_func: fractal_edition() answers (Community)" \
+                        || fail "87 api_func: fractal_edition()='$r'"
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_dims('[0.1,0.2,0.3]');" 2>&1)
+  [ "$r" = "3" ] && pass "87 api_func: fractal_vector_dims answers" || fail "87 api_func: fractal_vector_dims='$r'"
+  # A malformed vector must not answer with a value. MariaDB's UDF ABI has no error text on the runtime
+  # path, so the refusal reaches the client as an error flag (a NULL here) and the reason goes to the
+  # server's own error log; the other hosts refuse it with a message.
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_dims('bad!vec');" 2>&1)
+  [ "$r" = "NULL" ] || grep -q "fractalsql" <<< "$r" \
+    && pass "87 api_func: fractal_vector_dims refuses a malformed vector" \
+    || fail "87 api_func: a malformed vector answered with a value: $r"
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_norm('[0.1,0.2,0.3]');" 2>&1)
+  [[ "$r" =~ ^[0-9.]+$ ]] && pass "87 api_func: fractal_vector_norm answers" || fail "87 api_func: fractal_vector_norm='$r'"
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_vector_cosine_distance('[1,0,0]','[1,0,0]');" 2>&1)
+  [[ "$r" =~ ^[0-9.eE+-]+$ ]] && pass "87 api_func: fractal_vector_cosine_distance answers" \
+                              || fail "87 api_func: fractal_vector_cosine_distance='$r'"
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_sfs_converge('bad!vec','bad!vec',1,'{}');" 2>&1)
+  [ "$r" = "NULL" ] || grep -q "fractalsql" <<< "$r" \
+    && pass "87 api_func: fractal_sfs_converge refuses a malformed vector" \
+    || fail "87 api_func: a malformed vector answered with a value: $r"
+  r=$("${MARIADB[@]}" -N -e "SELECT fractal_optimize_portfolio('[0.1,0.15]','[0.04,0.01,0.01,0.03]',2,'{}');" 2>&1)
+  grep -q '"sharpe"' <<< "$r" && pass "87 api_func: fractal_optimize_portfolio answers" \
+                                 || fail "87 api_func: fractal_optimize_portfolio='$r'"
+}
+
+# 84 id_emission: how the agents write a row's id into their JSON result (tests/mdb_id_emission.py): the id column is the caller's
+# data, so the id comes back byte for byte -- quotes, backslashes, control characters, unicode, an empty id, a 400-digit id -- and
+# the result document stays valid JSON.
+gate_84_id_emission() {
+  local py; py="$(mcp_python)"; [ -n "$py" ] || { skip "84 id_emission (no python3 on PATH)"; return; }
+  local out rc attempt note=""
+  # The driver runs unbuffered (-u): its report is the only thing this gate
+  # judges, and python's stdout buffer is lost with the process when the
+  # child is killed before it exits (a reaped python on a busy runner leaves
+  # an EMPTY report behind -- which is a failure to report, not a pass).
+  # Unbuffered, whatever the driver printed survives the kill, so the gate
+  # can say what happened instead of showing nothing.
+  for attempt in 1 2; do
+    out=$(FSQL_MARIADB_JSON="$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "${MARIADB[@]}" -N)" \
+          python3 -u -I "$HERE/tests/mdb_id_emission.py" 2>&1)
+    rc=$?
+    [[ -n "${out//[[:space:]]/}" ]] && break
+    # No report at all: the child died before it printed a thing. One retry
+    # (a reaped process is transient), then say so plainly.
+    if [ "$attempt" -eq 1 ]; then note=" (the first attempt was killed before it reported)"; fi
+  done
+  if [[ "$out" == *" 0 failed"* ]]; then
+    pass "84 id_emission: ${out##*$'\n'} (the row ids and the caller's text come back exactly)${note}"
+  elif [[ -z "${out//[[:space:]]/}" ]]; then
+    fail "84 id_emission: the driver produced no report (exit ${rc}): the python child was killed before it could report"
+  else
+    # The report goes to STDOUT, not stderr: the stderr stream is the one
+    # a CI runner is least likely to keep, and this is the only thing
+    # that says what the driver found. The tail is also quoted in the
+    # failure line itself, so the reason survives even a log that keeps
+    # stdout only.
+    printf '%s\n' "$out" | tail -8 | sed 's/^/    /'
+    fail "84 id_emission: the driver reported failures: ${out##*$'\n'}"
+  fi
+}
+
+# 85 oom_sweep: every kit statement re-run with an allocation failure injected inside the daemon (tests/mdb_oom_sweep.py). The fault
+# shim (tests/oom_preload.c) is armed with a control file and a signal, so the nth allocation after the arming fails; the daemon must
+# still answer or refuse the statement, and must not crash or hang.
+gate_85_oom_sweep() {
+  local py so ctl W; py="$(mcp_python)"
+  [ -n "$py" ] || { skip "85 oom_sweep (no python3 on PATH)"; return; }
+  [ "$(uname -s)" = Linux ] || { skip "85 oom_sweep (needs LD_PRELOAD and signals: Linux only)"; return; }
+  # The fault shim interposes the allocator, so it and a sanitizer's own runtime cannot both do it:
+  # under TSan the daemon is instrumented with its own allocator, and an injected mid-call allocation
+  # failure trips the instrumented build (reproduced: "the daemon died" with 1 problem in the tsan cell).
+  if [ "$ASAN" -eq 1 ] || [ "$UBSAN" -eq 1 ] || [ "$TSAN" -eq 1 ]; then
+    skip "85 oom_sweep (runs on the uninstrumented build; the sanitizer runs cover other ground)"; return
+  fi
+  have_cc=$(command -v gcc || command -v cc); [ -n "$have_cc" ] || { skip "85 oom_sweep (no C compiler)"; return; }
+  W="$TMPROOT/fractalsql_bt_oomsweep_${CUR_VER//./_}"; rm -rf "$W"; mkdir -p "$W"
+  so="$W/oom_preload.so"; ctl="$W/ctl"
+  if ! cc -O2 -fPIC -shared -o "$so" tests/oom_preload.c -ldl 2>"$W/build.log"; then
+    cat "$W/build.log" >&2; fail "85 oom_sweep: oom_preload.so failed to build"; return
+  fi
+  rb_reset_daemon
+  LD_PRELOAD="$so" FSQL_OOM_CTL="$ctl" rb_daemon_restart || { fail "85 oom_sweep: the daemon did not start under the fault shim"; rb_reset_daemon; return; }
+  local out
+  out=$(FSQL_MARIADB_JSON="$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "${MARIADB[@]}" -N)" \
+        FSQL_OOM_CTL="$ctl" FSQD_PID="$FSQD_PID" \
+        python3 -u -I "$HERE/tests/mdb_oom_sweep.py" 2>&1)
+  rb_reset_daemon
+  if [[ "$out" == *"oom sweep:"* ]]; then
+    if [[ "$out" == *"0 problem(s)"* ]]; then
+      pass "85 oom_sweep: ${out##*$'\n'} (an allocation failed inside the daemon: no crash, no hang)"
+    else
+      printf '%s\n' "$out" | grep -E '^  FAIL ' | head -6 | sed 's/^/    /' >&2
+      fail "85 oom_sweep: ${out##*$'\n'}"
+    fi
+  else
+    printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2; fail "85 oom_sweep: see the output above"
+  fi
+}
+
+# 86 kit_mutation: every kit statement re-run with one literal swapped for an awkward value and with its argument list changed
+# (tests/mdb_kit_mutation.py): NULL, an empty string, a huge number, a malformed JSON fragment, an argument dropped, an extra
+# argument. The daemon may not crash.
+gate_86_kit_mutation() {
+  local py; py="$(mcp_python)"; [ -n "$py" ] || { skip "86 kit_mutation (no python3 on PATH)"; return; }
+  local out
+  out=$(FSQL_MARIADB_JSON="$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "${MARIADB[@]}" -N)" \
+        python3 -u -I "$HERE/tests/mdb_kit_mutation.py" 2>&1)
+  if [[ "$out" == *"kit mutation:"* ]]; then
+    if [[ "$out" == *"0 crashed"* ]]; then
+      pass "86 kit_mutation: ${out##*$'\n'} (every kit statement with an awkward argument: no crash)"
+    else
+      fail "86 kit_mutation: ${out##*$'\n'}"
+    fi
+  else
+    printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2; fail "86 kit_mutation: see the output above"
+  fi
+}
+
+gate_82_retrieval() {
+  local out q
+  g82() { "${MARIADB[@]}" -N -e "$1" 2>&1; }
+  g82 "
+    DROP TABLE IF EXISTS g82_rt;
+    CREATE TABLE g82_rt (id BIGINT PRIMARY KEY, parent INT, body TEXT, emb JSON);
+    INSERT INTO g82_rt SELECT seq, seq MOD 4, CONCAT('row ', seq, ' ', REPEAT('x', 60)),
+        CONCAT('[', 0.1 + seq*0.001, ',', 0.2 - seq*0.0005, ',', 0.3 + (seq MOD 3)*0.002, ']') FROM seq_1_to_40;" >/dev/null
+
+  # --- fractal_index_ensure ------------------------------------------------
+  out=$(g82 "CALL fractal_index_ensure('g82_rt','emb','{\"name\":\"g82_rt_ix\",\"vector_format\":\"FP32\",\"nlist\":4}',@r); SELECT JSON_VALUE(@r,'\$.action');")
+  [ "$out" = "created" ] && pass "82 retrieval: fractal_index_ensure builds the index when there is none (created)" || fail "82 retrieval: ensure create: ${out:0:160}"
+  out=$(g82 "CALL fractal_index_ensure('g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'\$.action');")
+  [ "$out" = "unchanged" ] && pass "82 retrieval: ensure on a fit index changes nothing (unchanged)" || fail "82 retrieval: ensure unchanged: ${out:0:160}"
+  g82 "INSERT INTO g82_rt SELECT seq+40, (seq+40) MOD 4, CONCAT('row ', seq+40), CONCAT('[', 0.1 + (seq+40)*0.001, ',', 0.2 - (seq+40)*0.0005, ',0.3]') FROM seq_1_to_4;" >/dev/null
+  out=$(g82 "CALL fractal_index_ensure('g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'\$.action');")
+  [ "$out" = "refreshed" ] && pass "82 retrieval: ensure folds in a few added rows (refreshed)" || fail "82 retrieval: ensure refresh: ${out:0:160}"
+  g82 "INSERT INTO g82_rt SELECT seq+44, (seq+44) MOD 4, CONCAT('row ', seq+44), CONCAT('[', 0.1 + (seq+44)*0.001, ',', 0.2 - (seq+44)*0.0005, ',0.3]') FROM seq_1_to_26;" >/dev/null
+  out=$(g82 "CALL fractal_index_ensure('g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'\$.action'), JSON_VALUE(@r,'\$.status');")
+  [ "$out" = "rebuilt	ready" ] && pass "82 retrieval: ensure rebuilds after more than a quarter of the rows were added (rebuilt), and the index is ready" || fail "82 retrieval: ensure rebuild: ${out:0:160}"
+
+  # --- a wide FP32 vector (over 512 dimensions) keeps all of its codes: 700 dimensions = 5600 hex characters per row ---
+  g82 "DROP TABLE IF EXISTS g82_wide; CREATE TABLE g82_wide (id BIGINT PRIMARY KEY, emb JSON);
+    INSERT INTO g82_wide SELECT seq, CONCAT('[', REPEAT(CONCAT(0.01 * seq, ','), 699), '0.5]') FROM seq_1_to_12;" >/dev/null
+  out=$(g82 "CALL fractal_index_ensure('g82_wide','emb','{\"name\":\"g82_wide_ix\",\"vector_format\":\"FP32\",\"nlist\":2}',@r); SELECT JSON_VALUE(@r,'\$.action'), JSON_VALUE(@r,'\$.rows');")
+  [ "$out" = "created	12" ] && pass "82 retrieval: an FP32 index over 700-dimension vectors builds (the codes are not cut short)" || fail "82 retrieval: wide FP32 index: ${out:0:200}"
+  out=$(g82 "CALL fractal_search('g82_wide','emb',CONCAT('[', REPEAT('0.05,', 699), '0.5]'), 3, '{\"index\":\"g82_wide_ix\"}', @r, @s); SELECT JSON_LENGTH(@r), JSON_VALUE(@s,'\$.used_index');")
+  [ "$out" = "3	1" ] && pass "82 retrieval: the wide FP32 index answers a search" || fail "82 retrieval: wide FP32 search: ${out:0:200}"
+
+  # --- agent_use_index: off / on / auto (one client run = one connection) ---
+  q="CALL fractal_rag_agent('q','g82_rt','emb',NULL,@r); SELECT JSON_VALUE(@r,'\$.used_index');"
+  out=$(g82 "$q")
+  [ "$out" = "0" ] && pass "82 retrieval: rag_agent scans by default (used_index false)" || fail "82 retrieval: rag default: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; $q" | tail -1)
+  [ "$out" = "1" ] && pass "82 retrieval: agent_use_index on sends rag_agent through the index (used_index true)" || fail "82 retrieval: rag on: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','auto',CONNECTION_ID()) INTO @x; $q SELECT fractal_config_set('agent_index_min_rows','5',CONNECTION_ID()) INTO @y; $q" | tr '\n' ' ')
+  [ "$out" = "0 1 " ] && pass "82 retrieval: auto scans exactly on a table under agent_index_min_rows, and uses the ready, calibrated index once the table is over it" || fail "82 retrieval: rag auto: ${out:0:160}"
+  out=$(g82 "CALL fractal_index_info('g82_rt_ix',@r); SELECT JSON_VALUE(@r,'\$.calibration.reaches_target'), JSON_VALUE(@r,'\$.nprobe_default') > 0, JSON_VALUE(@r,'\$.status');" | tr '\n' ' ')
+  [ "$out" = "1	1	ready " ] && pass "82 retrieval: the index was calibrated at build time (a recall estimate from a sample) and reports nprobe_default and reaches_target" || fail "82 retrieval: calibration info: ${out:0:200}"
+  g82 "DROP TABLE IF EXISTS g82_few; CREATE TABLE g82_few (id BIGINT PRIMARY KEY, emb JSON); INSERT INTO g82_few SELECT seq, CONCAT('[', seq, ',1,2]') FROM seq_1_to_8;
+       CALL fractal_index_create('g82_few','emb','{\"name\":\"g82_few_ix\",\"vector_format\":\"FP32\",\"nlist\":2}',@r);" >/dev/null
+  out=$(g82 "CALL fractal_index_info('g82_few_ix',@r); SELECT JSON_VALUE(@r,'\$.calibration.skipped') IS NOT NULL, JSON_VALUE(@r,'\$.status');" | tr '\n' ' ')
+  [ "$out" = "1	ready " ] && pass "82 retrieval: an index over fewer than 12 rows is built uncalibrated (calibration skipped), not refused" || fail "82 retrieval: uncalibrated info: ${out:0:200}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','auto',CONNECTION_ID()) INTO @x; SELECT fractal_config_set('agent_index_min_rows','1',CONNECTION_ID()) INTO @y; CALL fractal_rag_agent('q','g82_few','emb',NULL,@r); SELECT JSON_VALUE(@r,'\$.used_index');" | tail -1)
+  [ "$out" = "0" ] && pass "82 retrieval: auto scans exactly through an uncalibrated index" || fail "82 retrieval: auto uncalibrated: ${out:0:160}"
+  # plan_explore through the index: the same branches (row id, own vector, score), found through the index when the session allows it
+  out=$(g82 "CALL fractal_agent_plan_explore('start','g82_rt','emb',3,@r); SELECT @_fractalsql_agent_search_path, JSON_LENGTH(@r);" | tr '\n' ' ')
+  [ "$out" = "scan	3 " ] && pass "82 retrieval: plan_explore scans by default (3 branches)" || fail "82 retrieval: plan_explore default: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; CALL fractal_agent_plan_explore('start','g82_rt','emb',3,@r); SELECT @_fractalsql_agent_search_path, JSON_LENGTH(@r), JSON_LENGTH(JSON_EXTRACT(@r,'\$[0].plan_trajectory'));" | tail -1)
+  [ "$out" = "index	3	3" ] && pass "82 retrieval: with agent_use_index on plan_explore finds its branches through the index (3 branches, each with its own vector)" || fail "82 retrieval: plan_explore through the index: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; CALL fractal_agent_plan_explore('start','g82_rt','emb',3,@a); SELECT fractal_config_set('agent_use_index','off',CONNECTION_ID()) INTO @y; CALL fractal_agent_plan_explore('start','g82_rt','emb',3,@b); SELECT JSON_EXTRACT(@a,'\$[*].doc_id') = JSON_EXTRACT(@b,'\$[*].doc_id');" | tail -1)
+  [ "$out" = "1" ] && pass "82 retrieval: plan_explore returns the same row ids through the index as by the scan" || fail "82 retrieval: plan_explore parity: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','sometimes',CONNECTION_ID());")
+  [[ "$out" == *"must be one of: off|on|auto"* ]] && pass "82 retrieval: agent_use_index refuses a value that is not off, on or auto" || fail "82 retrieval: bad mode: ${out:0:160}"
+
+  # --- meta_filter, the context budget ------------------------------------
+  q="CALL fractal_rag_agent('q','g82_rt','emb',JSON_OBJECT('parent',2),@r); SELECT (SELECT COUNT(*) FROM g82_rt WHERE parent = 2 AND JSON_CONTAINS(JSON_EXTRACT(@r,'\$.source_row_ids'), CAST(id AS CHAR))) = JSON_LENGTH(JSON_EXTRACT(@r,'\$.source_row_ids')), JSON_LENGTH(JSON_EXTRACT(@r,'\$.source_row_ids')) > 0;"
+  out=$(g82 "$q")
+  [ "$out" = "1	1" ] && pass "82 retrieval: meta_filter limits the scan to the rows that match" || fail "82 retrieval: filter scan: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; $q" | tail -1)
+  [ "$out" = "1	1" ] && pass "82 retrieval: meta_filter through the index passes the matching keys as the ids option, same rows" || fail "82 retrieval: filter index: ${out:0:160}"
+  out=$(g82 "CALL fractal_rag_agent('q','g82_rt','emb',JSON_OBJECT('nosuch',1),@r);")
+  [[ "$out" == *"does not exist"* ]] && pass "82 retrieval: a meta_filter column the table does not have is an error" || fail "82 retrieval: filter bad column: ${out:0:160}"
+  out=$(g82 "CALL fractal_rag_agent('q','g82_rt','emb',JSON_OBJECT('parent',99),@r);")
+  [[ "$out" == *"for that meta_filter"* ]] && pass "82 retrieval: a meta_filter that matches no row is an error, never ignored" || fail "82 retrieval: filter no match: ${out:0:160}"
+  out=$(g82 "SELECT fractal_config_set('agent_context_row_bytes','10',CONNECTION_ID()) INTO @x; CALL fractal_search_agent('q','g82_rt','emb',10,5,NULL,@r); SELECT JSON_VALUE(@r,'\$.context_cut.cells') > 0, JSON_VALUE(@r,'\$.execution_time_ms') >= 0;" | tail -1)
+  [ "$out" = "1	1" ] && pass "82 retrieval: a text cell over agent_context_row_bytes is cut and counted in context_cut; search_agent reports a measured time" || fail "82 retrieval: context cut: ${out:0:160}"
+
+  # --- recall_hybrid through the index -----------------------------------
+  q="CALL fractal_agent_recall_hybrid('g82_rt','emb','[0.1,0.2,0.3]','parent','1',5,NULL,@r); SELECT GROUP_CONCAT(j.mem_id ORDER BY j.mem_id) FROM JSON_TABLE(@r,'\$[*]' COLUMNS(mem_id BIGINT PATH '\$.mem_id')) j;"
+  local r_scan r_idx
+  r_scan=$(g82 "$q" | tail -1)
+  r_idx=$(g82 "SELECT fractal_config_set('agent_use_index','on',CONNECTION_ID()) INTO @x; $q" | tail -1)
+  [ -n "$r_scan" ] && [ "$r_scan" = "$r_idx" ] && pass "82 retrieval: recall_hybrid through the index returns the rows the cohort scan returns ($r_idx)" || fail "82 retrieval: recall_hybrid index '$r_idx' vs scan '$r_scan'"
+  g82 "CALL fractal_index_drop('g82_rt_ix',@d); DROP TABLE IF EXISTS g82_rt;" >/dev/null
+
+  # --- fractal_chunk_text --------------------------------------------------
+  out=$(g82 "SELECT JSON_COMPACT(fractal_chunk_text('abcdefghij', 4, 1, 'fixed'));")
+  [ "$out" = '[{"no":0,"start":0,"end":4,"text":"abcd"},{"no":1,"start":3,"end":7,"text":"defg"},{"no":2,"start":6,"end":10,"text":"ghij"}]' ] && pass "82 retrieval: chunk_text fixed, size 4, overlap 1" || fail "82 retrieval: chunk_text fixed: ${out:0:200}"
+  out=$(g82 "SELECT GROUP_CONCAT(CONCAT(j.s, '-', j.e, ':', j.t) ORDER BY j.n SEPARATOR '|') FROM JSON_TABLE(fractal_chunk_text('One. Two sentences! Is this three? Yes.  Four is a long one that keeps on going and going.', 30, 5, 'sentence'), '\$[*]' COLUMNS(n INT PATH '\$.no', s INT PATH '\$.start', e INT PATH '\$.end', t TEXT PATH '\$.text')) j;")
+  [ "$out" = "0-19:One. Two sentences!|20-39:Is this three? Yes.|41-71:Four is a long one that keeps |66-90:eeps on going and going." ] && pass "82 retrieval: chunk_text sentence packing, a long sentence split with overlap" || fail "82 retrieval: chunk_text sentence: ${out:0:200}"
+  out=$(g82 "SELECT fractal_chunk_text('', 10, 0), fractal_chunk_text(NULL, 10, 0) IS NULL;")
+  [ "$out" = "[]	1" ] && pass "82 retrieval: chunk_text of empty text is [] and of NULL is NULL" || fail "82 retrieval: chunk_text empty: ${out:0:200}"
+  out=$(g82 "SELECT JSON_VALUE(fractal_chunk_text(CONCAT('one', CHAR(10), 'two', CHAR(10), 'three'), 100, 0), '\$[0].end');")
+  [ "$out" = "13" ] && pass "82 retrieval: chunk_text: a paragraph break needs two line feeds" || fail "82 retrieval: chunk_text single LF: ${out:0:200}"
+  out=$(g82 "SELECT fractal_chunk_text('x', 5, 5);")
+  [ "$out" = "NULL" ] && pass "82 retrieval: chunk_text refuses an overlap of size or more (NULL, as every UDF argument error does)" || fail "82 retrieval: chunk_text overlap: ${out:0:200}"
+  out=$(g82 "SELECT fractal_chunk_text('x', 5, 0, 'word');")
+  [ "$out" = "NULL" ] && pass "82 retrieval: chunk_text refuses an unknown mode (NULL)" || fail "82 retrieval: chunk_text mode: ${out:0:200}"
+
+  # --- chunking vectorizer -------------------------------------------------
+  g82 "
+    DROP TABLE IF EXISTS g82_cdocs_chunks; DROP TABLE IF EXISTS g82_cdocs;
+    CREATE TABLE g82_cdocs (id BIGINT PRIMARY KEY, body TEXT);
+    INSERT INTO g82_cdocs VALUES (1, CONCAT('First paragraph here.', CHAR(10), CHAR(10), 'Second one is short.')), (2, 'A single short document.');" >/dev/null
+  local vid
+  vid=$(g82 "CALL fractal_vectorizer_create('g82_cdocs','body','embedding','{\"chunk_size\":30,\"chunk_overlap\":0}',@v); SELECT @v;" | tr -d '\n ')
+  [[ "$vid" =~ ^[0-9]+$ ]] && pass "82 retrieval: a vectorizer with chunk_size is created (id $vid)" || fail "82 retrieval: chunking vectorizer: ${vid:0:200}"
+  out=$(g82 "SELECT GROUP_CONCAT(CONCAT(parent_id, '/', chunk_no, ':', chunk_text) ORDER BY parent_id, chunk_no SEPARATOR '|') FROM g82_cdocs_chunks;")
+  [ "$out" = "1/0:First paragraph here.|1/1:Second one is short.|2/0:A single short document." ] && pass "82 retrieval: existing rows are chunked into the chunk table" || fail "82 retrieval: chunk table: ${out:0:200}"
+  g82 "CALL fractal_vectorizer_process_queue(50, 600);" >/dev/null
+  out=$(g82 "SELECT CONCAT(SUM(embedding IS NOT NULL), '/', COUNT(*)) FROM g82_cdocs_chunks;")
+  [ "$out" = "3/3" ] && pass "82 retrieval: the chunks are what the vectorizer embeds" || fail "82 retrieval: chunk embeddings: ${out:0:200}"
+  g82 "INSERT INTO g82_cdocs VALUES (3, 'Added later.'); UPDATE g82_cdocs SET body = 'Only one now.' WHERE id = 1; DELETE FROM g82_cdocs WHERE id = 2;" >/dev/null
+  out=$(g82 "SELECT GROUP_CONCAT(CONCAT(parent_id, ':', chunk_text) ORDER BY parent_id, chunk_no SEPARATOR '|') FROM g82_cdocs_chunks;")
+  [ "$out" = "1:Only one now.|3:Added later." ] && pass "82 retrieval: insert adds chunks, an update of the text rechunks the row, a delete removes them" || fail "82 retrieval: chunk follow: ${out:0:200}"
+  g82 "CALL fractal_vectorizer_drop($vid); INSERT INTO g82_cdocs VALUES (4, 'After the drop.');" >/dev/null
+  out=$(g82 "SELECT COUNT(*) FROM g82_cdocs_chunks WHERE parent_id = 4;")
+  [ "$out" = "0" ] && pass "82 retrieval: dropping the vectorizer stops the chunking and leaves the chunk table" || fail "82 retrieval: after drop: ${out:0:200}"
+  out=$(g82 "CALL fractal_vectorizer_create('g82_cdocs','body','embedding','{\"chunk_size\":0}',@v);")
+  [[ "$out" == *"chunk_size must be 1..100000"* ]] && pass "82 retrieval: chunk_size out of range is refused" || fail "82 retrieval: chunk_size 0: ${out:0:200}"
+  g82 "DROP TABLE IF EXISTS g82_cdocs_chunks; DROP TABLE IF EXISTS g82_cdocs;" >/dev/null
+
+  # The vectorizer option index_ensure: after a batch, an index that already exists on the embedding column is brought up to date.
+  # A control vectorizer without the option leaves its index stale.
+  g82 "DROP TABLE IF EXISTS g82_vix; DROP TABLE IF EXISTS g82_vix2;
+    CREATE TABLE g82_vix (id BIGINT PRIMARY KEY, body TEXT, emb JSON);
+    CREATE TABLE g82_vix2 (id BIGINT PRIMARY KEY, body TEXT, emb JSON);
+    INSERT INTO g82_vix (id, body) SELECT seq, CONCAT('text ', seq) FROM seq_1_to_30;
+    INSERT INTO g82_vix2 (id, body) SELECT seq, CONCAT('text ', seq) FROM seq_1_to_30;
+    CALL fractal_vectorizer_create('g82_vix','body','emb','{\"index_ensure\":true}',@v1);
+    CALL fractal_vectorizer_create('g82_vix2','body','emb',NULL,@v2);
+    CALL fractal_vectorizer_process_queue(100, 600);
+    CALL fractal_index_ensure('g82_vix','emb','{\"name\":\"g82_vix_ix\",\"vector_format\":\"FP32\",\"nlist\":2}',@r1);
+    CALL fractal_index_ensure('g82_vix2','emb','{\"name\":\"g82_vix2_ix\",\"vector_format\":\"FP32\",\"nlist\":2}',@r2);
+    INSERT INTO g82_vix (id, body) VALUES (101,'new a'),(102,'new b');
+    INSERT INTO g82_vix2 (id, body) VALUES (101,'new a'),(102,'new b');
+    CALL fractal_vectorizer_process_queue(100, 600);
+    SELECT 1;" >/dev/null 2>&1
+  out=$(g82 "CALL fractal_index_info('g82_vix_ix',@a); CALL fractal_index_info('g82_vix2_ix',@b); SELECT CONCAT(JSON_VALUE(@a,'\$.status'),'/',JSON_VALUE(@a,'\$.rows_added_since_build'),' ',JSON_VALUE(@b,'\$.status'),'/',JSON_VALUE(@b,'\$.rows_added_since_build'));")
+  [ "$out" = "ready/0 stale/2" ] && pass "82 retrieval: a vectorizer with index_ensure folds the batch's new rows into its index (ready); one without leaves it stale" || fail "82 retrieval: index_ensure hook: ${out:0:200}"
+  out=$("${MARIADB[@]}" -N < "$HERE/demo/demo-chunking.sql" 2>&1)
+  if [[ "$out" != *"ERROR"* ]] && [[ "$out" == *'"action": "created"'* ]] && [[ "$out" == *'"action": "unchanged"'* ]]; then
+    pass "82 retrieval: demo/demo-chunking.sql runs clean"
+  else
+    fail "82 retrieval: demo/demo-chunking.sql: ${out: -300}"
+  fi
+  g82 "CALL fractal_index_drop('chunk_demo_docs_chunks_embedding',@d); DROP TABLE IF EXISTS chunk_demo_docs_chunks; DROP TABLE IF EXISTS chunk_demo_docs;" >/dev/null
+  if command -v python3 >/dev/null 2>&1; then
+    local uout; uout=$(FSQL_MARIADB_JSON="$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "${MARIADB[@]}" -N)" python3 -u -I "$HERE/tests/unicode_matrix.py" 2>&1)
+    [[ "$uout" == *" 0 failed"* ]] && pass "82 retrieval: ${uout##*$'\n'} (Latin, CJK, right-to-left, emoji, combining marks through chunk_text and a utf8mb4 table)" || { printf '%s\n' "$uout" | tail -8 | sed 's/^/    /' >&2; fail "82 retrieval: the Unicode matrix failed"; }
+  fi
+  return 0
+}
+
+gate_77_frame_auth() {
+  local py; py="$(mcp_python)"
+  # Ported from the Druid daemon. Frame authentication allocates nothing, so a forged
+  # all-zero-tag frame is refused even when the buffer it once allocated is made to fail; a payload declared but not sent is not
+  # allocated before the frame is authenticated; and a key under 16 bytes is refused at start-up.
+  local d key conf sock pid log hex i
+  [ "$(uname -s)" = Linux ] || { skip "77 frame_auth (needs LD_PRELOAD and /proc: Linux only)"; return; }
+  have_cc=$(command -v gcc || command -v cc)
+  [ -n "$have_cc" ] || { skip "77 frame_auth (no C compiler)"; return; }
+  [ -n "$py" ] || { skip "77 frame_auth (no python3)"; return; }
+  d="$(mktemp -d /tmp/fsqa.XXXXXX)"; key="$d/k"; conf="$d/c.conf"; sock="$d/s"; log="$d/log"
+  "$have_cc" -shared -fPIC -O1 -o "$d/fs.so" tests/robustness/fail_size_preload.c -ldl 2>"$d/build.log" \
+    || { fail "77 frame_auth: the failure shim did not build"; rm -rf "$d"; return; }
+  openssl rand -hex 32 > "$key"; chmod 600 "$key"
+  printf 'socket_path = %s\nhmac_key_file = %s\nallowed_uids = %s\n' "$sock" "$key" "$(id -u)" > "$conf"; chmod 600 "$conf"
+  # The failure shim is preloaded into the daemon, and in an ASan cell the
+  # sanitizer runtime has to come FIRST: ASan refuses to start when it is not
+  # the first library in the initial list ("ASan runtime does not come first in
+  # initial library list"), and a preloaded shim would take exactly that place
+  # (the daemon itself links libasan, so the runtime is otherwise first on its
+  # own). The cell's own LD_PRELOAD is set later -- mdb_setup runs after this
+  # gate -- so the runtime is resolved here rather than inherited. A cell with
+  # no sanitizer has no runtime to order, and the shim alone is all the gate
+  # needs.
+  local preload="$d/fs.so"
+  if [ "$ASAN" -eq 1 ]; then
+    local rt; rt="$(resolve_san_rt libasan.so)"
+    if [ -z "$rt" ] || [ ! -f "$rt" ]; then
+      fail "77 frame_auth: the ASan runtime (libasan.so) could not be resolved for the preload"
+      rm -rf "$d"; return
+    fi
+    preload="$rt:$d/fs.so"
+  elif [ -n "${LD_PRELOAD:-}" ]; then
+    preload="${LD_PRELOAD}:$d/fs.so"
+  fi
+  FSQL_FAIL_SIZE=$((32 + 777)) LD_PRELOAD="$preload" "$HERE/service/build/fractalsqld" -c "$conf" </dev/null >"$log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 100); do [ -S "$sock" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+  if [ ! -S "$sock" ] && [ -f "$log" ]; then sed 's/^/         (daemon) /' "$log" | tail -6; fi
+  if "$py" tests/robustness/frame_auth.py "$sock" "$key" "$pid" 777 >"$d/out" 2>&1; then
+    pass "77 frame_auth: forged frames refused, genuine answered, declared-but-unsent payloads not allocated"
+  else
+    sed 's/^/         /' "$d/out" | tail -8; fail "77 frame_auth: see the output above"
+  fi
+  kill "$pid" 2>/dev/null; { wait "$pid"; } 2>/dev/null
+  local bad=0
+  for hex in 00 0011223344556677 00112233445566778899aabbccddee; do
+    printf '%s\n' "$hex" > "$key"; rm -f "$sock"
+    if [ "$(KEYTRY=1 bash -c '"$0" -c "$1" </dev/null >/dev/null 2>&1 & p=$!; for i in $(seq 1 40); do [ -S "$2" ] && { echo start; kill $p; exit; }; kill -0 $p 2>/dev/null || { echo refuse; exit; }; sleep 0.05; done; echo timeout; kill $p' "$HERE/service/build/fractalsqld" "$conf" "$sock")" != refuse ]; then bad=$((bad + 1)); fi
+  done
+  if [ "$bad" -eq 0 ]; then pass "77 frame_auth: keys of 1, 8 and 15 bytes are refused at start-up"
+  else fail "77 frame_auth: $bad short key(s) were accepted"; fi
+  # Without FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE the destructive ledger calls refuse; flush does not. The
+  # refusal comes before the enterprise library is resolved, so the message differs from the "not loaded" one a permitted call gets.
+  local ctl="$HERE/service/build/fsqlctl" kd d2 rd rf ra
+  printf '%s\n' "$(openssl rand -hex 32)" > "$key"; rm -f "$sock"
+  env -u FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE "$HERE/service/build/fractalsqld" -c "$conf" </dev/null >"$d/off.log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 100); do [ -S "$sock" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+  rd=$(FSQLCTL_SOCKET="$sock" FSQLCTL_KEY="$key" "$ctl" call fractal_ledger_reset_hard i:1 2>&1)
+  rf=$(FSQLCTL_SOCKET="$sock" FSQLCTL_KEY="$key" "$ctl" call fractal_ledger_flush i:1 2>&1)
+  kill "$pid" 2>/dev/null; { wait "$pid"; } 2>/dev/null
+  rm -f "$sock"
+  FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE=1 "$HERE/service/build/fractalsqld" -c "$conf" </dev/null >"$d/on.log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 100); do [ -S "$sock" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+  ra=$(FSQLCTL_SOCKET="$sock" FSQLCTL_KEY="$key" "$ctl" call fractal_ledger_reset_hard i:1 2>&1)
+  kill "$pid" 2>/dev/null; { wait "$pid"; } 2>/dev/null
+  if grep -q "reset_hard refused: FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE" "$d/off.log" && ! grep -q "reset_hard refused" "$d/on.log" \
+     && ! grep -q "flush refused" "$d/off.log"; then
+    pass "77 frame_auth: reset_hard is refused (and logged) with the destructive switch off, not with it on; flush is never gated"
+  else
+    fail "77 frame_auth: the destructive switch did not behave: off log '$(tail -c 160 "$d/off.log" | tr '\n' ' ')'"
+  fi
+  rm -rf "$d"
+}
+
 gate_73_config_matrix() {
   local sqlf="$TMPROOT/fractalsql_bt_cfg_matrix.sql" outf="$TMPROOT/fractalsql_bt_cfg_matrix.out" kind name val i=0 bad=0 n=0 got want rowsv
   # The heredoc is read straight into the variable: wrapped in $(...), bash 3.2 (macOS) mis-tracks the quotes in rows like SELECT 'unterminated.
@@ -9253,6 +9908,33 @@ U	fractalsql.	1
 U	fractalsql.nope	1
 U	reasoning_plugin 	1
 U	a;b	1
+OK	agent_use_index	off
+OK	agent_use_index	on
+OK	agent_use_index	auto
+OK	fractalsql.agent_use_index	auto
+R	agent_use_index	true
+R	agent_use_index	1
+R	agent_use_index	ON
+R	agent_use_index	maybe
+U	AGENT_USE_INDEX	on
+OK	agent_index_min_rows	10000
+OK	agent_index_min_rows	0
+OK	agent_index_min_rows	2000000
+OK	agent_index_min_rows	
+R	agent_index_min_rows	-1
+R	agent_index_min_rows	2000001
+I	agent_index_min_rows	abc
+I	agent_index_min_rows	3.5
+OK	fractalsql.agent_index_min_rows	5
+U	AGENT_INDEX_MIN_ROWS	5
+OK	agent_context_row_bytes	8192
+OK	agent_context_row_bytes	0
+OK	agent_context_row_bytes	1048576
+R	agent_context_row_bytes	1048577
+R	agent_context_row_bytes	-1
+I	agent_context_row_bytes	abc
+OK	fractalsql.agent_context_row_bytes	100
+U	AGENT_CONTEXT_ROW_BYTES	100
 ROWS
   rowsv="${rowsv%$'\n'}"
   _cfg_expand() { case "$1" in @X9000@) printf 'x%.0s' $(seq 1 9000) ;; @P5000@) printf '/'; printf 'p%.0s' $(seq 1 5000) ;; @X300@) printf 'x%.0s' $(seq 1 300) ;; *) printf '%s' "$1" ;; esac; }
@@ -9466,6 +10148,19 @@ P	SELECT 1; /* only a comment after */
 P	SELECT 1; -- comment after
 P	SELECT 1; # comment after
 M	SELECT 1;\nSELECT 2
+T	(DELETE FROM bt_customers)
+T	(INSERT INTO bt_customers (id) VALUES (1))
+T	(UPDATE bt_customers SET name = 'x')
+T	((DELETE FROM bt_customers))
+P	((SELECT 1))
+F	SELECT SLEEP/**/(5)
+F	SELECT SLEEP -- c\n (5)
+F	SELECT SLEEP # c\n (5)
+F	SELECT 1--SLEEP(5)
+F	SELECT BENCHMARK/**/(1000000, MD5('a'))
+F	SELECT `sleep`(0)
+F	SELECT "sleep"(0)
+P	SELECT `sleep` FROM bt_customers
 ROWS
   rows="${rows%$'\n'}"
   while IFS=$'\t' read -r kind cand; do
@@ -9603,11 +10298,13 @@ run_major() {
     [ "$g" = "64" ] && gate_64_direct_faults
     [ "$g" = "69" ] && gate_69_plugin_sig_vendored
     [ "$g" = "70" ] && gate_70_redact_unit
+    # Gate 77 (frame authentication) starts its own throwaway daemon: no cluster, no mariadbd.
+    [ "$g" = "77" ] && gate_77_frame_auth
   done
 
   local need_db=0
   for g in "${gates[@]}"; do
-    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|31|32|33|34|35|36|37|38|39|40|42|43|44|45|47|48|49|50|51|52|53|54|55|56|57|58|59|60|61|62|65|66|68|71|72|73|74|75|76) need_db=1 ;; esac
+    case "$g" in 02|03|04|05|06|07|08|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|31|32|33|34|35|36|37|38|39|40|42|43|44|45|47|48|49|50|51|52|53|54|55|56|57|58|59|60|61|62|65|66|68|71|72|73|74|75|76|78|79|80|81|82|83|84|85|86|87) need_db=1 ;; esac
   done
   if [ "$need_db" -eq 1 ]; then
     mdb_setup "$v"; local rc=$?
@@ -9656,6 +10353,16 @@ run_major() {
         74) gate_74_udf_inputs ;;
         75) gate_75_multimodal_edge ;;
         76) gate_76_enterprise_refusals ;;
+        78) gate_78_audit_regress ;;
+        79) gate_79_precision ;;
+        80) gate_80_rename ;;
+        81) gate_81_index ;;
+        82) gate_82_retrieval ;;
+        83) gate_83_ledger_payloads ;;
+        84) gate_84_id_emission ;;
+        87) gate_87_api_func ;;
+        85) gate_85_oom_sweep ;;
+        86) gate_86_kit_mutation ;;
         36) gate_36_morphology_metrics ;;
         37) gate_37_oom_injection ;;
         38) gate_38_fatal_signal ;;

@@ -28,17 +28,25 @@ exposes whichever capability tiers that edition includes.
 
 ## 🔍 Tier 1: Discovery
 
-The foundation of FractalSQL is the **Stochastic Fractal Search (SFS)**
-engine, which treats vector search as a continuous optimization problem
-rather than an index lookup like standard HNSW.
+FractalSQL has two ways to find rows. The **Stochastic Fractal Search (SFS)** engine treats
+the problem as continuous optimization and powers `fractal_sfs_converge` and the diverse
+**Scout** discovery; the **IVF index** gives fast, verified nearest-neighbour search over
+your stored rows, like an index lookup in standard HNSW or IVFFlat, with exact distances
+and a recall you can measure.
 
-### Sniper Search (`fractal_search`)
+### Indexed Search (`fractal_search`, `fractal_index_*`)
+
+`CALL fractal_index_create(table, column)` builds an index over the table's embedding column (the table needs a single-column numeric primary key to use as the row id), and `CALL fractal_search(table, column, query, k)` returns the `k` nearest rows to a query vector. With an index the search reads a few cells instead of every row, and it re-scores every candidate against the stored vector, so the distances it returns are **exact**: the index only chooses which rows to look at, it does not approximate the answer. Without an index the same call scans the table and returns the same distances, only slower. The nearest-row agents can search through an index too, off by default — see [Agency](api-agency.md). Building, refreshing and checking an index, and the search options, are in [Discovery](api-discovery.md#the-native-ivf-index-fractal_index_-and-the-indexed-fractal_search).
+
+
+
+### Sniper Search (`fractal_sfs_converge`)
 Pure SFS convergence to the single best point minimizing cosine distance to
 a query. Also the corpus top-k search: pass a real inline corpus for top-k,
 or an empty one (`''`) to run pure convergence with no corpus at all. It is
 a "precision" tool for finding the absolute global minimum.
 
-### Convergence Trace (`fractal_search_debug`)
+### Convergence Trace (`fractal_sfs_converge_debug`)
 The same search with the corpus removed and the debug trace always on: no
 top-k, just the walk's own trace on one query point, so you can see where the
 search landed and how well it fit. Pass a `seed` for a byte-stable result --
@@ -130,7 +138,7 @@ examples, and notes.
 | `fractal_agent_rebalance_sibling` | optimizer + trajectory search → reasoning rationale | ✓ |
 | `fractal_agent_diverse_portfolios` (enterprise) | multi-restart SFS + diverse-select → reasoning rationale | ✓ |
 | `fractal_agent_route_task` | nearest-capability search + budget accounting → reasoning rationale | ✓ |
-| `fractal_agent_schedule_workload` | `fractal_search` refine + nearest node → reasoning rationale | ✓ |
+| `fractal_agent_schedule_workload` | `fractal_sfs_converge` refine + nearest node → reasoning rationale | ✓ |
 | `fractal_agent_outlier_intercept` | distance-to-bad-state safety barrier → reasoning justification | ✓ |
 | `fractal_agent_patient_deterioration_triage` | cohort search + trajectory drift → reasoning triage | ✓ |
 | `fractal_agent_data_analyst` | NL → SQL → reasoning analysis (SQL runs only with an explicit `auto_execute`) | ✓ |
@@ -285,8 +293,8 @@ sweep either way; measure on your own workload (see `bench/README.md`'s
 detailed per-tier references.)
 
 **Discovery**
-- `fractal_search(vector_csv, query_csv, k, params)`: Sniper Mode convergence, or corpus top-k. → **[api-discovery.md](api-discovery.md)**
-- `fractal_search_debug(query_csv [, iterations, population_size, diffusion_factor, seed])`: The convergence trace, with no corpus. → **[api-discovery.md](api-discovery.md)**
+- `fractal_sfs_converge(vector_csv, query_csv, k, params)`: Sniper Mode convergence, or corpus top-k. → **[api-discovery.md](api-discovery.md)**
+- `fractal_sfs_converge_debug(query_csv [, iterations, population_size, diffusion_factor, seed])`: The convergence trace, with no corpus. → **[api-discovery.md](api-discovery.md)**
 - `fractal_search_explore(corpus, query, params)`: Scout Mode diverse exploration. → **[api-discovery.md](api-discovery.md)**
 - `fractal_search_telemetry(table, col, query, k, OUT result)`: Ground-truth row retrieval. → **[api-discovery.md](api-discovery.md)**
 

@@ -24,9 +24,17 @@
  */
 
 /* Search and discovery */
+/* fractal_sfs_converge is the table-free convergence function: it runs
+ * SFS toward the query direction, it is NOT a retrieval function. It
+ * was renamed from fractal_search (2026-11-18) and there is NO alias:
+ * fractal_search below is the tombstone that refuses the old call and
+ * names the new name. The indexed search (fractal_search over a TABLE)
+ * is a stored PROCEDURE -- a MariaDB UDF cannot read a table -- see
+ * sql/install_udf.sql. */
+X(fractal_sfs_converge, STR, r)
+X(fractal_sfs_converge_debug, STR, r)
 X(fractal_search, STR, r)
 X(fractal_search_explore, STR, r)
-X(fractal_search_debug, STR, r)
 /* Dimension, analytics, and informational */
 X(fractal_version, STR, r)
 X(fractal_edition, STR, r)
@@ -35,6 +43,7 @@ X(fractal_dimension_boxcount, REAL, r)
 X(fractal_dimension_drift, STR, r)
 X(fractal_change_point_detect, STR, r)
 X(fractal_periodogram, STR, r)
+X(fractal_chunk_text, STR, r)
 X(fractal_spectrogram_entropy, STR, r)
 X(fractal_state_fingerprint, STR, r)
 X(fractal_cycle_detect, STR, r)
@@ -70,6 +79,13 @@ X(fractal_vector_hamming_distance, INT, r)
 /* Cognition */
 X(fractal_reason, STR, e)
 X(fractal_embed, STR, e)
+/* IVF index plumbing. The maths lives in the DAEMON (this host is
+ * split-process); the table I/O lives in the stored procedures
+ * fractal_index_create / _rebuild / _drop / _info and the indexed
+ * fractal_search (sql/install_udf.sql). This one stateful UDF is the
+ * whole plumbing protocol: a JSON request in, a JSON response out.
+ * It is 's' (stateful) because it mutates the daemon's index state. */
+X(fractal_index_op, STR, s)
 /* Text-to-SQL */
 X(fractal_t2s_config, STR, r)
 X(fractal_t2s_generate, STR, e)

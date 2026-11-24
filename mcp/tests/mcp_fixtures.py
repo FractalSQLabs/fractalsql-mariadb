@@ -25,7 +25,7 @@ _B = [0.0, 1.0, 0.0]
 _TBL = {"table_name": "mcp_sm_docs", "vector_col": "emb"}
 
 FIXTURE_CALLS = [
-    ("fractal_search_debug", {"query": _Q, "iterations": 5, "population_size": 8, "seed": 7, "diffusion_factor": 2}),
+    ("fractal_sfs_converge_debug", {"query": _Q, "iterations": 5, "population_size": 8, "seed": 7, "diffusion_factor": 2}),
     ("fractal_search_explore", {"corpus": [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7], "query": [0, 0],
                                 "params": {"population_size": 4, "iterations": 3}}),
     ("fractal_search_trajectory", {**_TBL, "baseline_vector": _Q, "current_vector": _B, "k": 3, "limit": 5}),
@@ -71,7 +71,7 @@ FIXTURE_CALLS = [
     ("fractal_search_agent", {"query": "alpha", "table_name": "mcp_sm_docs", "vector_col": "emb", "iterations": 5,
                               "pop_size": 8}),
     ("fractal_rag_agent", {"query": "alpha", "table_name": "mcp_sm_docs", "vector_col": "emb",
-                           "meta_filter": "title LIKE 'a%'"}),
+                           "meta_filter": "{}"}),
     ("fractal_sql_agent", {"question": "list all titles in mcp_sm_docs", "table_names": ["mcp_sm_docs"],
                            "auto_execute": False, "max_retries": 1}),
     ("fractal_sql_agent", {"question": "list all titles in mcp_sm_docs", "table_names": ["mcp_sm_docs"],
@@ -85,6 +85,7 @@ FIXTURE_CALLS = [
     ("fractal_dimension_boxcount", {"dim": 2, "points": _SQUARE}),
     ("fractal_change_point_detect", {"series": _SERIES, "window": 8, "threshold": 2.0, "max_points": 8}),
     ("fractal_periodogram", {"series": _SERIES, "max_peaks": 4}),
+    ("fractal_chunk_text", {"text": "One. Two sentences! Is this three?", "chunk_size": 20, "chunk_overlap": 0, "chunk_mode": "sentence"}),
     ("fractal_tda_persistence_diagram", {"points": _SQUARE, "dim": 2, "max_dim": 1, "max_h0_bars": 8,
                                          "max_thresh": 2.0}),
     ("fractal_state_fingerprint", {"vector": _Q, "n_bits": 64, "seed": 42}),

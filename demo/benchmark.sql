@@ -30,11 +30,11 @@ BEGIN
     SELECT JSON_ARRAYAGG(RAND()*2-1) INTO query_json FROM (
         WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < dim) SELECT n FROM seq
     ) s;
-    -- fractal_search is 4-arg here (corpus, query, k, params);
+    -- fractal_sfs_converge is 4-arg here (corpus, query, k, params);
     -- corpus='' (empty corpus) + k=1 runs Sniper mode with no real
     -- corpus, same as demo.sql Section 2.
-    SET best_json = fractal_search('', query_json, 1, JSON_OBJECT('iterations', 50, 'population_size', 50));
-    -- fractal_search's result is the canonical {"dim":...,"best_point":
+    SET best_json = fractal_sfs_converge('', query_json, 1, JSON_OBJECT('iterations', 50, 'population_size', 50));
+    -- fractal_sfs_converge's result is the canonical {"dim":...,"best_point":
     -- [...],...} object (sql/install_udf.sql), not a bare array -- pull
     -- best_point out via $.best_point[*], not $[*].
     SELECT dim AS dim,

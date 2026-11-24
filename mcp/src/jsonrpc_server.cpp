@@ -393,8 +393,11 @@ namespace fsqlmcp
         bool inFlight = false;
         {
             std::lock_guard<std::mutex> lk( inflightMu_ );
-            cancelledIds_.insert( requestId );
             inFlight = inflightIds_.count( requestId ) != 0;
+            // An id in flight is always remembered; one that is not (a cancel racing a finished call, or never issued) only
+            // while the set is small: the completion path is the one place an entry is erased, so an unbounded set would
+            // grow for the life of the process.
+            if( inFlight || cancelledIds_.size() < 1024 ) cancelledIds_.insert( requestId );
         }
         // Race-safe by construction: a cancel racing an already-finished call
         // still records the id (the post-handler check in handleToolsCall
@@ -404,7 +407,7 @@ namespace fsqlmcp
         // db.cpp's killQuery; never the busy connection itself).
         if( inFlight && cfg_.cancelHook )
             cfg_.cancelHook();
-        logging::logInfo( "cancel propagated for request " + requestId );
+        logging::logInfo( "cancel propagated for request " + requestId.substr( 0, 64 ) );
     }
 
     void JsonRpcServer::beginShutdown() { shuttingDown_ = true; }

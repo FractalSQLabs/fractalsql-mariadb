@@ -12,7 +12,11 @@ packaging/debian/.debhelper/
 packaging/rpm/BUILD/
 packaging/rpm/BUILDROOT/
 mcp/dist/
-mcp/tests/
+# The MCP gate drivers (mcp/tests/mcp_smoke_client.py, mcp_https_smoke_client.py) are
+# needed by gates 39 and 40: excluding the whole directory made those gates SKIP
+# instead of run. Only the build artefacts go.
+mcp/tests/__pycache__/
+mcp/tests/*.exe
 mcp/**/*.o
 mcp/fractalsql-mariadb-mcp
 mcp/**/*.gcda

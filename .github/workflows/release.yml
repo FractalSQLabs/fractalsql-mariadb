@@ -24,7 +24,7 @@ jobs:
   # arch covers the whole supported range, no per-major fan-in.
   #
   # Both arches get a native smoke test inside real mariadb:11.4 AND
-  # mariadb:12.3 containers (edition + version + fractal_search
+  # mariadb:12.3 containers (edition + version + fractal_sfs_converge
   # cosine-similarity convergence), the same .so in, both containers
   # out, which is the actual cross-major-ABI proof. The arm64 cell
   # runs on GitHub's native ubuntu-24.04-arm runner, so its Docker
@@ -61,9 +61,9 @@ jobs:
         run: |
           chmod +x build.sh
           ./build.sh ${{ matrix.arch }}
-          ls -l dist/${{ matrix.arch }}/fractalsql.so dist/${{ matrix.arch }}/fractalsqld
+          ls -l dist/${{ matrix.arch }}/fractalsql.so dist/${{ matrix.arch }}/fractalsqld dist/${{ matrix.arch }}/fractalsql-mariadb-mcp
 
-      - name: Smoke test (edition/version + fractal_search convergence)
+      - name: Smoke test (edition/version + fractal_sfs_converge convergence)
         run: |
           set -euo pipefail
           SO="dist/${{ matrix.arch }}/fractalsql.so"
@@ -191,7 +191,7 @@ jobs:
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "2.0.13"
+              test "${VERSION}" = "2.0.14"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -203,7 +203,7 @@ jobs:
               # should be essentially 1. ||query||^2 = 0.6^2+0.8^2 = 1,
               # so cos_sim simplifies to (v . query) / ||v||.
               RESULT=$(docker exec "${M}" ${MC} -N -B -e "
-                  SET @r = fractal_search('', '0.6,0.8', 1,
+                  SET @r = fractal_sfs_converge('', '0.6,0.8', 1,
                                           '{\"iterations\":100,\"population_size\":50}');
                   SELECT CASE
                       WHEN SQRT(v1*v1 + v2*v2) > 1e-9
@@ -223,13 +223,17 @@ jobs:
           done
           rm -f "${KEY_FILE}"
 
-      - name: Upload shim + daemon artifact
+      # The MCP server is built by build.sh next to the shim and the daemon and must travel with them: the
+      # packaging job below only sees what this artifact carries (it once left the MCP binary out, and the
+      # packages were built without it, silently).
+      - name: Upload shim + daemon + MCP server artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}-bin
           path: |
             dist/${{ matrix.arch }}/fractalsql.so
             dist/${{ matrix.arch }}/fractalsqld
+            dist/${{ matrix.arch }}/fractalsql-mariadb-mcp
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -253,7 +257,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - name: Download fractalsql.so + fractalsqld
+      - name: Download fractalsql.so + fractalsqld + the MCP server
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: fractalsql-mariadb-${{ matrix.arch }}-bin
@@ -268,7 +272,8 @@ jobs:
       - name: Build .deb and .rpm for ${{ matrix.arch }}
         run: |
           chmod +x scripts/package.sh
-          scripts/package.sh ${{ matrix.arch }}
+          # FSQL_REQUIRE_MCP=1: a release package without the MCP server is an error, not a warning.
+          FSQL_REQUIRE_MCP=1 scripts/package.sh ${{ matrix.arch }}
           ls -l dist/packages
 
       - name: Verify packages declare no luajit dependency
@@ -318,6 +323,29 @@ jobs:
               echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/LICENSE-Apache-2.0$'
               echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/LICENSE-GPL-2.0-only$'
               echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/LICENSE-THIRD-PARTY$'
+          done
+
+      # The MCP server is a separate Apache-2.0 process shipped in these packages: the binary and its two lock
+      # files (which the server looks for beside its own executable) must all be there.
+      - name: Verify packages ship the MCP server
+        run: |
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              CONTENTS=$(dpkg-deb -c "${deb}")
+              echo "${CONTENTS}" | grep -E 'usr/bin/fractalsql-mariadb-mcp$'
+              echo "${CONTENTS}" | grep -E 'usr/bin/\.mcp-schema-lock$'
+              echo "${CONTENTS}" | grep -E 'usr/bin/\.mcp-safety-annotations-lock$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mariadb/mcp/manifest\.json$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mariadb/mcp/RUN\.txt$'
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              CONTENTS=$(rpm -qlp "${rpm}")
+              echo "${CONTENTS}" | grep -E '/usr/bin/fractalsql-mariadb-mcp$'
+              echo "${CONTENTS}" | grep -E '/usr/bin/\.mcp-schema-lock$'
+              echo "${CONTENTS}" | grep -E '/usr/bin/\.mcp-safety-annotations-lock$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mariadb/mcp/RUN\.txt$'
           done
 
       - name: Verify plugin .so lands at the right per-distro path
@@ -395,12 +423,11 @@ jobs:
   # community-sovereign-c.a into the daemon, the same vendored core
   # archive the Linux build links.
   #
-  # Both cells run on macos-15, since GitHub retired the free macos-13 and macos-14
-  # (Intel) runner in Dec 2025, so amd64 is a cross-compile
-  # (`-arch x86_64`, via FSQ_ARCH_FLAGS) on the arm64 runner rather
-  # than a native build. The vendored core archive is a real per-arch
-  # static lib (not a host binary), so cross-linking it from either
-  # runner arch just works.
+  # Each architecture is built natively on its own runner: macos-15 (Apple Silicon) for arm64 and macos-15-intel
+  # for x86_64. macos-15-intel is GitHub's last Intel image (available until August 2027, per
+  # actions/runner-images#13045); when it goes, so does the Intel macOS package. Native builds mean each leg uses
+  # its own Homebrew (/opt/homebrew or /usr/local) for Connector/C and OpenSSL, so the MCP server links them
+  # dynamically on both. The vendored core archive is a real per-arch static lib, linked into the daemon.
   #
   # `brew install mariadb-connector-c` supplies mysql.h (UDF headers)
   # only, no client library is linked. plugin_dir varies across
@@ -419,9 +446,11 @@ jobs:
         include:
           - arch: x86_64
             platform_tag: osx_amd64
+            runner: macos-15-intel
           - arch: arm64
             platform_tag: osx_arm64
-    runs-on: macos-15
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -442,38 +471,6 @@ jobs:
           # 'libmariadb' not found". Point pkg-config at the keg.
           echo "PKG_CONFIG_PATH=$(brew --prefix mariadb-connector-c)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      # The macos-15 runner is arm64, so arm-Homebrew's openssl@3 keg
-      # contains only arm64 objects; linking them into an -arch x86_64
-      # build makes ld discard every member ("found architecture
-      # 'arm64', required architecture 'x86_64'") and all EVP symbols
-      # go undefined. Homebrew also no longer ships x86_64 bottles
-      # (Intel support discontinued -- a Rosetta brew install compiles
-      # from source under emulation, ~20 minutes, on a platform Apple,
-      # GitHub and Homebrew are all sunsetting). Cross-compile an
-      # x86_64 libcrypto natively instead: clang -arch x86_64 emits
-      # x86_64 objects at full speed on the arm64 host, no Rosetta
-      # needed, since only the archive is linked and its binaries are
-      # never run.
-      - name: Cross-build x86_64 libcrypto from source
-        if: matrix.arch == 'x86_64'
-        run: |
-          set -euo pipefail
-          curl -fsSLO --proto '=https' https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
-          echo "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2  openssl-3.5.8.tar.gz" | shasum -a 256 -c -
-          tar xf openssl-3.5.8.tar.gz
-          cd openssl-3.5.8
-          ./Configure darwin64-x86_64 no-shared no-tests \
-              --prefix=/tmp/openssl-x64 \
-              -mmacosx-version-min=11.0 -fPIC
-          # opensslv.h and friends are generated at build time, not
-          # shipped in the tarball. Serially force the header-generation
-          # step first: kicking straight into a parallel libcrypto.a
-          # build races it, and the first .o compiles fail with
-          # "fatal error: 'openssl/opensslv.h' file not found".
-          make -j1 -s build_generated
-          make -j"$(sysctl -n hw.ncpu)" -s libcrypto.a
-          make -s install_sw
-
       - name: Verify vendored core archive is present
         run: |
           set -euo pipefail
@@ -487,14 +484,8 @@ jobs:
       - name: Build fractalsql.so (shim) and fractalsqld (daemon)
         run: |
           set -euo pipefail
-          # The tree must match the -arch being built: x86_64 uses the
-          # cross-compiled tree (see the step above), arm64 uses the
-          # runner's own arm-Homebrew keg.
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              OPENSSL_DIR="/tmp/openssl-x64"
-          else
-              OPENSSL_DIR="$(brew --prefix openssl@3)"
-          fi
+          # Native on both runners, so the runner's own Homebrew keg has the right architecture.
+          OPENSSL_DIR="$(brew --prefix openssl@3)"
           MDB_CFLAGS="$(pkg-config --cflags libmariadb)"
           echo "MDB_CFLAGS: ${MDB_CFLAGS}"
           echo "OPENSSL_DIR: ${OPENSSL_DIR}"
@@ -511,24 +502,32 @@ jobs:
           cp service/build/fractalsqld "${OUT_DIR}/fractalsqld"
           ls -l "${OUT_DIR}/fractalsql.so" "${OUT_DIR}/fractalsqld"
 
-      # The MCP server for both architectures, from this one runner. MariaDB Connector/C and OpenSSL are linked
-      # statically and built for the target architecture (scripts/macos/build-mcp.sh), because Homebrew has the
-      # host architecture only; the Intel binary uses the x86_64 OpenSSL tree built above.
+      # The MCP server (scripts/macos/build-mcp.sh), built natively on each runner. It links the runner's Homebrew
+      # mariadb-connector-c and openssl@3 dynamically, so Homebrew patches both and they need to be installed at run
+      # time. Nothing from either library is shipped in the zip.
       - name: Build fractalsql-mariadb-mcp
         run: |
           set -euo pipefail
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              OPENSSL_DIR="/tmp/openssl-x64"
-          else
-              OPENSSL_DIR="$(brew --prefix openssl@3)"
-          fi
+          OPENSSL_DIR="$(brew --prefix openssl@3)"
           bash scripts/macos/build-mcp.sh "${{ matrix.arch }}" "${OPENSSL_DIR}" "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp"
-          # The Intel binary can only run here under Rosetta, which may be absent; the native one always runs.
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-              "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --version
-              "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --list-tools | head -3
-          else
-              "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --version || echo "note: the x86_64 binary could not run on this arm64 runner"
+          # Each binary runs natively on its own runner.
+          "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --version
+          "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" --list-tools | head -3
+
+      # The daemon links Homebrew's openssl@3 libcrypto dynamically (Homebrew patches it; none of it is shipped), needs
+      # nothing else outside the system, and the shim (which runs inside mariadbd) links no OpenSSL at all.
+      - name: The daemon links openssl@3 dynamically
+        run: |
+          set -euo pipefail
+          D="dist/${{ matrix.platform_tag }}/fractalsqld"
+          LIBS="$(otool -L "${D}" | tail -n +2 | awk '{print $1}')"
+          echo "${LIBS}"
+          echo "${LIBS}" | grep -q 'openssl@3/lib/libcrypto' || { echo "FAIL: libcrypto is not linked dynamically" >&2; exit 1; }
+          if echo "${LIBS}" | grep -v -E '^(/usr/lib/|/System/Library/|.*/opt/openssl@3/lib/libcrypto)' | grep -q .; then
+              echo "FAIL: fractalsqld depends on a library other than openssl@3 and the system's own" >&2; exit 1
+          fi
+          if otool -L "dist/${{ matrix.platform_tag }}/fractalsql.so" | grep -q -i 'libcrypto\|libssl'; then
+              echo "FAIL: the shim must not link OpenSSL" >&2; exit 1
           fi
 
       - name: Posture checks (otool, size, exports)
@@ -574,7 +573,7 @@ jobs:
           # Covers every UDF currently in sql/install_udf.sql. Extend
           # this list whenever sql/install_udf.sql adds a new
           # CREATE FUNCTION entry.
-          for sym in _fractal_search _fractal_search_init _fractal_search_deinit \
+          for sym in _fractal_search _fractal_sfs_converge_init _fractal_sfs_converge_deinit \
                      _fractal_search_explore _fractal_search_explore_init _fractal_search_explore_deinit \
                      _fractal_edition _fractal_edition_init _fractal_edition_deinit \
                      _fractal_version _fractal_version_init _fractal_version_deinit \
@@ -650,6 +649,11 @@ jobs:
           install -m 0644 "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so.sig" "${STAGE}/"
           install -m 0644 packaging/launchd/com.fractalsqlabs.fractalsqld.plist "${STAGE}/"
           cp LICENSE "${STAGE}/"
+          # fractalsql.dylib is GPL-2.0-only: the GPL text and the written source offer travel with it, as they do in
+          # the deb, the rpm and the MSI. NOTICE carries the attribution for the Apache-2.0 components.
+          cp LICENSES/GPL-2.0-only.txt "${STAGE}/LICENSE-GPL-2.0-only"
+          cp GPL-SOURCE-OFFER.txt "${STAGE}/GPL-SOURCE-OFFER.txt"
+          cp NOTICE "${STAGE}/NOTICE"
           cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
           cp sql/install_udf.sql "${STAGE}/install_udf.sql"
           cp sql/install_agents.sql "${STAGE}/install_agents.sql"
@@ -658,11 +662,11 @@ jobs:
           if [ -f "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" ]; then
               install -d "${STAGE}/mcp"
               install -m 0755 "dist/${{ matrix.platform_tag }}/fractalsql-mariadb-mcp" "${STAGE}/mcp/fractalsql-mariadb-mcp"
-              install -m 0644 mcp/.mcp-schema-lock mcp/.mcp-safety-annotations-lock mcp/README.md mcp/manifest.json "${STAGE}/mcp/"
+              install -m 0644 mcp/.mcp-schema-lock mcp/.mcp-safety-annotations-lock mcp/README.md mcp/RUN.txt mcp/manifest.json "${STAGE}/mcp/"
           fi
           install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
           cat > "${STAGE}/README.txt" <<EOF
-          fractalsql-mariadb 2.0.13 Community (${{ matrix.platform_tag }})
+          fractalsql-mariadb 2.0.14 Community (${{ matrix.platform_tag }})
 
           Unsigned, for macOS. Compatible with MariaDB 10.6 / 10.11 /
           11.4 LTS / 12.3 LTS via Homebrew.
@@ -721,6 +725,13 @@ jobs:
                  mariadb -uroot -p mydb < install_udf.sql
                  mariadb -uroot -p mydb < install_agents.sql
                  mariadb -uroot -p -e "SELECT fractal_edition(), fractal_version();"
+
+          The MCP server (mcp/fractalsql-mariadb-mcp) is optional and separate from the steps above:
+              xattr -d com.apple.quarantine mcp/fractalsql-mariadb-mcp      # unsigned release
+              mcp/fractalsql-mariadb-mcp --list-tools
+          It uses Homebrew's mariadb-connector-c and openssl@3 (brew install mariadb-connector-c openssl@3);
+          The module and the daemon above do not need either. How to start the server: mcp/RUN.txt.
+          All settings: mcp/README.md.
           EOF
           ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
           rm -rf "${STAGE}"
@@ -893,7 +904,10 @@ jobs:
           dir "%OUT_DIR%\fractalsql.dll"
 
       # The MCP server ships in the same MSI, in its own folder under the MariaDB root, with its two
-      # lock files beside the executable (that is where the server looks for them).
+      # lock files beside the executable (that is where the server looks for them). The build output
+      # tree also stages libmariadb.dll beside the exe: a dev/test fixture, like libmariadb3 being
+      # installed on the machine -- the MSI itself does not carry it (Connector/C is an install
+      # prerequisite there, resolved by the shipped fractalsql-mcp.cmd).
       - name: Build fractalsql-mariadb-mcp.exe
         shell: cmd
         env:
@@ -950,7 +964,7 @@ jobs:
           # CREATE FUNCTION entry; matches the macOS posture check's
           # list above.
           foreach ($sym in @(
-                'fractal_search','fractal_search_init','fractal_search_deinit',
+                'fractal_sfs_converge','fractal_sfs_converge_init','fractal_sfs_converge_deinit',
                 'fractal_search_explore','fractal_search_explore_init','fractal_search_explore_deinit',
                 'fractal_edition','fractal_edition_init','fractal_edition_deinit',
                 'fractal_version','fractal_version_init','fractal_version_deinit',

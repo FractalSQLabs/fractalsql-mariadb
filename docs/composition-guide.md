@@ -52,7 +52,7 @@ here is the pick-list.
 
 | Block | Role | Use it when… |
 |---|---|---|
-| `fractal_search` | Sniper-mode convergence over an inline corpus | You need the single best point, or a refinement pass over a task vector |
+| `fractal_sfs_converge` | Sniper-mode convergence over an inline corpus | You need the single best point, or a refinement pass over a task vector |
 | `fractal_search_explore` | Scout-mode diverse population, inline corpus | You need a *spread* of results, not one answer |
 | `fractal_search_telemetry` (procedure) | Real top-k rows from a table | You have a real table and want ground-truth nearest matches |
 | `fractal_hybrid_clinical_search` (procedure) | Cohort-restricted top-k | You need a metadata-filtered search, not the whole table |
@@ -63,7 +63,7 @@ here is the pick-list.
 | `fractal_sql_agent` (procedure) | NL → SQL with self-correction, `auto_execute` optional | You need structured answers from tables, not vector prose |
 | `fractal_agent_trajectory_predict` (procedure) | Baseline→current drift prediction against a table's own latest row | You need "where is this heading next," not just "how far has it drifted" |
 | `fractal_search_agent` (procedure) | Embed → search a table → reason over matched rows' content | You want a full retrieval+answer pipeline in one call, with source ids and timing back |
-| `fractal_rag_agent` (procedure) | Same pipeline, answer-only | You just want the answer text, no extra bookkeeping |
+| `fractal_rag_agent` (procedure) | Same pipeline, `{answer, source_row_ids, used_index, context_cut}`, with a `meta_filter` to limit the rows searched | You want a one-call answer from one document or tenant (chunk a long text with the vectorizer's `chunk_size`: see [vectorizer-setup.md](vectorizer-setup.md)) |
 | `fractal_agent_plan_explore` (procedure) | Embed → search a strategy table for diverse candidate branches | You need several distinct next-step options scored, not one |
 | `fractal_agent_detect_loop` (procedure) | DFA + short-period check on a state-hash log | You need a standalone loop/cycle guard outside a specific recipe |
 

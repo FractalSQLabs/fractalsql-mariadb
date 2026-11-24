@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Daniel Gardiner d/b/a FractalSQLabs
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -368,7 +369,7 @@ static int runHttpMode( JsonRpcServer& server, const CliArgs& args, const Engine
     }
 }
 
-int main( int argc, char** argv )
+static int runMain( int argc, char** argv )
 {
     const EngineConfig ecfg = EngineConfig::fromEnv();
 
@@ -473,4 +474,24 @@ int main( int argc, char** argv )
     StdioConfig stdioCfg;
     stdioCfg.shutdownDrainMs = envIntOr( "FSQL_MCP_SHUTDOWN_DRAIN_MS", 5000 );
     return runStdioTransport( server, stdioCfg );
+}
+
+// Nothing may escape main: an uncaught exception ends the process with std::terminate, which prints no line of ours and
+// leaves the supervisor an abort with no reason. Say what happened and exit with the error status instead.
+int main( int argc, char** argv )
+{
+    try
+    {
+        return runMain( argc, argv );
+    }
+    catch( const std::exception& e )
+    {
+        std::cerr << "fatal: unhandled exception: " << e.what() << "\n";
+        return 1;
+    }
+    catch( ... )
+    {
+        std::cerr << "fatal: unhandled exception of an unknown type\n";
+        return 1;
+    }
 }

@@ -6,7 +6,7 @@ name: Install test (packaging)
 # repo happens to carry. Builds the artifacts, installs them into a
 # clean per-major MariaDB (via the MariaDB Foundation's own repo setup
 # script, which auto-detects apt vs. yum), loads the UDFs, exercises
-# fractal_search and
+# fractal_sfs_converge and
 # its params-bounds caps, then a reasoning round-trip against a
 # mock OpenAI-compatible endpoint (one gated major per family, so the
 # same fixed-reply mock is never run N times redundantly). Also covers a
@@ -193,16 +193,16 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.13"
+          test "\$VERSION" = "2.0.14"
 
-          # End-to-end fractal_search smoke. Trivial 4-row corpus, query
+          # End-to-end fractal_sfs_converge smoke. Trivial 4-row corpus, query
           # equals row 0; expect a JSON document with dim/n_corpus/top_k.
-          RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
-          echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
+          RESULT=\$(mariadb -N -B -e "SELECT fractal_sfs_converge('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_sfs_converge result (first 200 chars): \${RESULT:0:200}"
           echo "\$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
           echo "\$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
           echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
-          echo "ok: fractal_search returned canonical JSON"
+          echo "ok: fractal_sfs_converge returned canonical JSON"
 
           # Params caps match the documented bounds (iterations<=10000,
           # pop_size<=100000, diff_factor<=32). Verify each just-over-cap
@@ -214,7 +214,7 @@ jobs:
               # A UDF that sets *error surfaces as a NULL result with a
               # zero client exit, not as a non-zero exit, so "empty or
               # NULL" is the rejection signal here.
-              OUT=\$(mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
+              OUT=\$(mariadb -N -B -e "SELECT fractal_sfs_converge('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
               if [ -n "\$OUT" ] && [ "\$OUT" != "NULL" ]; then
                   echo "FAIL: expected rejection on params=\$over_params, got \$OUT"; exit 1
               fi
@@ -225,16 +225,31 @@ jobs:
           # --- The MCP server ships in the package: installed, runs, and answers a tool call against the live server ---
           test -x /usr/bin/fractalsql-mariadb-mcp
           fractalsql-mariadb-mcp --version
-          test "\$(fractalsql-mariadb-mcp --list-tools | wc -l)" -ge 80
-          test -f /usr/share/doc/fractalsql-mariadb/mcp/manifest.json
+          TOOLS=\$(fractalsql-mariadb-mcp --list-tools 2>/tmp/mcp-list.err | wc -l) || TOOLS=0
+          test "\$TOOLS" -ge 80 \\
+              || { echo "FAIL: the packaged MCP server listed \$TOOLS tools (at least 80 expected)";
+                   cat /tmp/mcp-list.err 2>/dev/null || true; exit 1; }
+          test -f /usr/share/doc/fractalsql-mariadb/mcp/manifest.json \\
+              || { echo "FAIL: the package's MCP manifest is missing from /usr/share/doc/fractalsql-mariadb/mcp/"; exit 1; }
           test -f /usr/bin/.mcp-schema-lock && test -f /usr/bin/.mcp-safety-annotations-lock
           mariadb -e "CREATE USER 'mcpci'@'127.0.0.1' IDENTIFIED BY 'mcpci'; GRANT ALL ON *.* TO 'mcpci'@'127.0.0.1'"
+          # grep has no -q on purpose: -q exits on the first match and SIGPIPE-kills the
+          # producer mid-stream; under pipefail the pipeline then fails with 141 even when
+          # the call answered (the Rocky install jobs died on exactly this race).
+          # The server's own stderr goes to a file rather than /dev/null: a
+          # startup refusal (a missing lock file, a database it cannot
+          # reach) is the reason a call goes unanswered, and this is the only
+          # place that says which -- without it the step dies silently.
           (printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
               '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractal_version","arguments":{}}}'; sleep 3) \
-              | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci timeout 30 fractalsql-mariadb-mcp 2>/dev/null \
-              | grep -q '"isError":false'
+              | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci timeout 30 fractalsql-mariadb-mcp 2>/tmp/mcp-deb.err \
+              | tee /tmp/mcp-deb.out | grep '"isError":false' >/dev/null \
+              || { echo "FAIL: the packaged MCP server did not answer the live tool call";
+                   echo "--- server stdout:"; cat /tmp/mcp-deb.out 2>/dev/null || true;
+                   echo "--- server stderr:"; cat /tmp/mcp-deb.err 2>/dev/null || true;
+                   exit 1; }
           echo "ok: Debian MCP server installed + answered a live tool call (mdb\${MDB_VER})"
 
           # --- Reasoning + text-to-sql round-trip against a mock LLM --
@@ -449,7 +464,14 @@ jobs:
           done
           mariadb-admin ping
 
-          dnf install -qy ./dist/packages/fractalsql-mariadb-amd64.rpm
+          # --setopt=tsflags= : RHEL's dnf defaults to tsflags=nodocs, which
+          # skips every %doc-flagged file in the transaction -- and this
+          # package's /usr/share/doc files (the MCP manifest, README and RUN
+          # notes the install check below looks for) are doc-flagged. On a
+          # normal host they are installed; the Debian job above already
+          # removes the equivalent dpkg excludes for the same reason. An
+          # empty tsflags installs the package the way a normal host does.
+          dnf install -qy --setopt=tsflags= ./dist/packages/fractalsql-mariadb-amd64.rpm
 
           # postinst.sh (fpm's --after-install, shared with the .deb)
           # just added mysql to the fractalsql group so mariadbd can
@@ -507,14 +529,14 @@ jobs:
           VERSION=\$(mariadb -N -B -e "SELECT fractal_version()" | tr -d '\r')
           echo "edition=\$EDITION version=\$VERSION"
           test "\$EDITION" = "Community"
-          test "\$VERSION" = "2.0.13"
+          test "\$VERSION" = "2.0.14"
 
-          RESULT=\$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
-          echo "fractal_search result (first 200 chars): \${RESULT:0:200}"
+          RESULT=\$(mariadb -N -B -e "SELECT fractal_sfs_converge('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_sfs_converge result (first 200 chars): \${RESULT:0:200}"
           echo "\$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
           echo "\$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
           echo "\$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
-          echo "ok: fractal_search returned canonical JSON"
+          echo "ok: fractal_sfs_converge returned canonical JSON"
 
           for over_params in \
               '{"iterations":10001}' \
@@ -523,7 +545,7 @@ jobs:
               # A UDF that sets *error surfaces as a NULL result with a
               # zero client exit, not as a non-zero exit, so "empty or
               # NULL" is the rejection signal here.
-              OUT=\$(mariadb -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
+              OUT=\$(mariadb -N -B -e "SELECT fractal_sfs_converge('1,0;0,1', '1,0', 1, '\$over_params')" 2>/dev/null || true)
               if [ -n "\$OUT" ] && [ "\$OUT" != "NULL" ]; then
                   echo "FAIL: expected rejection on params=\$over_params, got \$OUT"; exit 1
               fi
@@ -534,16 +556,31 @@ jobs:
           # --- The MCP server ships in the package: installed, runs, and answers a tool call against the live server ---
           test -x /usr/bin/fractalsql-mariadb-mcp
           fractalsql-mariadb-mcp --version
-          test "\$(fractalsql-mariadb-mcp --list-tools | wc -l)" -ge 80
-          test -f /usr/share/doc/fractalsql-mariadb/mcp/manifest.json
+          TOOLS=\$(fractalsql-mariadb-mcp --list-tools 2>/tmp/mcp-list.err | wc -l) || TOOLS=0
+          test "\$TOOLS" -ge 80 \\
+              || { echo "FAIL: the packaged MCP server listed \$TOOLS tools (at least 80 expected)";
+                   cat /tmp/mcp-list.err 2>/dev/null || true; exit 1; }
+          test -f /usr/share/doc/fractalsql-mariadb/mcp/manifest.json \\
+              || { echo "FAIL: the package's MCP manifest is missing from /usr/share/doc/fractalsql-mariadb/mcp/"; exit 1; }
           test -f /usr/bin/.mcp-schema-lock && test -f /usr/bin/.mcp-safety-annotations-lock
           mariadb -e "CREATE USER 'mcpci'@'127.0.0.1' IDENTIFIED BY 'mcpci'; GRANT ALL ON *.* TO 'mcpci'@'127.0.0.1'"
+          # no -q on the grep: -q exits on the first match and SIGPIPE-kills the MCP
+          # mid-stream; under pipefail the pipeline then fails with 141 even when the
+          # call answered (the Rocky install jobs died on exactly this race).
+          # The server's own stderr goes to a file rather than /dev/null: a
+          # startup refusal (a missing lock file, a database it cannot
+          # reach) is the reason a call goes unanswered, and this is the only
+          # place that says which -- without it the step dies silently.
           (printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
               '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractal_version","arguments":{}}}'; sleep 3) \
-              | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci timeout 30 fractalsql-mariadb-mcp 2>/dev/null \
-              | grep -q '"isError":false'
+              | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci timeout 30 fractalsql-mariadb-mcp 2>/tmp/mcp-rpm.err \
+              | tee /tmp/mcp-rpm.out | grep '"isError":false' >/dev/null \
+              || { echo "FAIL: the packaged MCP server did not answer the live tool call";
+                   echo "--- server stdout:"; cat /tmp/mcp-rpm.out 2>/dev/null || true;
+                   echo "--- server stderr:"; cat /tmp/mcp-rpm.err 2>/dev/null || true;
+                   exit 1; }
           echo "ok: RPM MCP server installed + answered a live tool call (mdb\${MDB_VER})"
 
           if [ "\${MDB_VER}" = "11.4" ]; then
@@ -630,11 +667,11 @@ jobs:
           VERSION=$(mariadb -N -B -e "SELECT fractal_version();")
           echo "edition=${EDITION} version=${VERSION}"
           test "${EDITION}" = "Community"
-          test "${VERSION}" = "2.0.13"
+          test "${VERSION}" = "2.0.14"
 
-          RESULT=$(mariadb -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
+          RESULT=$(mariadb -N -B -e "SELECT fractal_sfs_converge('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
           echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
-          echo "ok: macOS build + install + fractal_search"
+          echo "ok: macOS build + install + fractal_sfs_converge"
 
       # The MCP server, built the way the release zip builds it (scripts/macos/build-mcp.sh), staged as the zip
       # lays it out (binary and lock files side by side) and run from a different directory, so the lock lookup
@@ -649,12 +686,13 @@ jobs:
           ./fractalsql-mariadb-mcp --version
           test "$(./fractalsql-mariadb-mcp --list-tools | wc -l)" -ge 80
           mariadb -e "CREATE USER IF NOT EXISTS 'mcpci'@'127.0.0.1' IDENTIFIED BY 'mcpci'; GRANT ALL ON *.* TO 'mcpci'@'127.0.0.1'"
+          # no -q: the SIGPIPE race (see the Rocky block)
           (printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}' \
               '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
               '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fractal_version","arguments":{}}}'; sleep 3) \
               | MARIADB_HOST=127.0.0.1 MARIADB_USER=mcpci MARIADB_PASSWORD=mcpci "${STAGE}/fractalsql-mariadb-mcp" 2>/tmp/mcp.err \
-              | grep -q '"isError":false' || { echo "FAIL: no successful tool call"; cat /tmp/mcp.err; exit 1; }
+              | grep '"isError":false' >/dev/null || { echo "FAIL: no successful tool call"; cat /tmp/mcp.err; exit 1; }
           echo "ok: macOS MCP server built, found its locks beside the binary, answered a live tool call"
 
       - name: Reasoning round-trip against a mock endpoint
@@ -768,36 +806,32 @@ jobs:
   # automated on macOS: package detection, idempotent UDF/procedure
   # registration, and the "already registered" pause + -ForceReinstall.
   # The mock-LLM round-trip is covered by easy-install-linux instead.
+  # Intel macOS, built natively on macos-15-intel the way release.yml builds it: the MCP server links Homebrew's
+  # mariadb-connector-c and openssl@3 dynamically and needs nothing else outside the system.
   macos-mcp-intel:
-    name: macOS Intel (x86_64) MCP cross-build
-    runs-on: macos-15
+    name: macOS Intel (x86_64) MCP build
+    runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - name: Install Homebrew tooling for the cross build
-        run: brew install cmake pkg-config
+      - name: Install Homebrew libraries
+        run: brew install mariadb-connector-c pkg-config openssl@3
 
-      # Same x86_64 OpenSSL tree the release job builds (static, for the target architecture).
-      - name: Build x86_64 OpenSSL
+      - name: Build fractalsql-mariadb-mcp for x86_64
         run: |
           set -euo pipefail
-          curl -fsSLO --proto '=https' https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
-          echo "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2  openssl-3.5.8.tar.gz" | shasum -a 256 -c -
-          tar xf openssl-3.5.8.tar.gz
-          cd openssl-3.5.8
-          ./Configure darwin64-x86_64 no-shared no-tests --prefix=/tmp/openssl-x64 -mmacosx-version-min=11.0 -fPIC
-          make -j1 -s build_generated
-          make -j"$(sysctl -n hw.ncpu)" -s libcrypto.a libssl.a
-          make -s install_sw
-
-      - name: Cross-build fractalsql-mariadb-mcp for x86_64
-        run: |
-          set -euo pipefail
-          bash scripts/macos/build-mcp.sh x86_64 /tmp/openssl-x64 "${RUNNER_TEMP}/fractalsql-mariadb-mcp"
-          lipo -info "${RUNNER_TEMP}/fractalsql-mariadb-mcp"
-          # Runs only if Rosetta is present on the runner; the build and the architecture checks are the gate.
-          "${RUNNER_TEMP}/fractalsql-mariadb-mcp" --version || echo "note: x86_64 binary could not run on this arm64 runner"
+          bash scripts/macos/build-mcp.sh x86_64 "$(brew --prefix openssl@3)" "${RUNNER_TEMP}/fractalsql-mariadb-mcp"
+          B="${RUNNER_TEMP}/fractalsql-mariadb-mcp"
+          lipo -info "${B}" | tee /dev/stderr | grep -q x86_64 || { echo "FAIL: not an x86_64 binary"; exit 1; }
+          LIBS="$(otool -L "${B}" | tail -n +2 | awk '{print $1}')"
+          echo "${LIBS}"
+          echo "${LIBS}" | grep -q 'openssl@3/lib/libssl' || { echo "FAIL: libssl is not linked dynamically"; exit 1; }
+          echo "${LIBS}" | grep -q 'libmariadb' || { echo "FAIL: libmariadb is not linked dynamically"; exit 1; }
+          if echo "${LIBS}" | grep -v -E '^(/usr/lib/|/System/Library/|.*/opt/openssl@3/lib/lib(ssl|crypto)|.*/opt/mariadb-connector-c/lib/)' | grep -q .; then
+              echo "FAIL: the binary depends on a library other than openssl@3, Connector/C and the system's own"; exit 1
+          fi
+          "${B}" --version
 
   easy-install-macos:
     name: "easy_install.sh: macOS wizard, non-interactive (arm64)"
@@ -1297,7 +1331,10 @@ jobs:
           dir "%OUT_DIR%\fractalsql.dll"
 
       # The MCP server ships in the same MSI, in its own folder under the MariaDB root, with its two
-      # lock files beside the executable (that is where the server looks for them).
+      # lock files beside the executable (that is where the server looks for them). The build output
+      # tree also stages libmariadb.dll beside the exe: a dev/test fixture, like libmariadb3 being
+      # installed on the machine -- the MSI itself does not carry it (Connector/C is an install
+      # prerequisite there, resolved by the shipped fractalsql-mcp.cmd).
       - name: Build fractalsql-mariadb-mcp.exe
         shell: cmd
         env:
@@ -1333,6 +1370,24 @@ jobs:
           if errorlevel 1 exit /b 1
           dir dist\windows\*.msi
 
+      # The reasoning plugin DLL imports the VC++ runtime (VCRUNTIME140.dll), so the installer must carry the launch
+      # condition that checks for the Redistributable. If the plugin depends on a runtime DLL and the condition is
+      # gone, a clean Windows machine installs fine and the plugin then fails to load with no explanation.
+      - name: The installer guards the plugin's VC++ runtime dependency
+        shell: pwsh
+        run: |
+          $dll = 'include\windows-x86_64\fractalsql-reasoning-http.dll'
+          $txt = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+          $imports = @([regex]::Matches($txt, '(?i)(vcruntime|msvcp|vcomp|concrt)[0-9_]*\.dll') | ForEach-Object { $_.Value.ToUpper() } | Sort-Object -Unique)
+          Write-Host "VC++ runtime imports of the plugin: $($imports -join ', ')"
+          if ($imports.Count -gt 0) {
+              $wxs = Get-Content scripts\windows\fractalsql.wxs -Raw
+              if ($wxs -notmatch 'VCRUNTIME140PRESENT' -or $wxs -notmatch 'vc_redist\.x64\.exe') {
+                  Write-Host 'FATAL: the plugin needs the VC++ runtime but fractalsql.wxs has no launch condition for it'; exit 1
+              }
+          }
+          Write-Host 'ok: the installer guards the plugin runtime dependency'
+
       # Unpack the MSI the way an administrative install does (files only, no service provisioning), then run
       # the packaged MCP server from where the package put it: the lock files must sit beside the executable.
       - name: Unpack the MSI and run the packaged MCP server
@@ -1345,9 +1400,18 @@ jobs:
           $exe = Get-ChildItem $out -Recurse -Filter fractalsql-mariadb-mcp.exe | Select-Object -First 1
           if (-not $exe) { Get-ChildItem $out -Recurse | Format-Table FullName; Write-Host 'FATAL: MCP exe is not in the MSI'; exit 1 }
           $dir = $exe.DirectoryName
-          foreach ($f in 'libmariadb.dll','.mcp-schema-lock','.mcp-safety-annotations-lock','README.md','manifest.json') {
+          # The MSI does not carry libmariadb.dll: MariaDB Connector/C is an install
+          # prerequisite in the same sense libmariadb3 is a package dependency on
+          # Linux. What ships is the launcher, which resolves the installed
+          # connector at start; what must be beside the executable is everything
+          # else it reads. (The MSI carries the launcher, so its absence fails too.)
+          foreach ($f in 'fractalsql-mcp.cmd','.mcp-schema-lock','.mcp-safety-annotations-lock','README.md','RUN.txt','manifest.json') {
               if (-not (Test-Path (Join-Path $dir $f))) { Get-ChildItem $dir -Force | Format-Table Name; Write-Host "FATAL: $f missing beside the MCP server in the MSI"; exit 1 }
           }
+          if (Test-Path (Join-Path $dir 'libmariadb.dll')) { Write-Host 'FATAL: libmariadb.dll must not ship in the MSI (Connector/C is an install prerequisite)'; exit 1 }
+          # The runner's own connector (the test host equivalent of Linux's
+          # installed libmariadb3) makes the extracted exe runnable.
+          $env:PATH = "$(Get-Location)\deps\mariadb\root\lib;$env:PATH"
           Push-Location $env:RUNNER_TEMP
           & $exe.FullName --version
           if ($LASTEXITCODE -ne 0) { Write-Host 'FATAL: --version failed'; exit 1 }
@@ -1355,4 +1419,4 @@ jobs:
           Write-Host "tools: $n"
           if ($n -lt 80) { Write-Host 'FATAL: fewer than 80 tools'; exit 1 }
           Pop-Location
-          Write-Host '==> OK: MSI ships the MCP server with its libmariadb.dll and lock files; it runs from the package'
+          Write-Host '==> OK: MSI ships the MCP server and launcher; the connector is resolved from the machine; it runs from the package'

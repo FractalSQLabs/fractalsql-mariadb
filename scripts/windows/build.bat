@@ -147,6 +147,7 @@ if "%CRT_FLAG%"=="" set CRT_FLAG=/MT
         src\fractalsql_textsql.c src\fractalsql_enterprise.c ^
         src\fractalsql_interrupt.c ^
         src\fractalsql_config.c src\fractalsql_config_udf.c ^
+        src\fractalsql_index.c ^
     /link /DEBUG %LINK_EXPORTS% ^
         "%CORE_LIB%" ^
         "%OPENSSL_DIR%\lib\libcrypto.lib" ^

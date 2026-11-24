@@ -93,6 +93,7 @@
 
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,7 +183,10 @@ str_out_ensure(str_out_ctx *so, size_t need)
     char  *nb;
     if (need <= so->cap) return true;
     ncap = so->cap ? so->cap : 256;
-    while (ncap < need) ncap *= 2;
+    while (ncap < need) {
+        if (ncap > SIZE_MAX / 2) { ncap = need; break; }   /* the doubling must not wrap */
+        ncap *= 2;
+    }
     nb = realloc(so->buf, ncap);
     if (nb == NULL) return false;
     so->buf = nb; so->cap = ncap;
@@ -428,8 +432,9 @@ capture_t2s_env_fb(void)
     max_att = getenv("FRACTALSQL_TEXT_TO_SQL_MAX_ATTEMPTS");
     g_env_fb.max_attempts = 2;
     if (max_att && *max_att) {
-        int v = atoi(max_att);
-        if (v >= 1 && v <= 10) g_env_fb.max_attempts = v;
+        char *endp = NULL;
+        long  v = strtol(max_att, &endp, 10);   /* no overflow UB, unlike atoi */
+        if (endp != max_att && v >= 1 && v <= 10) g_env_fb.max_attempts = (int) v;
     }
 
     allowed = getenv("FRACTALSQL_TEXT_TO_SQL_ALLOWED_STATEMENTS");
@@ -1027,6 +1032,7 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
     bool    loaded = false;
     fsql_ctx *ctx;
     fsql_ai_response_t resp;
+    char err_copy[T2S_DETAIL_MAX + 1];
     int     rc;
     char   *s;
     (void) result;
@@ -1085,9 +1091,18 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
     rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1],
                           context_json, context_len, &resp);
+    /* The core writes its error message into the context, and the tier's
+     * context is shared by every connection that uses the tier: read the
+     * message while the tier's lock is still held, or the read races
+     * another thread's dispatch (ThreadSanitizer sees exactly that). */
+    err_copy[0] = '\0';
+    if (rc != FSQL_OK || resp.rc != 0) {
+        const char *e = fsql_last_error(ctx);
+        if (e) snprintf(err_copy, sizeof err_copy, "%s", e);
+    }
     load_unlock();
     if (rc != FSQL_OK || resp.rc != 0) {
-        const char *err = fsql_last_error(ctx);
+        const char *err = err_copy;
         char detail[T2S_DETAIL_MAX + sizeof T2S_DETAIL_MARK];
         t2s_detail_bounded(err && *err ? err : "(no detail)",
                            detail, sizeof detail);
@@ -1117,6 +1132,15 @@ fractal_t2s_generate(UDF_INIT *initid, UDF_ARGS *args, char *result,
         SFS_INIT_ERROR(errbuf,
             "fractal_t2s_generate: reasoning plugin returned a NULL summary "
             "on a success status -- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release_tier();
+        *error = 1; return NULL;
+    }
+
+    if (resp.summary_len > 0 && memchr(resp.summary, '\0', resp.summary_len) != NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_generate: reasoning plugin returned a response with an embedded NUL "
+            "-- likely a plugin bug");
         fsql_ai_response_free(&resp);
         fractal_session_release_tier();
         *error = 1; return NULL;
@@ -1205,6 +1229,7 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
     bool    loaded = false;
     fsql_ctx *ctx;
     fsql_ai_response_t resp;
+    char err_copy[T2S_DETAIL_MAX + 1];
     int     rc;
     char   *prompt;
     const char *p;
@@ -1253,9 +1278,18 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
         *error = 1; return NULL;
     }
     rc = fsql_dispatch_ai(ctx, prompt, plen, "{}", 2, &resp);
+    /* The core writes its error message into the context, and the tier's
+     * context is shared by every connection that uses the tier: read the
+     * message while the tier's lock is still held, or the read races
+     * another thread's dispatch (ThreadSanitizer sees exactly that). */
+    err_copy[0] = '\0';
+    if (rc != FSQL_OK || resp.rc != 0) {
+        const char *e = fsql_last_error(ctx);
+        if (e) snprintf(err_copy, sizeof err_copy, "%s", e);
+    }
     load_unlock();
     if (rc != FSQL_OK || resp.rc != 0) {
-        const char *err = fsql_last_error(ctx);
+        const char *err = err_copy;
         char detail[T2S_DETAIL_MAX + sizeof T2S_DETAIL_MARK];
         t2s_detail_bounded(err && *err ? err : "(no detail)",
                            detail, sizeof detail);
@@ -1294,9 +1328,13 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
     p = resp.summary;
     size_t rem = resp.summary_len;
     while (rem > 0 && isspace((unsigned char) *p)) { p++; rem--; }
+    /* The verdict is the WORD pass at the front of the answer, in any case: "Password column is missing" and
+     * "Passage of time ..." begin with the same four letters and are critiques, not a pass. A pass that is
+     * wrongly read as a critique costs a retry; a critique wrongly read as a pass lets a bad candidate through. */
     passed = (rem >= 4 &&
               tolower((unsigned char) p[0]) == 'p' && tolower((unsigned char) p[1]) == 'a' &&
-              tolower((unsigned char) p[2]) == 's' && tolower((unsigned char) p[3]) == 's');
+              tolower((unsigned char) p[2]) == 's' && tolower((unsigned char) p[3]) == 's' &&
+              (rem == 4 || !(isalnum((unsigned char) p[4]) || p[4] == '_')));
 
     if (passed) {
         fsql_ai_response_free(&resp);
@@ -1304,6 +1342,15 @@ fractal_t2s_review(UDF_INIT *initid, UDF_ARGS *args, char *result,
         free(prompt);
         *is_null = 1;
         return NULL;
+    }
+
+    if (resp.summary_len > 0 && memchr(resp.summary, '\0', resp.summary_len) != NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_t2s_review: reasoning plugin returned a response with an embedded NUL "
+            "-- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release_tier();
+        *error = 1; return NULL;
     }
 
     s = str_out_set(so, resp.summary, resp.summary_len, length);
@@ -1464,8 +1511,10 @@ t2s_count_statements(const char *sql, size_t len)
  * "DELETE"/"REPLACE"/"OTHER", or NULL if the WITH clause itself is
  * malformed (unbalanced parens / missing AS); treated as a parse
  * failure by the caller. */
+#define T2S_MAX_PAREN_DEPTH 32
+
 static const char *
-t2s_classify_leading_stmt(const char *sql, size_t len)
+t2s_classify_leading_stmt_d(const char *sql, size_t len, int depth)
 {
     t2s_scan sc = { sql, len, 0 };
     t2s_skip_ws_comments(&sc);
@@ -1496,8 +1545,25 @@ t2s_classify_leading_stmt(const char *sql, size_t len)
 
     /* A leading '(' at the top level (after any WITH-clause) is only
      * valid MariaDB grammar for a parenthesized SELECT/set-operation.
-     * DML statements cannot be parenthesized at statement level. */
-    if (sc.pos < sc.len && sc.s[sc.pos] == '(') return "SELECT";
+     * DML statements cannot be parenthesized at statement level -- so the
+     * statement INSIDE the parentheses decides, not the parenthesis: a
+     * parenthesized DML is not a SELECT, and must not be allowed
+     * through as one. Nesting is bounded: a statement nested deeper than
+     * T2S_MAX_PAREN_DEPTH is refused rather than recursed into. */
+    if (sc.pos < sc.len && sc.s[sc.pos] == '(') {
+        size_t inner_start = sc.pos + 1;
+        if (depth >= T2S_MAX_PAREN_DEPTH) return NULL;
+        if (!t2s_skip_paren_balanced(&sc)) return NULL;
+        /* sc.pos is one past the matching ')'. */
+        if (sc.pos < 1) return NULL;
+        {
+            size_t inner_len = sc.pos - 1 - inner_start;
+            const char *inner = t2s_classify_leading_stmt_d(sql + inner_start, inner_len, depth + 1);
+            if (inner == NULL) return NULL;
+            if (strcmp(inner, "SELECT") != 0) return "OTHER";
+            return "SELECT";
+        }
+    }
 
     if (t2s_match_kw(&sc, "SELECT"))  return "SELECT";
     if (t2s_match_kw(&sc, "INSERT"))  return "INSERT";
@@ -1505,6 +1571,12 @@ t2s_classify_leading_stmt(const char *sql, size_t len)
     if (t2s_match_kw(&sc, "DELETE"))  return "DELETE";
     if (t2s_match_kw(&sc, "REPLACE")) return "REPLACE";
     return "OTHER";
+}
+
+static const char *
+t2s_classify_leading_stmt(const char *sql, size_t len)
+{
+    return t2s_classify_leading_stmt_d(sql, len, 0);
 }
 
 /* Whole-statement (all depths) scan for INTO OUTFILE / INTO DUMPFILE,
@@ -1539,7 +1611,7 @@ t2s_has_into_outfile(const char *sql, size_t len)
 }
 
 /* MariaDB executes the contents of a versioned comment (slash-star-
- * bang-star) and an optimizer-hint comment (slash-star-plus) as
+ * bang-star), MariaDB's own executable comment (slash-star-M-bang) and an optimizer-hint comment (slash-star-plus) as
  * statement text, so neither is inert here the way a plain block
  * comment is. Any such comment in candidate SQL is rejected outright
  * (over-rejection is this gate's stated failure direction): splicing
@@ -1557,8 +1629,13 @@ t2s_has_exec_comment(const char *sql, size_t len)
         char c = sc.s[sc.pos];
         if (c == '\'' || c == '"' || c == '`') { t2s_skip_quoted(&sc); continue; }
         if (c == '/' && sc.pos + 1 < sc.len && sc.s[sc.pos + 1] == '*') {
+            /* MySQL's executable comment (!), an optimizer hint (+) and MariaDB's own
+             * executable comment (M!, upper or lower case) all run their contents as SQL. */
             if (sc.pos + 2 < sc.len &&
                 (sc.s[sc.pos + 2] == '!' || sc.s[sc.pos + 2] == '+'))
+                return true;
+            if (sc.pos + 3 < sc.len &&
+                (sc.s[sc.pos + 2] == 'M' || sc.s[sc.pos + 2] == 'm') && sc.s[sc.pos + 3] == '!')
                 return true;
             /* plain comment: skip to its close, same loop shape as
              * t2s_skip_ws_comments */
@@ -1603,6 +1680,58 @@ static const char *const t2s_denied_call_prefixes[] = {
     NULL
 };
 
+/* The position after the comment at `i`, or `i` when there is no comment
+ * there. The comment forms are the ones the server has: a block comment,
+ * a "#" line comment, and a "--" line comment -- which needs the
+ * whitespace after it, exactly as the server requires. That last rule
+ * matters in both directions: "--x" is not a comment, so the scan must
+ * keep looking at what follows it ("SELECT 1--SLEEP(5)" is
+ * "1 - (-SLEEP(5))" to the server, and SLEEP(5) really is called). */
+static unsigned long
+t2s_skip_comment_at(const char *sql, unsigned long len, unsigned long i)
+{
+    if (i + 1 < len && sql[i] == '/' && sql[i + 1] == '*') {
+        i += 2;
+        while (i + 1 < len && !(sql[i] == '*' && sql[i + 1] == '/')) i++;
+        return (i + 1 < len) ? i + 2 : len;
+    }
+    if (i < len && sql[i] == '#') {
+        while (i < len && sql[i] != '\n') i++;
+        return i;
+    }
+    if (i + 1 < len && sql[i] == '-' && sql[i + 1] == '-' &&
+        (i + 2 >= len || sql[i + 2] == ' ' || sql[i + 2] == '\t' ||
+         sql[i + 2] == '\n' || sql[i + 2] == '\r')) {
+        while (i < len && sql[i] != '\n') i++;
+        return i;
+    }
+    return i;
+}
+
+/* The position of the next non-whitespace, non-comment byte at or after
+ * `i`. Used between a name and its opening parenthesis: the server does
+ * not care whether "SLEEP" and "(" are separated by a space or by a
+ * comment. */
+static unsigned long
+t2s_skip_ws_comments_at(const char *sql, unsigned long len, unsigned long i)
+{
+    for (;;) {
+        unsigned long before = i;
+        while (i < len && (sql[i] == ' ' || sql[i] == '\t' ||
+                           sql[i] == '\n' || sql[i] == '\r')) i++;
+        {
+            unsigned long j = t2s_skip_comment_at(sql, len, i);
+            if (j == i) break;
+            i = j;
+        }
+        if (i == before) break;
+    }
+    return i;
+}
+
+/* MariaDB's SQL: backslash escapes in strings, and the comment forms are -- followed by whitespace, #, and block comments. */
+#define T2S_DIALECT_CALCITE 0
+
 static bool
 t2s_has_denied_call(const char *sql, unsigned long len, const char **which)
 {
@@ -1610,17 +1739,39 @@ t2s_has_denied_call(const char *sql, unsigned long len, const char **which)
     while (i < len) {
         char c = sql[i];
         if (c == '\'' || c == '"' || c == '`') {
-            char q = c; i++;
+            /* A single-quoted token is a string. A double-quoted or back-tick token can be an IDENTIFIER, and an
+             * identifier followed by "(" is a function call: "sleep"(1) (a quoted name in Druid SQL, or in MariaDB
+             * with ANSI_QUOTES) and `sleep`(1) (MariaDB) both call SLEEP. So read the name, and check it when a
+             * parenthesis follows. */
+            char q = c; char qname[64]; unsigned long qn = 0; i++;
             while (i < len) {
-                if (sql[i] == '\\' && q != '`') { i += 2; continue; }
-                if (sql[i] == q) { if (i + 1 < len && sql[i + 1] == q) { i += 2; continue; } break; }
+                if (sql[i] == '\\' && q != '`' && !T2S_DIALECT_CALCITE) { if (i + 1 < len) i += 2; else i++; continue; }
+                if (sql[i] == q) { if (i + 1 < len && sql[i + 1] == q) { if (qn + 1 < sizeof qname) qname[qn++] = q; i += 2; continue; } break; }
+                if (q != '\'' && qn + 1 < sizeof qname) qname[qn++] = (char) ((sql[i] >= 'A' && sql[i] <= 'Z') ? sql[i] + 32 : sql[i]);
                 i++;
             }
             i++;
+            if (q != '\'') {
+                unsigned long j = t2s_skip_ws_comments_at(sql, len, i);
+                qname[qn] = '\0';
+                if (j < len && sql[j] == '(') {
+                    for (int k = 0; t2s_denied_call_prefixes[k] != NULL; k++) {
+                        if (strncmp(qname, t2s_denied_call_prefixes[k], strlen(t2s_denied_call_prefixes[k])) == 0) {
+                            *which = t2s_denied_call_prefixes[k];
+                            return true;
+                        }
+                    }
+                }
+            }
             continue;
         }
         if (c == '#' || (c == '-' && i + 1 < len && sql[i + 1] == '-')) {
-            while (i < len && sql[i] != '\n') i++;
+            /* The comment forms the server has, and no others: a "--"
+             * that is not followed by whitespace is not a comment, and
+             * the text after it is still code the server will run. */
+            unsigned long j = t2s_skip_comment_at(sql, len, i);
+            if (j == i) { i++; continue; }
+            i = j;
             continue;
         }
         if (c == '/' && i + 1 < len && sql[i + 1] == '*') {
@@ -1632,14 +1783,27 @@ t2s_has_denied_call(const char *sql, unsigned long len, const char **which)
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
             char name[64];
             unsigned long n = 0;
-            while (i < len && ((sql[i] >= 'a' && sql[i] <= 'z') || (sql[i] >= 'A' && sql[i] <= 'Z') ||
-                               (sql[i] >= '0' && sql[i] <= '9') || sql[i] == '_' || sql[i] == '$')) {
-                if (n + 1 < sizeof name) name[n++] = (char) ((sql[i] >= 'A' && sql[i] <= 'Z') ? sql[i] + 32 : sql[i]);
-                i++;
+            /* The name is read with the comments skipped: the server
+             * strips them, so a name split by a block comment is still
+             * that name to the server (SLE<comment>EP is SLEEP), and a
+             * scan that stopped at the comment would miss the call. */
+            for (;;) {
+                while (i < len && ((sql[i] >= 'a' && sql[i] <= 'z') || (sql[i] >= 'A' && sql[i] <= 'Z') ||
+                                   (sql[i] >= '0' && sql[i] <= '9') || sql[i] == '_' || sql[i] == '$')) {
+                    if (n + 1 < sizeof name) name[n++] = (char) ((sql[i] >= 'A' && sql[i] <= 'Z') ? sql[i] + 32 : sql[i]);
+                    i++;
+                }
+                {
+                    unsigned long j = t2s_skip_comment_at(sql, len, i);
+                    if (j == i) break;
+                    i = j;
+                }
             }
             name[n] = '\0';
-            unsigned long j = i;
-            while (j < len && (sql[j] == ' ' || sql[j] == '\t' || sql[j] == '\n' || sql[j] == '\r')) j++;
+            /* The opening parenthesis may be separated from the name by
+             * whitespace or by a comment; the server does not care
+             * which. */
+            unsigned long j = t2s_skip_ws_comments_at(sql, len, i);
             if (j < len && sql[j] == '(') {
                 for (int k = 0; t2s_denied_call_prefixes[k] != NULL; k++) {
                     size_t pl = strlen(t2s_denied_call_prefixes[k]);

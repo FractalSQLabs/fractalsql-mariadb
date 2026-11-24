@@ -76,6 +76,7 @@ typedef struct fsql_session_entry {
      * a second exclusive acquire of that id then fails fast instead of
      * racing the core. Checked alongside refcount by every destroy path. */
     int                          busy;
+    int                          retention_applied;   /* FRACTALSQL_LEDGER_RETENTION is on this ctx */
     /* How many PLAIN (non-exclusive) holders this entry has right now:
      * the diversify tuning/diagnostic calls and the ledger calls, all
      * of which run against the same ctx an exclusive holder would.
@@ -282,7 +283,7 @@ fractal_session_acquire(unsigned long long session_id)
     session_lock();
     sweep_stale(FSQL_SESSION_SWEEP_SCAN_LIMIT);
 
-    /* An exclusive holder (fractal_search's in-flight call on this same
+    /* An exclusive holder (fractal_sfs_converge's in-flight call on this same
      * session_id) owns e->ctx's diversify state for the duration; a
      * tuning/read call here would race it. Refuse up front, same as
      * fractal_session_acquire_exclusive does against a second exclusive
@@ -306,7 +307,7 @@ fractal_session_acquire(unsigned long long session_id)
      * deployment or for search/diversify's own use of this same ctx. No
      * reasoning VFS (second argument stays NULL): this registry only
      * needs search-capable ctx state, the same posture as
-     * fractal_search's own per-call ctx. */
+     * fractal_sfs_converge's own per-call ctx. */
     if (e->ctx == NULL) {
         e->ctx = fsql_new_sovereign(fractal_ledger_storage_vfs(), NULL);
         if (e->ctx == NULL) {
@@ -320,6 +321,7 @@ fractal_session_acquire(unsigned long long session_id)
     }
 
     fsql_ctx *ctx = e->ctx;
+    if (!e->retention_applied && fractal_enterprise_apply_retention(ctx)) e->retention_applied = 1;
     e->shared++;   /* a plain holder: an exclusive acquire must refuse */
     session_unlock();
     return ctx;
@@ -393,7 +395,7 @@ fractal_session_acquire_reason(unsigned long long session_id, bool *out_loaded)
 }
 
 /* Exclusive-use acquire of session_id's Diversify/search ctx, for
- * fractal_search()/fractal_search_explore() (see fractalsql.c). Same
+ * fractal_sfs_converge()/fractal_search_explore() (see fractalsql.c). Same
  * acquire/create/refcount/LRU contract as fractal_session_acquire, plus:
  *   1. The entry is marked busy for the duration of the call, and
  *      release_exclusive clears it. Busy entries are never destroyed by

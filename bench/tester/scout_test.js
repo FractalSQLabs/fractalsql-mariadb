@@ -7,7 +7,7 @@
 //           of the corpus dim (not best_point alone);
 //   (3)     discovery: particles disperse across more than one island;
 //   (4)     Scout != Sniper: fractal_search_explore spans more islands than
-//           fractal_search's top-k (which collapses into one basin).
+//           fractal_sfs_converge's top-k (which collapses into one basin).
 //
 // Exits non-zero on failure. Skips cleanly (exit 0) if fractal_search_explore
 // is not registered, so it is safe before the Scout drop is deployed.
@@ -93,7 +93,7 @@ async function main() {
 
   // Sniper: top-k nearest (collapses into one basin). Map stored-vector
   // index -> island via corpus row order (island = floor(idx / PER)).
-  const [sr]   = await conn.query("SELECT fractal_search(?, ?, ?, ?) AS r", [corpus, query, POP, params]);
+  const [sr]   = await conn.query("SELECT fractal_sfs_converge(?, ?, ?, ?) AS r", [corpus, query, POP, params]);
   const topk   = (JSON.parse(sr[0].r).top_k) || [];
   const sniperIslands = new Set(topk.map(e => Math.floor((e.idx ?? 0) / PER))).size;
 

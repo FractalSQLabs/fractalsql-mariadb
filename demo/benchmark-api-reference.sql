@@ -1,8 +1,8 @@
 -- demo/benchmark-api-reference.sql
 --
 -- Real, structural details worth knowing before reading this file:
---   - fractal_search_debug IS a separate function (the convergence view
---     of the SFS: no corpus, the trace always on); fractal_search's own
+--   - fractal_sfs_converge_debug IS a separate function (the convergence view
+--     of the SFS: no corpus, the trace always on); fractal_sfs_converge's own
 --     "debug":true params flag still adds a trace to a corpus search.
 --     Both are demonstrated in Section 1 below; see
 --     docs/api-discovery.md.
@@ -68,29 +68,29 @@ DELIMITER ;
 -- === 0. Meta (2 functions): fractal_edition, fractal_version ===
 SELECT fractal_edition(), fractal_version();
 
--- === 1. Search (3 functions): fractal_search (plain + debug-trace modes), fractal_search_debug, fractal_search_explore ===
+-- === 1. Search (3 functions): fractal_sfs_converge (plain + debug-trace modes), fractal_sfs_converge_debug, fractal_search_explore ===
 DROP TABLE IF EXISTS bmk_corpus;
 CREATE TABLE bmk_corpus (id INT AUTO_INCREMENT PRIMARY KEY, emb_arr JSON);
 INSERT INTO bmk_corpus (emb_arr)
 SELECT JSON_ARRAY(RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1, RAND()*2-1)
 FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 100) SELECT n FROM seq) s;
 
--- fractal_search is 4-arg (corpus, query, k, params); corpus=''+k=1
+-- fractal_sfs_converge is 4-arg (corpus, query, k, params); corpus=''+k=1
 -- converges with no real corpus (see demo.sql Section 2).
-SELECT fractal_search('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 30}');
+SELECT fractal_sfs_converge('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 30}');
 
 -- Debug-trace mode: a "debug":true params flag adds the trace to a
 -- corpus search (see docs/api-discovery.md).
 SELECT JSON_EXTRACT(
-    fractal_search('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 10, "debug": true}'),
+    fractal_sfs_converge('', '[0.6,0.8,0,0,0,0,0,0]', 1, '{"iterations": 10, "debug": true}'),
     '$.trace.best_fit'
 ) AS debug_trace_best_fit;
 
--- fractal_search_debug: the convergence view of the SFS -- no corpus at
+-- fractal_sfs_converge_debug: the convergence view of the SFS -- no corpus at
 -- all, the trace always on. The seed pins the walk for a byte-stable
 -- result; left out, the walk is non-deterministic.
 SELECT JSON_EXTRACT(
-    fractal_search_debug('[0.6,0.8,0,0,0,0,0,0]', 10, 50, 2, 12345),
+    fractal_sfs_converge_debug('[0.6,0.8,0,0,0,0,0,0]', 10, 50, 2, 12345),
     '$.trace.best_fit'
 ) AS search_debug_best_fit;
 
@@ -158,7 +158,7 @@ SELECT fractal_explain_result(CONNECTION_ID()) AS diagnostics;
 -- fractal_feedback_report(session_id, result_handle, kind [, dwell_ms]):
 -- result_handle=1 is a placeholder id, not tied to a real search
 -- result from this script (fine for a coverage smoke pass; a real
--- caller would pass back a handle from an actual fractal_search call).
+-- caller would pass back a handle from an actual fractal_sfs_converge call).
 SELECT fractal_feedback_report(CONNECTION_ID(), 1, 'positive', 4000);
 SELECT fractal_isolate_background(CONNECTION_ID(), 2);
 SELECT fractal_diversify_disable(CONNECTION_ID());

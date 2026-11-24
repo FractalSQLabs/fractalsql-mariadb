@@ -1,4 +1,4 @@
-SELECT fractal_search();
+SELECT fractal_sfs_converge();
 SELECT fractal_search_explore();
 SELECT fractal_version();
 SELECT fractal_edition();
@@ -7,6 +7,7 @@ SELECT fractal_dimension_boxcount();
 SELECT fractal_dimension_drift();
 SELECT fractal_change_point_detect();
 SELECT fractal_periodogram();
+SELECT fractal_chunk_text();
 SELECT fractal_spectrogram_entropy();
 SELECT fractal_state_fingerprint();
 SELECT fractal_cycle_detect();

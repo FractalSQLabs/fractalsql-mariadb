@@ -124,14 +124,14 @@ SELECT fractal_dimension_boxcount(
 -- === 3. Sniper Search: ideal node profile for a GPU-inference workload ===
 
 -- Blueprint (raw primitives): converge toward the ideal node profile with
--- fractal_search (the "sniper search" in the abstract [-1,1]^5 space --
+-- fractal_sfs_converge (the "sniper search" in the abstract [-1,1]^5 space --
 -- corpus='' + k=1 runs Sniper mode with no real corpus, same as
 -- demo.sql Section 2), then map that profile to a REAL node with
 -- fractal_search_telemetry. doc_id in the result is already vse_nodes'
 -- real `id` column (resolved internally), no remap needed. Generalized
 -- below by the shipped fractal_agent_schedule_workload preset, which
 -- folds both steps together and reasons.
--- SELECT fractal_search('', '[0.3, 0.6, 0.9, 0.2, 0.0]', 1, '{"iterations": 50}') AS ideal_profile;
+-- SELECT fractal_sfs_converge('', '[0.3, 0.6, 0.9, 0.2, 0.0]', 1, '{"iterations": 50}') AS ideal_profile;
 --
 -- CALL fractal_search_telemetry('vse_nodes', 'capability',
 --                                '[0.3, 0.6, 0.9, 0.2, 0.0]', 3, @t);
@@ -141,7 +141,7 @@ SELECT fractal_dimension_boxcount(
 --  ORDER BY jt.dist;
 
 -- Productized preset: the shipped engine refines the task vector
--- (fractal_search), finds the nearest node (fractal_search_telemetry),
+-- (fractal_sfs_converge), finds the nearest node (fractal_search_telemetry),
 -- and reasons. assigned_node is the real node id; confidence is
 -- 1/(1+distance). No id_col arg: the node table's
 -- own PRIMARY KEY is returned directly, see this file's header.

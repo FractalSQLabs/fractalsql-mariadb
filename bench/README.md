@@ -8,7 +8,7 @@ Head-to-head comparison of MariaDB's own built-in `VECTOR(n)` ANN index
 against FractalSQL's `fractal_search_explore` (Scout Mode, `walk=0`). Measures
 search latency and island recall on a synthetic Gaussian-cluster dataset.
 This is a research/methodology comparison, distinct from
-[`bench/tester/`](tester/)'s raw `fractal_search()` latency-percentile
+[`bench/tester/`](tester/)'s raw `fractal_sfs_converge()` latency-percentile
 throughput driver.
 
 ## Prerequisites
@@ -29,7 +29,7 @@ pip install -r bench/requirements.txt
 mariadb -uroot -p -e "CREATE DATABASE fractalsql_bench;"
 ```
 
-`fractal_search_explore`/`fractal_search` (used by `head_to_head.py`) are UDFs,
+`fractal_search_explore`/`fractal_sfs_converge` (used by `head_to_head.py`) are UDFs,
 registered globally by `sql/install_udf.sql` and callable from any
 database once installed anywhere. `fractal_search_trajectory` (used by
 `vector_type_head_to_head.py`'s search-latency arm) is a stored
@@ -262,7 +262,7 @@ returned `[]`, zero results, **no error**. Root cause, confirmed directly:
 without first raising the session's `group_concat_max_len`. MariaDB's
 default is 1MB (as low as 1024 bytes on an older `my.cnf`), and past that,
 `GROUP_CONCAT` silently *truncates* (a warning, not an error), producing
-invalid JSON that `fractal_search` then treats as an empty corpus. This
+invalid JSON that `fractal_sfs_converge` then treats as an empty corpus. This
 affected `fractal_search_telemetry`, `fractal_hybrid_clinical_search`,
 `fractal_search_trajectory`, and `fractal_cross_modal_search` alike, at
 any table whose combined vector text crossed that limit, a few hundred
@@ -322,7 +322,7 @@ native-`VECTOR(n)`/TEXT scan paths, a real profiler attached to the
 | ---: | ---: | ---: | ---: |
 | 1393 us | 1417 us | 1975 us | 3412 us |
 
-**Search** (`fractal_search`, N=10000, dim=128, k=10, the largest size in
+**Search** (`fractal_sfs_converge`, N=10000, dim=128, k=10, the largest size in
 `scale_sweep.sh`; 10 iterations, default SFS params):
 
 | mean | p50 | p99 |
@@ -346,3 +346,17 @@ SET GLOBAL max_allowed_packet = 67108864;   -- 64 MB
 ```
 
 The scalar tester is unaffected - it sends one short vector per call.
+
+## The index and precision scripts
+
+| Script | What it does |
+| --- | --- |
+| `index_head_to_head.py` | The native IVF index (one run per `vector_format`) against the exact scan: recall@10, median latency, bytes per row, build time and the rows the index read. |
+| `precision_agreement.py` | Checks that the SQL distance functions are bit-identical to the sequential double reference. |
+
+```bash
+python3 bench/index_head_to_head.py --n 20000 --dim 128
+python3 bench/precision_agreement.py --dims 128,768
+```
+
+Both take `--host`, `--port`, `--db`, `--user` and `--password` (or the `FRACTALSQL_*` environment variables). Read **rows scanned** (far below the row count means the index answered) and the **bit-identical share** (1.0000 expected).

@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 
+#include <limits.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -87,7 +88,7 @@ typedef volatile int fsq_atomic_int;
 #  define FSQ_ATOMIC_SET(p,v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
 #endif
 
-#define FSQL_DAEMON_VERSION     "2.0.13"
+#define FSQL_DAEMON_VERSION     "2.0.14"
 #define FSQ_CONFIG_ENV          "FRACTALSQL_CONFIG"
 #define FSQ_MAX_ALLOWED_UIDS    16
 #define FSQ_PEER_MAX            160
@@ -221,7 +222,10 @@ static int load_key(struct fsq_config *cfg) {
         buf[n++] = (char) c;
     }
     fclose(f);
-    if (n == 0 || n % 2 != 0 || n / 2 > sizeof(cfg->key)) return -1;
+    /* A key shorter than 16 bytes (128 bits) is not an authentication secret: a one-byte key would be guessed in 256 tries. */
+    if (n / 2 < 16 && n != 0 && n % 2 == 0)
+        fprintf(stderr, "fractalsqld: the HMAC key in %s is %zu bytes; at least 16 are required\n", cfg->key_path, n / 2);
+    if (n == 0 || n % 2 != 0 || n / 2 > sizeof(cfg->key) || n / 2 < 16) return -1;
     cfg->key_len = 0;
     for (size_t i = 0; i < n; i++) {
         int v = hex_nibble(buf[i]);
@@ -262,6 +266,16 @@ static int process_user_sid(char *out, size_t outlen) {
 #endif
 
 /* Case-insensitive equality against a lower-case ASCII word. */
+/* strtol with a clamp to int: atoi() is undefined on overflow. A non-number reads as 0, as atoi did. */
+static int cfg_atoi_clamped(const char *v) {
+    char *e = NULL;
+    long  n = strtol(v, &e, 10);
+    if (e == v) return 0;
+    if (n > INT_MAX) return INT_MAX;
+    if (n < INT_MIN) return INT_MIN;
+    return (int) n;
+}
+
 static int cfg_word_is(const char *v, const char *word) {
     for (; *v && *word; v++, word++) {
         char c = *v;
@@ -317,9 +331,9 @@ static int load_config(const char *path, struct fsq_config *cfg) {
         } else if (strcmp(k, "log_file") == 0) {
             CFG_SET_STR(log_path);
         } else if (strcmp(k, "max_connections") == 0) {
-            cfg->max_connections = atoi(v);
+            cfg->max_connections = cfg_atoi_clamped(v);
         } else if (strcmp(k, "idle_timeout_secs") == 0) {
-            cfg->idle_timeout_secs = atoi(v);
+            cfg->idle_timeout_secs = cfg_atoi_clamped(v);
 #ifdef _WIN32
         } else if (strcmp(k, "allowed_pipe_sid") == 0) {
             char *save = NULL;
@@ -835,14 +849,29 @@ static int write_all(fsq_sock fd, const uint8_t *p, size_t n) {
 }
 #endif
 
+/* The frame tag: HMAC-SHA256 over the header and the payload, computed without copying either (no allocation, so it cannot
+ * fail; it used to build a joined copy, and on allocation failure zeroed the tag, which made an all-zero tag valid). */
 static void mac(const struct fsq_config *cfg, const uint8_t *hdr,
                 const uint8_t *payload, size_t plen, uint8_t tag[FSQ_TAG_LEN]) {
-    uint8_t *msg = malloc(FSQ_HEADER_LEN + plen);
-    if (!msg) { memset(tag, 0, FSQ_TAG_LEN); return; }
-    memcpy(msg, hdr, FSQ_HEADER_LEN);
-    if (plen) memcpy(msg + FSQ_HEADER_LEN, payload, plen);
-    fsq_hmac_sha256(cfg->key, cfg->key_len, msg, FSQ_HEADER_LEN + plen, tag);
-    free(msg);
+    fsq_hmac_sha256_2(cfg->key, cfg->key_len, hdr, FSQ_HEADER_LEN, payload, plen, tag);
+}
+
+/* Reads the declared payload before the frame is authenticated, so the buffer grows only as bytes actually arrive (1 MiB at a
+ * time): a peer that declares 80 MiB and sends nothing, or a little, makes the daemon hold what it sent, not what it claimed. */
+static int read_payload(fsq_sock fd, uint32_t len, uint8_t **out) {
+    const size_t step = 1u << 20;
+    uint8_t *buf = NULL;
+    size_t have = 0;
+    while (have < len) {
+        size_t want = len - have < step ? len - have : step;
+        uint8_t *nb = realloc(buf, have + want);
+        if (!nb) { free(buf); return -1; }
+        buf = nb;
+        if (read_all(fd, buf + have, want) != 0) { free(buf); return -1; }
+        have += want;
+    }
+    *out = buf;
+    return 0;
 }
 
 static int send_reply(fsq_sock fd, const struct fsq_config *cfg, const struct fsq_header *req,
@@ -937,6 +966,7 @@ struct fsq_handle {
 };
 
 static fsq_mutex g_handles_mu = FSQ_MUTEX_INIT;
+static FSQ_TLS uint64_t t_peer_uid = 0;   /* the authenticated uid of the connection's peer (peer_allowed sets it) */
 static FSQ_TLS uint64_t t_conn = 0;   /* connection serving this thread */
 /* The handle the interrupt-hooked computation loops run for, if any. The
  * loops are called on the same thread that serves the UDF_CALL, so the
@@ -1197,6 +1227,7 @@ static void core_fail(struct fsq_reply *rep, struct fsq_handle *h) {
 
 struct fsq_cache_entry {
     uint64_t token;
+    uint64_t peer_uid;  /* the authenticated uid that executed the call: a replay is for that uid only */
     uint32_t status;
     int32_t  core_rc;
     uint32_t body_len;
@@ -1236,7 +1267,10 @@ static int cache_replay(uint64_t token, struct fsq_reply *rep,
     FSQ_LOCK(g_cache_mu);
     e = cache_find_locked(token);
     if (!e) { FSQ_UNLOCK(g_cache_mu); return 0; }
-    if (e->name_len != name_len || (name_len && memcmp(e->name, name, name_len) != 0)) {
+    /* A token is replayed to the principal that minted it, not to any peer that presents the number. The scope is the peer's
+     * uid and not the connection, because a client replays across a reconnect. */
+    if (e->peer_uid != t_peer_uid ||
+        e->name_len != name_len || (name_len && memcmp(e->name, name, name_len) != 0)) {
         FSQ_UNLOCK(g_cache_mu);
         return 0;
     }
@@ -1311,6 +1345,7 @@ static void cache_put(uint64_t token, const struct fsq_reply *rep,
         g_cache_next = (g_cache_next + 1) % FSQ_CACHE_ENTRIES;
     }
     slot->token = token;
+    slot->peer_uid = t_peer_uid;
     slot->status = rep->status;
     slot->core_rc = rep->core_rc;
     slot->body_len = len;
@@ -1757,6 +1792,7 @@ static int peer_allowed(fsq_sock fd, const struct fsq_config *cfg, char *peer, s
         return 0;
     }
     snprintf(peer, peerlen, "uid %ld", (long) euid);
+    t_peer_uid = (uint64_t) euid;
     for (size_t i = 0; i < cfg->n_allowed; i++)
         if (cfg->allowed_uids[i] == euid) ok = 1;
     return ok;
@@ -1769,6 +1805,7 @@ static int peer_allowed(fsq_sock fd, const struct fsq_config *cfg, char *peer, s
         return 0;
     }
     snprintf(peer, peerlen, "uid %ld", (long) cred.uid);
+    t_peer_uid = (uint64_t) cred.uid;
     for (size_t i = 0; i < cfg->n_allowed; i++)
         if (cfg->allowed_uids[i] == cred.uid) ok = 1;
     return ok;
@@ -1873,10 +1910,7 @@ static FSQ_THREAD_RET serve_connection_body(void *arg) {
         }
         if (h.flags & FSQ_FLAG_RESPONSE) break;
         if (read_all(fd, tag, FSQ_TAG_LEN) != 0) break;
-        if (h.payload_len) {
-            payload = malloc(h.payload_len);
-            if (!payload || read_all(fd, payload, h.payload_len) != 0) { free(payload); break; }
-        }
+        if (h.payload_len && read_payload(fd, h.payload_len, &payload) != 0) break;
         mac(cfg, hdr, payload, h.payload_len, want);
         if (!fsq_ct_equal(tag, want, FSQ_TAG_LEN)) {
             fsq_log("WARN", "connection %llu from %s failed authentication (opcode 0x%04x, request %u)",
@@ -2289,10 +2323,36 @@ static int run_listener(void) {
     return 0;
 }
 #else
+/* The fatal-signal handler runs in signal context, so it may call only
+ * async-signal-safe functions: snprintf is not one (it can allocate and take
+ * locks, and the signal may have interrupted code that holds them). The line
+ * is built by hand into a stack buffer and written with write(2). */
+static size_t fatal_put(char *d, size_t cap, size_t n, const char *s) {
+    while (*s && n + 1 < cap) d[n++] = *s++;
+    return n;
+}
+
+static size_t fatal_put_num(char *d, size_t cap, size_t n, long v) {
+    char t[24];
+    size_t k = 0;
+    unsigned long u = v < 0 ? 0UL - (unsigned long) v : (unsigned long) v;
+    if (v < 0 && n + 1 < cap) d[n++] = '-';
+    do { t[k++] = (char) ('0' + (u % 10)); u /= 10; } while (u && k < sizeof t);
+    while (k && n + 1 < cap) d[n++] = t[--k];
+    return n;
+}
+
 static void on_fatal(int sig) {
-    char line[96];
-    int n = snprintf(line, sizeof(line), "fractalsqld[%ld] FATAL %s (%d), exiting\n", fsq_pid(), fsq_sig_name(sig), sig);
-    if (n > 0) { ssize_t w = write(STDERR_FILENO, line, (size_t) n); (void) w; }
+    char line[128];
+    size_t n = 0;
+    n = fatal_put(line, sizeof line, n, "fractalsqld[");
+    n = fatal_put_num(line, sizeof line, n, (long) fsq_pid());
+    n = fatal_put(line, sizeof line, n, "] FATAL ");
+    n = fatal_put(line, sizeof line, n, fsq_sig_name(sig));
+    n = fatal_put(line, sizeof line, n, " (");
+    n = fatal_put_num(line, sizeof line, n, (long) sig);
+    n = fatal_put(line, sizeof line, n, "), exiting\n");
+    { ssize_t w = write(STDERR_FILENO, line, n); (void) w; }
     signal(sig, SIG_DFL);
     raise(sig);
 }

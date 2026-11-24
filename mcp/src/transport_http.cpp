@@ -124,6 +124,17 @@ inline void fsqlCloseAfterReply( int fd, int lingerMs )
 
 namespace fsqlmcp
 {
+    // A header the server acts on that arrives twice is refused: two values for the host, the credential, the origin or the
+    // framing are an ambiguity a proxy in front and this parser could resolve differently.
+    static bool isSingleValuedHeader( const std::string& name )
+    {
+        static const char* const kNames[] = { "host", "authorization", "origin", "content-type", "transfer-encoding",
+                                              "mcp-session-id", "mcp-protocol-version", "mcp-method", "mcp-name" };
+        for( const char* n : kNames )
+            if( name == n ) return true;
+        return false;
+    }
+
     static constexpr std::size_t kBodyMax = 32 * 1024 * 1024;
 
     // The most body bytes the server reads and throws away for a request
@@ -1016,7 +1027,7 @@ namespace fsqlmcp
             // A header sent more than once is ambiguous framing, not "the
             // last one wins": the names are remembered so the request can be
             // refused rather than served with one of the two values.
-            if( out.headers.count( name ) ) out.repeated.insert( name );
+            if( out.headers.count( name ) ) { out.repeated.insert( name ); if( isSingleValuedHeader( name ) ) { out.malformed = true; return false; } }
             out.headers[ name ] = value;
 
             if( name == "authorization" )
@@ -1150,7 +1161,23 @@ namespace fsqlmcp
         if( req.path == "/healthz" ) { sendStatus( wire, 200, "OK" ); return true; }
         if( req.path == "/readyz" )
         {
-            const bool ready = readinessProbe();
+            // This route is unauthenticated and the probe is a live query: the result is kept for 5 s so a burst of requests
+            // costs the engine one probe, not one each.
+            static std::mutex probeMu;
+            static std::chrono::steady_clock::time_point probedAt{};
+            static bool probed = false, lastReady = false;
+            bool ready;
+            {
+                std::lock_guard<std::mutex> lk( probeMu );
+                const auto now = std::chrono::steady_clock::now();
+                if( !probed || now - probedAt >= std::chrono::seconds( 5 ) )
+                {
+                    lastReady = readinessProbe();
+                    probedAt = now;
+                    probed = true;
+                }
+                ready = lastReady;
+            }
             sendStatus( wire, ready ? 200 : 503, ready ? "OK" : "Service Unavailable" );
             return true;
         }
@@ -1194,6 +1221,14 @@ namespace fsqlmcp
         return tokens.check( presentedOut );
     }
 
+    // True for an IPv4 address in 127.0.0.0/8, parsed as an address: a name that merely starts with "127." (127.evil.example,
+    // 127.0.0.1.nip.io) is not one.
+    static bool isLoopbackV4( const std::string& host )
+    {
+        in_addr addr{};
+        return inet_pton( AF_INET, host.c_str(), &addr ) == 1 && ( ntohl( addr.s_addr ) >> 24 ) == 127;
+    }
+
     // True when the origin names a loopback host. The host part is what
     // matters: a page served from http://127.0.0.1:3000 is a loopback
     // origin whatever its port.
@@ -1214,7 +1249,7 @@ namespace fsqlmcp
         const std::size_t colon = host.rfind( ':' );
         if( colon != std::string::npos ) host = host.substr( 0, colon );
         if( host == "localhost" ) return true;
-        if( host.rfind( "127.", 0 ) == 0 ) return true;
+        if( isLoopbackV4( host ) ) return true;
         return false;
     }
 
@@ -1807,7 +1842,7 @@ namespace fsqlmcp
     // text. Warn always; refuse unless FSQL_MCP_ALLOW_PLAINTEXT_NONLOOPBACK is set.
     static bool hostIsLoopback( const std::string& h )
     {
-        return h.empty() || h == "localhost" || h == "::1" || h.rfind( "127.", 0 ) == 0;
+        return h.empty() || h == "localhost" || h == "::1" || isLoopbackV4( h );
     }
 
     static SSL_CTX* makeSslCtx( const HttpConfig& cfg, std::string& errOut )

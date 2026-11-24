@@ -38,7 +38,7 @@ Measures:
       far fewer at higher dims or in an older my.cnf with the
       historical 1024-BYTE default), GROUP_CONCAT silently TRUNCATES
       (a warning, not an error) mid-vector, producing invalid JSON
-      that fractal_search then silently treats as an empty corpus --
+      that fractal_sfs_converge then silently treats as an empty corpus --
       fractal_search_trajectory/_cross_modal_search/_telemetry/
       _hybrid_clinical_search all return `[]` with NO error surfaced,
       at ANY table size past that limit. Confirmed directly: at 5000

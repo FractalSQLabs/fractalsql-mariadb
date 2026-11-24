@@ -191,4 +191,46 @@ fsq_hmac_sha256(const uint8_t *key, size_t keylen,
     fsq_sha256_final(&ctx, out);
 }
 
+/*
+ * HMAC-SHA256 over the concatenation a||b without building it: the same tag as fsq_hmac_sha256 over the joined buffer, with
+ * no allocation (so it cannot fail) and no second copy of a large b. Either part may be empty (len 0).
+ */
+static inline void
+fsq_hmac_sha256_2(const uint8_t *key, size_t keylen,
+                  const uint8_t *a, size_t alen,
+                  const uint8_t *b, size_t blen,
+                  uint8_t out[32])
+{
+    uint8_t         k_ipad[64], k_opad[64], tk[32], inner[32];
+    size_t          i;
+    fsq_sha256_ctx ctx;
+
+    if (keylen > 64)
+    {
+        fsq_sha256_init(&ctx);
+        fsq_sha256_update(&ctx, key, keylen);
+        fsq_sha256_final(&ctx, tk);
+        key = tk;
+        keylen = 32;
+    }
+    memset(k_ipad, 0, 64);
+    memset(k_opad, 0, 64);
+    memcpy(k_ipad, key, keylen);
+    memcpy(k_opad, key, keylen);
+    for (i = 0; i < 64; ++i)
+    {
+        k_ipad[i] ^= 0x36;
+        k_opad[i] ^= 0x5c;
+    }
+    fsq_sha256_init(&ctx);
+    fsq_sha256_update(&ctx, k_ipad, 64);
+    if (alen) fsq_sha256_update(&ctx, a, alen);
+    if (blen) fsq_sha256_update(&ctx, b, blen);
+    fsq_sha256_final(&ctx, inner);
+    fsq_sha256_init(&ctx);
+    fsq_sha256_update(&ctx, k_opad, 64);
+    fsq_sha256_update(&ctx, inner, 32);
+    fsq_sha256_final(&ctx, out);
+}
+
 #endif /* FSQ_SHA256_H */

@@ -115,7 +115,17 @@ EXPECTED_SAFETY = {
     "fractal_schema_context": ("read", False),
     "fractal_search": ("read", False),
     "fractal_search_agent": ("write", True),
-    "fractal_search_debug": ("read", False),
+    "fractal_sfs_converge": ("read", False),
+    "fractal_sfs_converge_debug": ("read", False),
+    "fractal_index_create": ("destructive", False),
+    "fractal_index_rebuild": ("destructive", False),
+    "fractal_index_refresh": ("destructive", False),
+    "fractal_index_ensure": ("destructive", False),
+    "fractal_chunk_text": ("read", False),
+    "fractal_index_list": ("read", False),
+    "fractal_index_drop": ("destructive", False),
+    "fractal_index_info": ("read", False),
+    "fractal_index_candidates": ("read", False),
     "fractal_search_explore": ("read", False),
     "fractal_search_telemetry": ("read", False),
     "fractal_search_trajectory": ("read", False),
@@ -128,6 +138,17 @@ EXPECTED_SAFETY = {
     "fractal_text_to_sql": ("write", True),
     "fractal_vascular_network": ("read", False),
     "fractal_vector": ("read", False),
+    "fractal_vector_add": ("read", False),
+    "fractal_vector_cosine_distance": ("read", False),
+    "fractal_vector_cosine_similarity": ("read", False),
+    "fractal_vector_dims": ("read", False),
+    "fractal_vector_l2_distance": ("read", False),
+    "fractal_vector_l2_squared": ("read", False),
+    "fractal_vector_negative_inner_product": ("read", False),
+    "fractal_vector_norm": ("read", False),
+    "fractal_vector_normalize": ("read", False),
+    "fractal_vector_scale": ("read", False),
+    "fractal_vector_sub": ("read", False),
     "fractal_vector_from_text": ("read", False),
     "fractal_vector_hamming_distance": ("read", False),
     "fractal_vector_lp_distance": ("read", False),
@@ -140,6 +161,7 @@ EXPECTED_SAFETY = {
     "fractal_vectorizer_pause": ("destructive", False),
     "fractal_vectorizer_process_queue": ("destructive", False),
     "fractal_vectorizer_resume": ("destructive", False),
+    "fractal_vectorizer_status": ("read", False),
     "fractal_configure_reasoning": ("destructive", False),
     "fractal_daemon_config_get": ("read", False),
     "fractal_version": ("read", False),
@@ -426,8 +448,8 @@ def main() -> int:  # noqa: ANN201
         # -- the accessibility invariant (1.7), mechanically ----------
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         listed = recv()["result"]["tools"]
-        check("tools/list: the full engine-filtered catalog (93 tools)",
-              len(listed) == 93)
+        check("tools/list: the full engine-filtered catalog (115 tools)",
+              len(listed) == 115)
         anonymous = [t["name"] for t in listed
                      if not (t.get("description") or "").strip()
                      or "properties" not in t["inputSchema"]]
@@ -590,15 +612,15 @@ def main() -> int:  # noqa: ANN201
               r is not None and r["result"].get("isError") is True)
 
         # -- Discovery tier --------------------------------------------
-        r = call("fractal_search", {"query": [0.6, 0.8],
-                                    "corpus": [[1, 0], [0, 1], [0.6, 0.8]],
-                                    "k": 3})
-        check("Discovery: fractal_search over an inline corpus returns "
+        r = call("fractal_sfs_converge", {"query": [0.6, 0.8],
+                                          "corpus": [[1, 0], [0, 1], [0.6, 0.8]],
+                                          "k": 3})
+        check("Discovery: fractal_sfs_converge over an inline corpus returns "
               "the top_k row with the query itself on top",
               r is not None and not r["result"].get("isError")
               and (r["result"]["structuredContent"] or {}).get("top_k")
               and r["result"]["structuredContent"]["top_k"][0]["idx"] == 2)
-        r = call("fractal_search", {"query": [0.6, 0.8]})
+        r = call("fractal_sfs_converge", {"query": [0.6, 0.8]})
         check("Discovery: pure Sniper convergence (corpus omitted) returns "
               "best_point",
               r is not None and not r["result"].get("isError")
@@ -703,7 +725,7 @@ def main() -> int:  # noqa: ANN201
               "(wrong-typed non-vector field: no leniency, 1.4)",
               r is not None and r["result"]["structuredContent"]
               ["error_class"] == "schema")
-        r = call("fractal_search", {"query": "not,an,array"})
+        r = call("fractal_sfs_converge", {"query": "not,an,array"})
         check("schema error: non-array vector rejected",
               r is not None and r.get("result", {}).get("isError")
               and r["result"]["structuredContent"]["error_class"] == "schema")
@@ -719,7 +741,7 @@ def main() -> int:  # noqa: ANN201
         corpus = [[0.1 * ((i * 7) % 11), 0.2 * ((i * 5) % 13),
                    0.3 * ((i * 3) % 17)] for i in range(300)]
         send({"jsonrpc": "2.0", "id": slow_id, "method": "tools/call",
-              "params": {"name": "fractal_search",
+              "params": {"name": "fractal_sfs_converge",
                          "arguments": {"query": [0.1, 0.2, 0.3],
                                        "corpus": corpus,
                                        "k": 30,
@@ -823,7 +845,7 @@ def main() -> int:  # noqa: ANN201
         sc = (r.get("result") or {}).get("structuredContent") if r else None
         keys = (sc or {}).get("keys") if isinstance(sc, dict) else None
         check("session config: keys() lists the engine's whole key surface",
-              isinstance(keys, list) and len(keys) == 18
+              isinstance(keys, list) and len(keys) == 21
               and all(isinstance(k, dict) and "name" in k
                       and "session_overridable" in k for k in keys))
 

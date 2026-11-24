@@ -46,6 +46,7 @@
 #include "fractalsql.h"       /* FSQL_OK */
 #include "fractalsql_sql.h"   /* fsql_vector_* */
 #include "fractalsql_parse.h" /* parse_vector_csv (shared with fractalsql.c) */
+#include "fsql_precision.h"   /* the ONE dot/L2/norm/cosine implementation */
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #  define FRACTAL_EXPORT __declspec(dllexport)
@@ -287,24 +288,38 @@ load_pair(UDF_ARGS *args, float **a, float **b, size_t *dim, char *errbuf)
     return true;
 }
 
+/* Which pairwise scalar the caller wants. Every one of them is computed
+ * by the ONE shared implementation in fsql_precision.h: one cosine per
+ * host, and the same bits as every other FractalSQL host. The values
+ * arrive as float32 (the canonical vector storage) and are accumulated
+ * in double; the SQL-visible result is the double itself -- no rounding
+ * to float32 on the way out. */
+typedef enum {
+    FSQLP_OP_COS_DIST = 0,
+    FSQLP_OP_COS_SIM,
+    FSQLP_OP_L2,
+    FSQLP_OP_L2_SQ,
+    FSQLP_OP_DOT
+} fsqlp_op;
+
 static bool
 compute_pair_scalar(UDF_ARGS *args, char *errbuf,
-                    int (*fn)(const float *, const float *, size_t, float *),
+                    fsqlp_op op,
                     double *out)
 {
     float *a = NULL, *b = NULL;
     size_t dim = 0;
-    float  r;
-    int    rc;
 
     if (!load_pair(args, &a, &b, &dim, errbuf)) return false;
-    rc = fn(a, b, dim, &r);
-    free(a); free(b);
-    if (rc != FSQL_OK) {
-        SFS_INIT_ERROR(errbuf, "fractal_vector: computation failed");
-        return false;
+    switch (op) {
+    case FSQLP_OP_COS_DIST: *out = fsqlp_cosine_distance_f(a, b, dim); break;
+    case FSQLP_OP_COS_SIM:  *out = fsqlp_cosine_similarity_f(a, b, dim); break;
+    case FSQLP_OP_L2:       *out = fsqlp_l2_f(a, b, dim); break;
+    case FSQLP_OP_L2_SQ:    *out = fsqlp_l2_sq_f(a, b, dim); break;
+    case FSQLP_OP_DOT:      *out = fsqlp_dot_f(a, b, dim); break;
+    default:               *out = 0.0; break;
     }
-    *out = (double) r;
+    free(a); free(b);
     return true;
 }
 
@@ -372,8 +387,7 @@ fractal_vector_norm(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error
     char    errbuf[MYSQL_ERRMSG_SIZE];
     float  *v = NULL;
     size_t  dim = 0;
-    float   out;
-    int     rc;
+    double  out;
     (void) initid;
 
     if (args->args[0] == NULL) { *is_null = 1; return 0.0; }
@@ -381,12 +395,14 @@ fractal_vector_norm(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error
     if (!load_vector(args->args[0], args->lengths[0], &v, &dim, errbuf)) {
         *error = 1; return 0.0;
     }
-    rc = fsql_vector_norm(v, dim, &out);
+    /* The shared implementation (R2): the sum of squares is accumulated
+     * in double, in a fixed sequential order, and the result is returned
+     * as a double -- NOT rounded to float32 on the way out. */
+    out = fsqlp_norm_f(v, dim);
     free(v);
-    if (rc != FSQL_OK) { SFS_INIT_ERROR(errbuf, "fractal_vector_norm: the computation failed"); *error = 1; return 0.0; }
 
     *is_null = 0;
-    return (double) out;
+    return out;
 }
 
 /* ==================================================================== */
@@ -417,7 +433,6 @@ fractal_vector_normalize(UDF_INIT *initid, UDF_ARGS *args, char *result,
     float  *v = NULL, *out;
     size_t  dim = 0;
     char   *s;
-    int     rc;
     (void) result;
 
     if (args->args[0] == NULL) { *is_null = 1; return NULL; }
@@ -427,9 +442,12 @@ fractal_vector_normalize(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
     out = malloc(dim * sizeof(float));
     if (out == NULL) { free(v); SFS_INIT_ERROR(errbuf, "fractal_vector_normalize: out of memory"); *error = 1; return NULL; }
-    rc = fsql_vector_normalize(v, dim, out);
+    /* The shared implementation: the norm is accumulated in
+     * double and the division is done in double; the ONE rounding to
+     * float32 happens here, because the canonical vector TEXT is the
+     * float32 contract (it round-trips through "%.9g"). */
+    fsqlp_normalize_f(v, dim, out);
     free(v);
-    if (rc != FSQL_OK) { free(out); SFS_INIT_ERROR(errbuf, "fractal_vector_normalize: the computation failed"); *error = 1; return NULL; }
 
     s = format_vector_json(jo, out, dim, length);
     free(out);
@@ -550,7 +568,7 @@ fractal_vector_scale(UDF_INIT *initid, UDF_ARGS *args, char *result,
 /*   fractal_vector_cosine_distance, fractal_vector_cosine_similarity     */
 /* ==================================================================== */
 
-#define FRACTAL_VECTOR_DISTANCE(NAME, FSQL_FN)                                      \
+#define FRACTAL_VECTOR_DISTANCE(NAME, FSQLP_OP)                                      \
 FRACTAL_EXPORT bool                                                                 \
 NAME##_init(UDF_INIT *initid, UDF_ARGS *args, char *message)                        \
 {                                                                                    \
@@ -575,24 +593,25 @@ NAME(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)              
     if (args->args[0] == NULL || args->args[1] == NULL) { *is_null = 1; return 0.0; } \
     if (args->lengths[0] > FSQL_VECTOR_MAX_BYTES ||                                \
         args->lengths[1] > FSQL_VECTOR_MAX_BYTES) { *error = 1; return 0.0; }      \
-    if (!compute_pair_scalar(args, errbuf, FSQL_FN, &out)) { *error = 1; return 0.0; } \
+    if (!compute_pair_scalar(args, errbuf, FSQLP_OP, &out)) { *error = 1; return 0.0; } \
     *is_null = 0;                                                                  \
     return out;                                                                     \
 }
 
-FRACTAL_VECTOR_DISTANCE(fractal_vector_l2_distance,        fsql_vector_l2)
-FRACTAL_VECTOR_DISTANCE(fractal_vector_l2_squared,          fsql_vector_l2_sq)
-FRACTAL_VECTOR_DISTANCE(fractal_vector_cosine_distance,     fsql_vector_cosine_distance)
-FRACTAL_VECTOR_DISTANCE(fractal_vector_cosine_similarity,   fsql_vector_cosine_similarity)
+FRACTAL_VECTOR_DISTANCE(fractal_vector_l2_distance,        FSQLP_OP_L2)
+FRACTAL_VECTOR_DISTANCE(fractal_vector_l2_squared,          FSQLP_OP_L2_SQ)
+FRACTAL_VECTOR_DISTANCE(fractal_vector_cosine_distance,     FSQLP_OP_COS_DIST)
+FRACTAL_VECTOR_DISTANCE(fractal_vector_cosine_similarity,   FSQLP_OP_COS_SIM)
 
 #undef FRACTAL_VECTOR_DISTANCE
 
 /* ==================================================================== */
 /* UDF triad: fractal_vector_negative_inner_product(a, b)                */
 /* Dot product, negated, so ORDER BY ... ASC ranks it like a distance   */
-/* (highest similarity first). Reuses the                                */
-/* raw dot product (fsql_vector_dot) rather than a dedicated core         */
-/* symbol, since negation is a one-line caller-side transform.           */
+/* (highest similarity first). The dot itself comes from the ONE shared */
+/* implementation (fsql_precision.h): the products are accumulated in    */
+/* double, in a fixed sequential order, and the result is returned as a  */
+/* double -- the SQL-visible value is not rounded to float32.            */
 /* ==================================================================== */
 
 FRACTAL_EXPORT bool
@@ -623,7 +642,7 @@ fractal_vector_negative_inner_product(UDF_INIT *initid, UDF_ARGS *args, char *is
     if (args->args[0] == NULL || args->args[1] == NULL) { *is_null = 1; return 0.0; }
     if (args->lengths[0] > FSQL_VECTOR_MAX_BYTES ||
         args->lengths[1] > FSQL_VECTOR_MAX_BYTES) { *error = 1; return 0.0; }
-    if (!compute_pair_scalar(args, errbuf, fsql_vector_dot, &dot)) { *error = 1; return 0.0; }
+    if (!compute_pair_scalar(args, errbuf, FSQLP_OP_DOT, &dot)) { *error = 1; return 0.0; }
 
     *is_null = 0;
     return -dot;

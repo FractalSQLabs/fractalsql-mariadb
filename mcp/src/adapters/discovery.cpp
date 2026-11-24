@@ -44,15 +44,18 @@ namespace fsqlmcp
                                   effectiveLimit( a, cfg ) );
         };
 
-        // fractal_search: plain UDF, SELECT with driver-bound text params.
-        t.push_back( mkTool( "fractal_search", "discovery", "pure", ToolClass::Cheap,
+        // fractal_sfs_converge: plain UDF, SELECT with driver-bound text params.
+        // (Renamed from fractal_search: this is the table-free convergence
+        // function, not a retrieval function. fractal_search is now the
+        // INDEXED search over a table -- see below.)
+        t.push_back( mkTool( "fractal_sfs_converge", "discovery", "pure", ToolClass::Cheap,
             "Sniper-mode SFS convergence to the single best point (or inline-corpus top-k) "
             "minimizing cosine distance to a query. One function covers both modes: pass an "
             "inline corpus for top-k search, omit `corpus` (or pass the empty corpus) for pure "
             "convergence. It never reads tables - corpus points are given inline. Set "
             "{\"debug\":true} in params for the full trajectory trace (best_point/best_fit per "
             "generation); for a convergence run that reports the trace with no corpus at all, "
-            "use fractal_search_debug. Returns "
+            "use fractal_sfs_converge_debug. Returns "
             "{dim, n_corpus, best_fit, best_point, top_k:[{idx,dist}]}.",
             { Vec( "query", true, "the query vector" ),
               Mat( "corpus", false, "inline corpus, one point per entry ('[[v11,v12],[v21,v22]]' grammar at "
@@ -66,7 +69,7 @@ namespace fsqlmcp
                                        ? a.at( "params" ) : empty;
                 const bool hasCorpus = a.contains( "corpus" ) && !a.at( "corpus" ).is_null()
                                         && a.at( "corpus" ).is_array() && !a.at( "corpus" ).empty();
-                Json result = db.callScalarBind( "SELECT fractal_search(?, ?, ?, ?)",
+                Json result = db.callScalarBind( "SELECT fractal_sfs_converge(?, ?, ?, ?)",
                     { SqlValue( hasCorpus ? packMatrix( a.at( "corpus" ), "corpus" ) : std::string( "" ) ),
                       SqlValue( packVector( a.at( "query" ), "query" ) ),
                       SqlValue( kOf( a, rowCfg ) ),
@@ -74,8 +77,8 @@ namespace fsqlmcp
                 return truncateResult( std::move( result ), effectiveLimit( a, rowCfg ) );
             }, true ) );
 
-        // fractal_search_debug: plain UDF, the convergence view of the SFS.
-        t.push_back( mkTool( "fractal_search_debug", "discovery", "pure", ToolClass::Cheap,
+        // fractal_sfs_converge_debug: plain UDF, the convergence view of the SFS.
+        t.push_back( mkTool( "fractal_sfs_converge_debug", "discovery", "pure", ToolClass::Cheap,
             "Convergence view of the Stochastic Fractal Search: no corpus, no top-k - the walk's "
             "own trace on one query point, so you can see where the search landed and how well "
             "it fit. Returns {dim, n_corpus, best_fit, best_point, trace:{...}}. Pass a `seed` "
@@ -88,7 +91,7 @@ namespace fsqlmcp
                                    "engine's own non-deterministic seed)", 0 ) },
             [ &db ]( const Json& a, CallCtx& )
             {
-                return db.callScalarBind( "SELECT fractal_search_debug(?, ?, ?, ?, ?)",
+                return db.callScalarBind( "SELECT fractal_sfs_converge_debug(?, ?, ?, ?, ?)",
                     { SqlValue( packVector( a.at( "query" ), "query" ) ),
                       SqlValue( valueOr<int>( a, "iterations", 30 ) ),
                       SqlValue( valueOr<int>( a, "population_size", 50 ) ),
@@ -142,6 +145,161 @@ namespace fsqlmcp
                       SqlValue( kOf( a, rowCfg ) ) },
                     { "result" }, MergeMode::Single );
                 return truncateResult( std::move( result ), effectiveLimit( a, rowCfg ) );
+            }, true ) );
+
+        // fractal_search: the INDEXED search over a real table. It is a
+        // stored PROCEDURE, not a UDF: a MariaDB UDF cannot read a
+        // table, so the table I/O lives in the procedure and the IVF
+        // maths in the daemon.
+        t.push_back( mkTool( "fractal_search", "discovery", "stateful", ToolClass::Cheap,
+            "Indexed K-nearest search over a real table, through the native IVF index when one "
+            "exists on that table/column (an exact scan otherwise). Returns "
+            "{result:[{doc_id, dist}] ascending, stats:{used_index, rows_scanned, cells_probed, "
+            "index, nprobe}}. doc_id is the table's own single-column primary-key value, and "
+            "every distance is EXACT: each candidate is verified against the base table with the "
+            "shared double-precision cosine, so the index never returns an approximate distance "
+            "as an answer. Indexed search does not apply Diversify repulsion.",
+            { Str( "table_name", true, "target table, bare name" ),
+              Str( "vector_col", true, "embedding column" ),
+              Vec( "query", true, "the query vector" ),
+              Int( "k", false, "neighbors to return", 5 ),
+              Obj( "options", false, "index options: {index, nprobe, rerank, use_index, ids} (ids: a JSON array of primary-key values to restrict the search to)" ),
+              RowLimit() },
+            [ &db, &rowCfg, kOf ]( const Json& a, CallCtx& )
+            {
+                const Json options = ( a.contains( "options" ) && a.at( "options" ).is_object() )
+                                       ? a.at( "options" ) : Json::object();
+                Json result = db.callProc( "fractal_search",
+                    { SqlValue( a.at( "table_name" ).get<std::string>() ),
+                      SqlValue( a.at( "vector_col" ).get<std::string>() ),
+                      SqlValue( packVector( a.at( "query" ), "query" ) ),
+                      SqlValue( kOf( a, rowCfg ) ),
+                      SqlValue( options.dump() ) },
+                    { "result", "stats" }, MergeMode::Fields );
+                return truncateResult( std::move( result ), effectiveLimit( a, rowCfg ) );
+            }, true ) );
+
+        // The index management surface.
+        t.push_back( mkTool( "fractal_index_create", "discovery", "no-retry", ToolClass::Cheap,
+            "Build the native IVF index over a table's vector column and store it in InnoDB. "
+            "Returns {name, table, column, format, dim, rows, nlist, pca_dim, code_bytes, "
+            "generation}. options: {name, vector_format: INT8|INT4|FP16|FP32, nlist, pca_dim, "
+            "iters, sample, seed}. The table needs exactly one single-column NUMERIC primary key "
+            "(the index's stable row id) and a bare name. Every returned distance stays exact: "
+            "the index only ever narrows the candidates.",
+            { Str( "table_name", true, "target table, bare name" ),
+              Str( "vector_col", true, "embedding column" ),
+              Obj( "options", false, "index options: {name, vector_format, nlist, pca_dim, iters, sample, seed}" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                const Json options = ( a.contains( "options" ) && a.at( "options" ).is_object() )
+                                       ? a.at( "options" ) : Json::object();
+                return db.callProc( "fractal_index_create",
+                    { SqlValue( a.at( "table_name" ).get<std::string>() ),
+                      SqlValue( a.at( "vector_col" ).get<std::string>() ),
+                      SqlValue( options.dump() ) },
+                    { "result" }, MergeMode::Single );
+            }, false, 1 ) );   /* writes the index: not read-only, and refused in read-only mode */
+
+        t.push_back( mkTool( "fractal_index_rebuild", "discovery", "no-retry", ToolClass::Cheap,
+            "Rebuild an existing index from the table's current rows, with the same options. The "
+            "new generation is built first; the generation pointer moves at the end, so the "
+            "previous generation keeps serving until the new one is ready.",
+            { Str( "name", true, "the index name" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callProc( "fractal_index_rebuild",
+                    { SqlValue( a.at( "name" ).get<std::string>() ) },
+                    { "result" }, MergeMode::Single );
+            }, false, 1 ) );   /* replaces the index generation: refused in read-only mode */
+
+        t.push_back( mkTool( "fractal_index_ensure", "discovery", "no-retry", ToolClass::Cheap,
+            "Leave the index on a table and column fit to use, in one call: build it when there is none "
+            "(created), fold in the added rows when that is all that is needed (refreshed), rebuild after "
+            "more than a quarter of the rows were added or a fifth deleted (rebuilt), and otherwise change "
+            "nothing (unchanged). Returns {name, action, status, generation, rows}. options are used only "
+            "when it builds (same as fractal_index_create). For a setup script or a scheduled job; a search "
+            "never builds or changes an index.",
+            { Str( "table_name", true, "the table to index" ),
+              Str( "vector_col", true, "the embedding column" ),
+              Obj( "options", false, "used only when it builds: same options as fractal_index_create" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                const Json options = ( a.contains( "options" ) && a.at( "options" ).is_object() )
+                                       ? a.at( "options" ) : Json::object();
+                return db.callProc( "fractal_index_ensure",
+                    { SqlValue( a.at( "table_name" ).get<std::string>() ),
+                      SqlValue( a.at( "vector_col" ).get<std::string>() ),
+                      SqlValue( options.dump() ) },
+                    { "result" }, MergeMode::Single );
+            }, false, 1 ) );   /* may build or change an index: refused in read-only mode */
+
+        t.push_back( mkTool( "fractal_index_drop", "discovery", "no-retry", ToolClass::Cheap,
+            "Drop an index and its stored cells. Returns {ok:1}.",
+            { Str( "name", true, "the index name" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callProc( "fractal_index_drop",
+                    { SqlValue( a.at( "name" ).get<std::string>() ) },
+                    { "ok" }, MergeMode::Single );
+            }, false, 1 ) );   /* drops the stored index: refused in read-only mode */
+
+        t.push_back( mkTool( "fractal_index_refresh", "discovery", "no-retry", ToolClass::Cheap,
+            "Fold the rows added since the build into the index's cells without retraining: each new "
+            "row is encoded with the existing model and appended to its cell, as a new generation. "
+            "Returns {name, added, rows, generation, refreshed}. Deleted rows are already dropped by "
+            "the verify step and a changed vector needs fractal_index_rebuild; fractal_index_info "
+            "says which one it advises.",
+            { Str( "name", true, "the index name" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callProc( "fractal_index_refresh",
+                    { SqlValue( a.at( "name" ).get<std::string>() ) },
+                    { "result" }, MergeMode::Single );
+            }, false, 1 ) );   /* replaces the index generation: refused in read-only mode */
+
+        t.push_back( mkTool( "fractal_index_list", "discovery", "pure", ToolClass::Cheap,
+            "List the indexes with their table, column, format, dimension, rows indexed, rows now, "
+            "status (ready, stale, empty or orphaned) and generation, sorted by name.",
+            {},
+            [ &db ]( const Json&, CallCtx& )
+            {
+                return db.callProc( "fractal_index_list", {}, { "result" }, MergeMode::Single );
+            }, true, 0 ) );   /* reads the index metadata */
+
+        t.push_back( mkTool( "fractal_index_info", "discovery", "pure", ToolClass::Cheap,
+            "Report an index's status (ready, stale, empty or orphaned) with advice on what to do "
+            "next (refresh or rebuild), its format and sizes: {name, table, column, id_col, metric, "
+            "format, dim, nlist, pca_dim, generation, rows_indexed, rows_now, max_id_indexed, "
+            "max_id_now, cells, nprobe_default, has_delta, stale, rows_added_since_build, "
+            "rows_deleted_since_build, status, advice}. \"stale\" means the table has "
+            "moved on since the build.",
+            { Str( "name", true, "the index name" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                return db.callProc( "fractal_index_info",
+                    { SqlValue( a.at( "name" ).get<std::string>() ) },
+                    { "result" }, MergeMode::Single );
+            }, true, 0 ) );   /* reads the index metadata */
+
+        t.push_back( mkTool( "fractal_index_candidates", "discovery", "stateful", ToolClass::Cheap,
+            "The candidate row ids for a Scout pass over an indexed table: every row of the "
+            "`near` nearest cells, plus `per_cell` representatives from every other cell, plus "
+            "the rows added since the build. options: {index, near, per_cell}.",
+            { Str( "table_name", true, "target table, bare name" ),
+              Str( "vector_col", true, "embedding column" ),
+              Vec( "query", true, "the query vector" ),
+              Obj( "options", false, "candidate options: {index, near, per_cell}" ) },
+            [ &db ]( const Json& a, CallCtx& )
+            {
+                const Json options = ( a.contains( "options" ) && a.at( "options" ).is_object() )
+                                       ? a.at( "options" ) : Json::object();
+                return db.callProc( "fractal_index_candidates",
+                    { SqlValue( a.at( "table_name" ).get<std::string>() ),
+                      SqlValue( a.at( "vector_col" ).get<std::string>() ),
+                      SqlValue( packVector( a.at( "query" ), "query" ) ),
+                      SqlValue( options.dump() ) },
+                    { "result" }, MergeMode::Single );
             }, true ) );
 
         t.push_back( mkTool( "fractal_hybrid_clinical_search", "discovery", "stateful", ToolClass::Cheap,

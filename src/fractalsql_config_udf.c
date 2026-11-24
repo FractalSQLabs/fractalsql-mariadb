@@ -306,7 +306,7 @@ fractal_config_reset_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
         return true;
     }
     args->arg_type[0] = INT_RESULT;
-    initid->maybe_null = 0;
+    initid->maybe_null = 1;   /* a NULL session_id returns NULL */
     return false;
 }
 

@@ -52,17 +52,17 @@ INSERT INTO demo_alerts (service, message, severity, created_at) VALUES
 -- === 2. Sniper Search: converge to a single best point ===
 -- Vector args/results are JSON-encoded strings on this extension's UDF
 -- surface (no native array type across the 10.6-12.3 compat floor, see
--- sql/install_udf.sql's own header). fractal_search takes 4 args
+-- sql/install_udf.sql's own header). fractal_sfs_converge takes 4 args
 -- (vector_csv corpus, query_csv, k, params); corpus='' (empty string)
 -- means an empty corpus, and k=1 asks for just the one converged point.
-SELECT fractal_search('', '[0.6, 0.8, 0.0]', 1, '{"iterations": 50}');
+SELECT fractal_sfs_converge('', '[0.6, 0.8, 0.0]', 1, '{"iterations": 50}');
 
 -- === 3. Ask the LLM to analyze the alerts table (real context, not a bare ping) ===
 -- JSON_ARRAYAGG plus an explicit JSON_OBJECT per row builds the same
 -- shape jsonb_agg(row_to_json(t)) would in a JSONB-native database.
 -- fractal_reason(session_id, query [, context]): session_id is
 -- required so the extension can key its per-connection context
--- (CONNECTION_ID() picks it up), the same convention fractal_search's
+-- (CONNECTION_ID() picks it up), the same convention fractal_sfs_converge's
 -- own optional session_id param JSON key uses, see
 -- fractalsql_session.h.
 SELECT fractal_reason(

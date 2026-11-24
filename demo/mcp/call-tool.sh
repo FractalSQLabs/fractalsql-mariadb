@@ -4,7 +4,7 @@
 #
 # The demo container's one-liner MCP tool call:
 #
-#   docker compose exec mariadb /demo/mcp/call-tool.sh fractal_search \
+#   docker compose exec mariadb /demo/mcp/call-tool.sh fractal_sfs_converge \
 #       '{"query":[0.6,0.8,0.0],"corpus":[[0.1,0.9,0.0]],"k":1}'
 #
 # Runs the PRODUCTION MCP server binary (the same one mcp/ builds) with
@@ -25,7 +25,7 @@ set -eu
 # same wrapper works both in the container (staged at /demo/mcp/) and
 # from a checkout (demo/mcp/).
 DEMO="$(cd "$(dirname "$0")" && pwd)"
-DEMO_TOOLS=fractal_search,fractal_reason,fractal_agent_data_analyst,fractal_agent_diverse_portfolios
+DEMO_TOOLS=fractal_sfs_converge,fractal_reason,fractal_agent_data_analyst,fractal_agent_diverse_portfolios
 
 # Resolve the server binary. The in-container path comes first (that is
 # where the image stages it), then the repo-checkout build, so the same
@@ -95,7 +95,7 @@ fi
 
 if [ "$#" -lt 1 ]; then
     echo "usage: $0 <tool-name> ['{json args}']" >&2
-    echo "demo tools: fractal_search, fractal_reason, fractal_agent_data_analyst," >&2
+    echo "demo tools: fractal_sfs_converge, fractal_reason, fractal_agent_data_analyst," >&2
     echo "            fractal_agent_diverse_portfolios" >&2
     exit 2
 fi

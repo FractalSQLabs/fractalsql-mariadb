@@ -476,7 +476,7 @@ namespace fsqlmcp
             "Sets ONE configuration key for THIS CONNECTION only, layered over the daemon-wide "
             "value -- no config-file edit and no daemon reload. A session may change the TUNING "
             "keys (reasoning_model, embed_model, think, think_num_ctx, t2s_max_attempts, "
-            "t2s_use_review) and nothing else: the keys that decide which code the daemon "
+            "t2s_use_review, agent_use_index, agent_index_min_rows, agent_context_row_bytes) and nothing else: the keys that decide which code the daemon "
             "loads, where its outbound traffic goes, what credentials it uses, and its transport "
             "posture are refused BY NAME, with the reason, by the engine. Returns {ok:true} on "
             "success, or {ok:false, reason:...} for a refusal. destructiveHint: it re-points "

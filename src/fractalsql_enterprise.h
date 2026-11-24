@@ -30,6 +30,9 @@ const fsql_storage_vfs_t *fractal_ledger_storage_vfs(void);
  * calls without duplicating the dlopen/dlsym machinery here. */
 bool fractal_enterprise_lib_loaded(void);
 
+/* Applies FRACTALSQL_LEDGER_RETENTION (fade | exact) to one context. true = applied (or nothing to apply); false = try again later. */
+bool fractal_enterprise_apply_retention(fsql_ctx *ctx);
+
 /* Authenticity gate for the reasoning plugin, which is native code run in the
  * server (or daemon) process. Called before every fsql_load_reasoning(). Trusted when:
  * FSQL_REASONING_REQUIRE_SIGNATURE=0 is set (operator opt-out: a plugin with no .sig

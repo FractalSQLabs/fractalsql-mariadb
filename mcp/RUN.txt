@@ -1,0 +1,40 @@
+fractalsql-mariadb-mcp: how to start the MCP server
+
+Where it is  (<M> is the MariaDB major version)
+  .deb / .rpm package   /usr/bin/fractalsql-mariadb-mcp
+  macOS archive         mcp/fractalsql-mariadb-mcp, in the unpacked archive
+  Windows MSI           C:\Program Files\MariaDB <M>\fractalsql-mcp\fractalsql-mcp.cmd (start it here:
+                        the launcher resolves the installed Connector/C and runs .\fractalsql-mariadb-mcp.exe)
+  The two .mcp-*-lock files must stay beside the executable: the server refuses to start without them.
+
+Settings (environment)
+  MARIADB_HOST      default 127.0.0.1
+  MARIADB_PORT      default 3306
+  MARIADB_USER      default root
+  MARIADB_PASSWORD
+  MARIADB_DATABASE
+  The server is a client of the database: the FractalSQL plugin and the fractalsqld daemon must be installed there.
+
+stdio (the default: a client such as Claude Desktop or Cursor launches the server)
+  MARIADB_USER=app MARIADB_PASSWORD=<secret> MARIADB_DATABASE=mydb \
+  fractalsql-mariadb-mcp
+
+HTTP or HTTPS (a bearer token is required)
+  FSQL_MCP_AUTH_TOKEN=<secret> fractalsql-mariadb-mcp --http 8765
+  FSQL_MCP_AUTH_TOKEN=<secret> FSQL_MCP_HTTP_TLS=1 FSQL_MCP_TLS_CERT=cert.pem FSQL_MCP_TLS_KEY=key.pem \
+  fractalsql-mariadb-mcp --http 8765
+
+Check it
+  fractalsql-mariadb-mcp --version
+  fractalsql-mariadb-mcp --list-tools
+
+What it needs
+  Linux    the MariaDB client library (libmariadb) and OpenSSL's runtime library (libssl.so.3), which the package
+           depends on.
+  macOS    Homebrew's mariadb-connector-c and openssl@3 (brew install mariadb-connector-c openssl@3).
+           The files are unsigned: clear quarantine once
+               xattr -d com.apple.quarantine mcp/fractalsql-mariadb-mcp
+  Windows  MariaDB Connector/C installed (the MSI requires it; MARIADB_CONNECTOR_HOME names a
+           non-default install). OpenSSL and the C runtime are built in.
+
+All settings are in README.md next to this file.

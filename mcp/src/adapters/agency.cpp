@@ -570,19 +570,24 @@ namespace fsqlmcp
         {
             static const std::string d =
                 "Embed a query -> Scout-search a table -> reason over the MATCHED ROWS' REAL CONTENT "
-                "(never raw vectors) -> {answer, source_doc_ids, execution_time_ms}. The full "
+                "(never raw vectors) -> {answer, source_row_ids (the rows' primary keys, best first), execution_time_ms, used_index, "
+                "context_cut {cells, rows}}. The nearest rows come from a Scout search, or through a fractal_index when the "
+                "session's agent_use_index allows it (off, on or auto). meta_filter limits the rows searched. The full "
                 "retrieve+reason building block." + kLlm + kContent + kPartialNote;
             t.push_back( mkTool( "fractal_search_agent", "agency", "no-retry", ToolClass::Expensive, d.c_str(),
                 { Str( "query", true, "the query text (it gets embedded for you)" ),
                   Str( "table_name", true, "table to search" ),
                   Str( "vector_col", true, "embedding column" ),
                   Int( "pop_size", false, "", 50 ),
-                  Int( "iterations", false, "", 15 ) },
+                  Int( "iterations", false, "", 15 ),
+                  Str( "meta_filter", false, "flat JSON object of column: value pairs; only rows where every column equals its value are searched", "{}" ) },
                 [ &db, strReq, intArg ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_search_agent",
                         { strReq( a, "query" ), strReq( a, "table_name" ), strReq( a, "vector_col" ),
-                          intArg( a, "pop_size", 50 ), intArg( a, "iterations", 15 ) },
+                          intArg( a, "pop_size", 50 ), intArg( a, "iterations", 15 ),
+                          ( a.contains( "meta_filter" ) && !a.at( "meta_filter" ).is_null() )
+                            ? SqlValue( a.at( "meta_filter" ).get<std::string>() ) : SqlValue( std::string( "{}" ) ) },
                         { "result" }, MergeMode::Single );
                 }, false, false, true, true ) );
         }
@@ -590,13 +595,14 @@ namespace fsqlmcp
         {
             static const std::string d =
                 "Lighter single-turn RAG sibling of fractal_search_agent (fixed pop_size=50 / "
-                "iterations=15): embed -> Scout -> reason -> {answer} only. meta_filter is accepted "
-                "for signature parity but currently unused (documented)." + kContent + kPartialNote;
+                "iterations=15): embed -> nearest rows -> reason -> {answer, source_row_ids, used_index, context_cut}. "
+                "meta_filter, a flat JSON object of column: value pairs, limits the rows searched (a filter that is "
+                "malformed, names a missing column or matches no row is an error)." + kContent + kPartialNote;
             t.push_back( mkTool( "fractal_rag_agent", "agency", "no-retry", ToolClass::Expensive, d.c_str(),
                 { Str( "query", true, "the query text" ),
                   Str( "table_name", true, "table to search" ),
                   Str( "vector_col", true, "embedding column" ),
-                  Str( "meta_filter", false, "accepted for signature parity; currently unused", "{}" ) },
+                  Str( "meta_filter", false, "flat JSON object of column: value pairs; only rows where every column equals its value are searched", "{}" ) },
                 [ &db, strReq ]( const Json& a, CallCtx& )
                 {
                     return db.callProc( "fractal_rag_agent",

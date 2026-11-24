@@ -7,7 +7,7 @@
 -- ordinary procedures is the whole mechanism: nothing else needs building.
 --
 -- Prerequisite: sql/install_udf.sql must already be run. This script calls
--- fractal_search/_telemetry, fractal_hybrid_clinical_search, fractal_
+-- fractal_sfs_converge/_telemetry, fractal_hybrid_clinical_search, fractal_
 -- search_trajectory, fractal_reason, fractal_dimension_*, fractal_
 -- optimize_portfolio(_multimodal), fractal_morphological_complexity,
 -- fractal_diversify_*, fractal_feedback_report/_isolate_background, and
@@ -106,6 +106,10 @@ DROP PROCEDURE IF EXISTS _fractalsql_agent_require_ident;
 DROP PROCEDURE IF EXISTS _fractalsql_agent_require_rows;
 DROP PROCEDURE IF EXISTS _fractalsql_agent_reason;
 DROP PROCEDURE IF EXISTS _fractalsql_agent_nearest1;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_search1;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_index_name;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_filter_where;
+DROP PROCEDURE IF EXISTS _fractalsql_agent_retrieve;
 DROP PROCEDURE IF EXISTS _fractalsql_agent_pk_col;
 DROP PROCEDURE IF EXISTS _fractalsql_agent_cohort;
 DROP PROCEDURE IF EXISTS fractal_agent_anomaly_triage;
@@ -245,18 +249,222 @@ BEGIN
     IF o_failed IS NOT NULL THEN SET o_reason = NULL; END IF;
 END$$
 
+-- _fractalsql_agent_index_name(table, col, OUT name)
+-- The name of the fractal_index the agents should search through on this table and column, NULL when they should scan. The session key
+-- agent_use_index is off (never, the default), on (when an index exists) or auto. auto uses an index only when it is ready and was
+-- calibrated to its target recall (an estimate from a sample, made at build time) on a table of at least agent_index_min_rows rows; otherwise auto scans exactly. Set with
+-- SELECT fractal_config_set('agent_use_index', 'on', CONNECTION_ID()).
+CREATE PROCEDURE _fractalsql_agent_index_name(
+    IN  p_table VARCHAR(128),
+    IN  p_col   VARCHAR(64),
+    OUT o_name  VARCHAR(64)
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_mode  VARCHAR(16);
+    DECLARE v_n     INT DEFAULT 0;
+    DECLARE v_info  LONGTEXT;
+    DECLARE v_minrows BIGINT DEFAULT 10000;
+    DECLARE CONTINUE HANDLER FOR 1146 SET v_n = 0;   -- no fractal_index_meta yet: no index exists
+
+    SET o_name = NULL;
+    SET v_mode = LOWER(IFNULL(fractal_config_get('agent_use_index', CONNECTION_ID()), ''));
+    IF v_mode IN ('on', 'auto') THEN
+        SELECT COUNT(*) INTO v_n FROM fractal_index_meta WHERE tbl = p_table AND col = p_col;
+        IF v_n > 0 THEN
+            SELECT name INTO o_name FROM fractal_index_meta WHERE tbl = p_table AND col = p_col ORDER BY name LIMIT 1;
+            -- auto: only a ready index, calibrated to its target recall, on a table of at least agent_index_min_rows rows
+            IF v_mode = 'auto' THEN
+                SET v_minrows = COALESCE(CAST(fractal_config_get('agent_index_min_rows', CONNECTION_ID()) AS SIGNED), 10000);
+                CALL fractal_index_info(o_name, v_info);
+                IF v_info IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.status')) <> 'ready'
+                   OR JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.calibration.reaches_target')) IS NULL
+                   OR JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.calibration.reaches_target')) <> 'true'
+                   OR CAST(JSON_UNQUOTE(JSON_EXTRACT(v_info, '$.rows_now')) AS SIGNED) < v_minrows THEN
+                    SET o_name = NULL;
+                END IF;
+            END IF;
+        END IF;
+    END IF;
+END$$
+
+-- _fractalsql_agent_search1(table, col, query, OUT hits)
+-- The one-neighbour search the nearest-row agents (route_task,
+-- outlier_intercept, schedule_workload) share. By default it is the exact
+-- scan, fractal_search_telemetry. When _fractalsql_agent_index_name finds
+-- an index the session allows (agent_use_index on), it
+-- searches through the index instead. Every distance is still exact; an
+-- index can rarely pick a different nearest row than the exact scan, which
+-- is why it is opt-in. Both paths return the same [{"doc_id":..,"dist":..}]
+-- shape, and the session variable @_fractalsql_agent_search_path records
+-- which one ran.
+CREATE PROCEDURE _fractalsql_agent_search1(
+    IN  p_table VARCHAR(128),
+    IN  p_col   VARCHAR(64),
+    IN  p_query JSON,
+    OUT o_hits  TEXT
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_name  VARCHAR(64);
+    DECLARE v_res   LONGTEXT;
+    DECLARE v_stats LONGTEXT;
+
+    CALL _fractalsql_agent_index_name(p_table, p_col, v_name);
+    IF v_name IS NOT NULL THEN
+        CALL fractal_search(p_table, p_col, p_query, 1, '{}', v_res, v_stats);
+        SET o_hits = v_res;
+        SET @_fractalsql_agent_search_path = 'index';
+    ELSE
+        CALL fractal_search_telemetry(p_table, p_col, p_query, 1, o_hits);
+        SET @_fractalsql_agent_search_path = 'scan';
+    END IF;
+END$$
+
+-- _fractalsql_agent_filter_where(proc, table, meta_filter, OUT where)
+-- A flat meta_filter ({"column": value, ...}) as a WHERE condition, every value quoted as a literal so it takes the column's own type
+-- (null becomes IS NULL). NULL for no filter. A filter that is not a flat object, a column the table does not have, and a value that is
+-- not a string, number, boolean or null are errors: a filter is never ignored.
+CREATE PROCEDURE _fractalsql_agent_filter_where(
+    IN  p_proc   VARCHAR(64),
+    IN  p_table  VARCHAR(128),
+    IN  p_filter JSON,
+    OUT o_where  TEXT
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_keys JSON;
+    DECLARE v_n    INT DEFAULT 0;
+    DECLARE v_i    INT DEFAULT 0;
+    DECLARE v_key  VARCHAR(255);
+    DECLARE v_path VARCHAR(300);
+    DECLARE v_type VARCHAR(32);
+    DECLARE v_cols INT DEFAULT 0;
+
+    SET o_where = NULL;
+    IF p_filter IS NULL OR JSON_TYPE(p_filter) = 'NULL' THEN
+        SET v_n = 0;
+    ELSEIF JSON_TYPE(p_filter) <> 'OBJECT' THEN
+        CALL _fractalsql_agent_fail(p_proc, 'meta_filter must be a JSON object of column: value pairs');
+    ELSE
+        SET v_keys = JSON_KEYS(p_filter);
+        SET v_n = IFNULL(JSON_LENGTH(v_keys), 0);
+    END IF;
+    WHILE v_i < v_n DO
+        SET v_key  = JSON_UNQUOTE(JSON_EXTRACT(v_keys, CONCAT('$[', v_i, ']')));
+        SET v_path = CONCAT('$."', REPLACE(v_key, '"', '\\"'), '"');
+        SELECT COUNT(*) INTO v_cols FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = p_table AND column_name = v_key;
+        IF v_cols = 0 THEN
+            CALL _fractalsql_agent_fail(p_proc, CONCAT('meta_filter column ', v_key, ' does not exist on ', p_table));
+        END IF;
+        SET v_type = JSON_TYPE(JSON_EXTRACT(p_filter, v_path));
+        IF v_type = 'NULL' THEN
+            SET o_where = CONCAT_WS(' AND ', o_where, CONCAT(_fractalsql_quote_ident(v_key), ' IS NULL'));
+        ELSEIF v_type IN ('STRING', 'INTEGER', 'DOUBLE', 'BOOLEAN', 'UNSIGNED INTEGER', 'DECIMAL') THEN
+            -- JSON_VALUE, not JSON_UNQUOTE(JSON_EXTRACT(...)): MariaDB 10.6's
+            -- JSON_UNQUOTE cannot carry a character outside the BMP, and a
+            -- filter value the operator wrote with one would silently become
+            -- a comparison against "?" and match nothing.
+            SET o_where = CONCAT_WS(' AND ', o_where,
+                CONCAT(_fractalsql_quote_ident(v_key), ' = ', QUOTE(IFNULL(JSON_VALUE(p_filter, v_path), ''))));
+        ELSE
+            CALL _fractalsql_agent_fail(p_proc, CONCAT('meta_filter value for ', v_key, ' must be a string, number, boolean or null'));
+        END IF;
+        SET v_i = v_i + 1;
+    END WHILE;
+END$$
+
+-- _fractalsql_agent_retrieve(proc, table, col, query_vec, k, meta_filter, OUT doc_ids, OUT used_index)
+-- The retrieval agents' search step: the real primary keys of the k nearest rows (best first). Through the index when
+-- _fractalsql_agent_index_name allows it (restricted to meta_filter's rows by the ids option), else a Scout search over the scanned rows.
+CREATE PROCEDURE _fractalsql_agent_retrieve(
+    IN  p_proc      VARCHAR(64),
+    IN  p_table     VARCHAR(128),
+    IN  p_col       VARCHAR(64),
+    IN  p_query_vec JSON,
+    IN  p_k         INT,
+    IN  p_filter    JSON,
+    OUT o_doc_ids   JSON,
+    OUT o_used      BOOLEAN
+)
+SQL SECURITY INVOKER
+BEGIN
+    DECLARE v_where  TEXT;
+    DECLARE v_name   VARCHAR(64);
+    DECLARE v_pk_col VARCHAR(64);
+    DECLARE v_ids    JSON;
+    DECLARE v_nrows  BIGINT DEFAULT 0;
+    DECLARE v_res    LONGTEXT;
+    DECLARE v_stats  LONGTEXT;
+    DECLARE v_opts   JSON;
+    DECLARE v_corpus JSON;
+    DECLARE v_cids   JSON;
+    DECLARE v_topk   JSON;
+
+    SET o_used = FALSE;
+    CALL _fractalsql_agent_pk_col(p_proc, 'table_name', p_table, v_pk_col);
+    CALL _fractalsql_agent_filter_where(p_proc, p_table, p_filter, v_where);
+    IF v_where IS NOT NULL THEN
+        SET @_fractalsql_ar_sql = CONCAT('SELECT COUNT(*) INTO @_fractalsql_ar_n FROM ', _fractalsql_quote_ident(p_table),
+            ' WHERE ', _fractalsql_quote_ident(p_col), ' IS NOT NULL AND (', v_where, ')');
+        SET @_fractalsql_ar_n = 0;
+        PREPARE _fractalsql_ar_stmt FROM @_fractalsql_ar_sql;
+        EXECUTE _fractalsql_ar_stmt;
+        DEALLOCATE PREPARE _fractalsql_ar_stmt;
+        SET v_nrows = IFNULL(@_fractalsql_ar_n, 0);
+        IF v_nrows = 0 THEN
+            CALL _fractalsql_agent_fail(p_proc, CONCAT('no rows found in ', p_table, '.', p_col, ' for that meta_filter'));
+        END IF;
+    END IF;
+
+    CALL _fractalsql_agent_index_name(p_table, p_col, v_name);
+    IF v_name IS NOT NULL AND (v_where IS NULL OR v_nrows <= 100000) THEN
+        SET v_opts = JSON_OBJECT();
+        IF v_where IS NOT NULL THEN
+            SET @_fractalsql_ar_sql = CONCAT('SELECT JSON_ARRAYAGG(', _fractalsql_quote_ident(v_pk_col), ') INTO @_fractalsql_ar_ids FROM ',
+                _fractalsql_quote_ident(p_table), ' WHERE ', _fractalsql_quote_ident(p_col), ' IS NOT NULL AND (', v_where, ')');
+            SET @_fractalsql_ar_ids = NULL;
+            PREPARE _fractalsql_ar_stmt FROM @_fractalsql_ar_sql;
+            EXECUTE _fractalsql_ar_stmt;
+            DEALLOCATE PREPARE _fractalsql_ar_stmt;
+            -- The ids are spliced in as a JSON literal: JSON_OBJECT
+            -- stringifies a JSON-typed argument.
+            SET v_opts = CONCAT('{"ids":', JSON_EXTRACT(@_fractalsql_ar_ids, '$'), '}');
+        END IF;
+        CALL fractal_search(p_table, p_col, p_query_vec, LEAST(p_k, 64), v_opts, v_res, v_stats);
+        SET o_doc_ids = IFNULL(JSON_EXTRACT(v_res, '$[*].doc_id'), JSON_ARRAY());
+        SET o_used = TRUE;
+    ELSE
+        SET @_fractalsql_scan_where = v_where;
+        CALL _fractalsql_scan_corpus(p_table, p_col, v_corpus, v_cids);
+        SET @_fractalsql_scan_where = NULL;
+        CALL _fractalsql_telemetry_topk(v_corpus, v_cids, p_query_vec, p_k, v_topk);
+        SET o_doc_ids = IFNULL(JSON_EXTRACT(v_topk, '$[*].doc_id'), JSON_ARRAY());
+    END IF;
+END$$
+
 -- _fractalsql_agent_nearest1(hits, OUT doc_id, OUT dist)
 -- The nearest-hit extraction: every engine that searches a table ends
 -- by reading the first hit's id and distance, and every one of them
 -- used to spell that out by hand.
 CREATE PROCEDURE _fractalsql_agent_nearest1(
     IN  p_hits   TEXT,
-    OUT o_doc_id VARCHAR(255),
+    OUT o_doc_id TEXT,
     OUT o_dist   DOUBLE
 )
 SQL SECURITY INVOKER
 BEGIN
-    SET o_doc_id = JSON_VALUE(p_hits, '$[0].doc_id');
+    -- JSON_VALUE, not JSON_UNQUOTE(JSON_EXTRACT(...)): on MariaDB 10.6
+    -- JSON_UNQUOTE cannot carry a character outside the BMP (a 4-byte
+    -- UTF-8 one -- an emoji, a rare CJK ideograph): it either replaces it
+    -- with "?" or hands the string back still quoted, so an id holding one
+    -- came back CORRUPTED in every agent answer on that major. JSON_VALUE
+    -- returns the text as it is on every supported major (this file
+    -- already uses it in two dozen places). Its one difference is that an
+    -- EMPTY string comes back as NULL -- hence the IFNULL, so an empty id
+    -- stays an empty id and not a null.
+    SET o_doc_id = IFNULL(JSON_VALUE(p_hits, '$[0].doc_id'), '');
     SET o_dist   = JSON_VALUE(p_hits, '$[0].dist');
 END$$
 
@@ -450,7 +658,7 @@ BEGIN
     CALL _fractalsql_agent_require_ident('fractal_agent_route_task', JSON_ARRAY(p_cap_table, p_cap_emb_col),
         'identifier arguments must not be NULL');
 
-    CALL fractal_search_telemetry(p_cap_table, p_cap_emb_col, p_task_emb, 1, v_telemetry);
+    CALL _fractalsql_agent_search1(p_cap_table, p_cap_emb_col, p_task_emb, v_telemetry);
     CALL _fractalsql_agent_require_rows('fractal_agent_route_task', 'no capability rows found', v_telemetry);
 
     CALL _fractalsql_agent_nearest1(v_telemetry, v_routed_to, v_dist);
@@ -520,7 +728,7 @@ BEGIN
     IF p_metric = 'cosine' THEN
         -- The exact telemetry engine, as calibrated. Works for JSON and
         -- native VECTOR columns alike (the scan helper handles both).
-        CALL fractal_search_telemetry(p_history_table, p_emb_col, p_state_vec, 1, v_telemetry);
+        CALL _fractalsql_agent_search1(p_history_table, p_emb_col, p_state_vec, v_telemetry);
         CALL _fractalsql_agent_require_rows('fractal_agent_outlier_intercept', 'no bad-state rows found', v_telemetry);
 
         SET v_dist    = JSON_VALUE(v_telemetry, '$[0].dist');
@@ -604,6 +812,9 @@ BEGIN
     DECLARE v_pk_col   VARCHAR(64);
     DECLARE v_cohort   JSON;
     DECLARE v_hits     TEXT;
+    DECLARE v_idx      VARCHAR(64);
+    DECLARE v_stats    LONGTEXT;
+    DECLARE v_res      LONGTEXT;
 
     CALL _fractalsql_agent_require_ident('fractal_agent_recall_hybrid', JSON_ARRAY(p_mem_table, p_vec_col),
         'identifier arguments must not be NULL');
@@ -619,17 +830,27 @@ BEGIN
         CALL _fractalsql_agent_fail('fractal_agent_recall_hybrid', 'filter matched no rows');
     END IF;
 
-    CALL fractal_hybrid_clinical_search(p_mem_table, p_vec_col, p_query_vec, v_cohort, IFNULL(p_k, 5), v_hits);
+    -- Through the index (session key agent_use_index on): the cohort becomes the ids option of fractal_search and the
+    -- answer is the same rows.
+    CALL _fractalsql_agent_index_name(p_mem_table, p_vec_col, v_idx);
+    IF v_idx IS NOT NULL AND JSON_LENGTH(v_cohort) <= 100000 THEN
+        -- The cohort is spliced in as a JSON literal (see the note on the
+        -- ids option above).
+        CALL fractal_search(p_mem_table, p_vec_col, p_query_vec, IFNULL(p_k, 5), CONCAT('{"ids":', JSON_EXTRACT(v_cohort, '$'), '}'), v_res, v_stats);
+        SET v_hits = v_res;
+    ELSE
+        CALL fractal_hybrid_clinical_search(p_mem_table, p_vec_col, p_query_vec, v_cohort, IFNULL(p_k, 5), v_hits);
+    END IF;
 
     IF p_content_col IS NULL THEN
         SELECT JSON_ARRAYAGG(JSON_OBJECT('mem_id', h.doc_id, 'content', NULL))
           INTO p_result
-        FROM JSON_TABLE(v_hits, '$[*]' COLUMNS (doc_id VARCHAR(255) PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
+        FROM JSON_TABLE(v_hits, '$[*]' COLUMNS (doc_id TEXT PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
     ELSE
         SET @_fractalsql_rh_sql2 = CONCAT(
             'SELECT JSON_ARRAYAGG(JSON_OBJECT(''mem_id'', h.doc_id, ''content'', t.',
             _fractalsql_quote_ident(p_content_col), ')) INTO @_fractalsql_rh_result ',
-            'FROM JSON_TABLE(@_fractalsql_rh_hits, ''$[*]'' COLUMNS (doc_id VARCHAR(255) PATH ''$.doc_id'', ord FOR ORDINALITY)) h ',
+            'FROM JSON_TABLE(@_fractalsql_rh_hits, ''$[*]'' COLUMNS (doc_id TEXT PATH ''$.doc_id'', ord FOR ORDINALITY)) h ',
             'JOIN ', _fractalsql_quote_ident(p_mem_table), ' t ON t.', _fractalsql_quote_ident(v_pk_col), ' = h.doc_id ',
             'ORDER BY h.ord');
         SET @_fractalsql_rh_hits = v_hits;
@@ -672,7 +893,7 @@ BEGIN
 
     SELECT JSON_ARRAYAGG(JSON_OBJECT('item_id', h.doc_id, 'score', 1.0 - h.dist))
       INTO p_result
-    FROM JSON_TABLE(v_telemetry, '$[*]' COLUMNS (doc_id VARCHAR(255) PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
+    FROM JSON_TABLE(v_telemetry, '$[*]' COLUMNS (doc_id TEXT PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
 
     IF p_result IS NULL THEN SET p_result = JSON_ARRAY(); END IF;
 END$$
@@ -758,7 +979,7 @@ BEGIN
     DECLARE v_cohort     JSON;
     DECLARE v_hybrid     TEXT;
     DECLARE v_traj       TEXT;
-    DECLARE v_cohort_id  VARCHAR(255);
+    DECLARE v_cohort_id  TEXT;
     DECLARE v_cohort_dist DOUBLE;
     DECLARE v_traj_dist   DOUBLE;
     DECLARE v_rationale   TEXT;
@@ -795,7 +1016,7 @@ BEGIN
     -- convention (recall_hybrid -> mem_id, recommend_diverse -> item_id/score).
     SELECT JSON_ARRAYAGG(JSON_OBJECT('id', h.doc_id, 'distance', h.dist) ORDER BY h.dist)
       INTO v_cohort_matches
-    FROM JSON_TABLE(v_hybrid, '$[*]' COLUMNS (doc_id VARCHAR(255) PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
+    FROM JSON_TABLE(v_hybrid, '$[*]' COLUMNS (doc_id TEXT PATH '$.doc_id', dist DOUBLE PATH '$.dist')) h;
 
     CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Triage this patient: nearest cohort match is id ', IFNULL(v_cohort_id, '?'),
@@ -845,7 +1066,7 @@ BEGIN
     DECLARE v_done       BOOLEAN DEFAULT FALSE;
     DECLARE v_warmup_vec TEXT;
     DECLARE v_target_telemetry TEXT;
-    DECLARE v_target_id  VARCHAR(255);
+    DECLARE v_target_id  TEXT;
     DECLARE v_dq         DOUBLE;
     DECLARE v_diag       TEXT;
     DECLARE v_ignored    TEXT;
@@ -886,7 +1107,10 @@ BEGIN
     -- (the k=1 telemetry doc_id is the handle).
     CALL fractal_search_telemetry(p_catalog_table, p_emb_col, p_query_vec, 1, v_target_telemetry);
     IF v_target_telemetry IS NOT NULL AND JSON_LENGTH(v_target_telemetry) > 0 THEN
-        SET v_target_id = JSON_VALUE(v_target_telemetry, '$[0].doc_id');
+        -- JSON_VALUE, not JSON_UNQUOTE(JSON_EXTRACT(...)): see the note in
+        -- _fractalsql_agent_nearest1 (MariaDB 10.6's JSON_UNQUOTE cannot
+        -- carry a character outside the BMP).
+        SET v_target_id = IFNULL(JSON_VALUE(v_target_telemetry, '$[0].doc_id'), '');
         SELECT fractal_isolate_background(v_session_id, v_target_id) INTO v_ignored;
     END IF;
 
@@ -901,8 +1125,8 @@ END$$
 
 -- =====================================================================
 -- Engine J: fractal_agent_schedule_workload
--- fractal_search (sniper refinement) + fractal_search_telemetry +
--- reason. Like Engine C but with the fractal_search refinement step
+-- fractal_sfs_converge (sniper refinement) + fractal_search_telemetry +
+-- reason. Like Engine C but with the fractal_sfs_converge refinement step
 -- route_task lacks.
 -- =====================================================================
 CREATE PROCEDURE fractal_agent_schedule_workload(
@@ -931,9 +1155,9 @@ BEGIN
     CALL _fractalsql_agent_require_ident('fractal_agent_schedule_workload', JSON_ARRAY(p_node_table, p_node_emb_col),
         'identifier arguments must not be NULL');
 
-    -- fractal_search's own corpus/query shape: a single-row corpus (the
+    -- fractal_sfs_converge's own corpus/query shape: a single-row corpus (the
     -- task vector itself) refines toward its own local optimum, the
-    -- "sniper search" idea behind fractal_search(task_vec, ...).
+    -- "sniper search" idea behind fractal_sfs_converge(task_vec, ...).
     -- NOTE: wrapping via plain CONCAT, not JSON_ARRAY(p_task_vec).
     -- JSON_ARRAY() on an already-JSON-text argument double-encodes it
     -- as a quoted STRING element ('["[0.9,0.1,0]"]'), not a real
@@ -941,13 +1165,13 @@ BEGIN
     -- sql/install_udf.sql's CAST(x AS JSON)/JSON_ARRAYAGG note:
     -- MariaDB's JSON type has no distinct binary representation that a
     -- JSON-producing function can recognize and nest verbatim.
-    SET v_refined_json = fractal_search(
+    SET v_refined_json = fractal_sfs_converge(
         CONCAT('[', p_task_vec, ']'), p_task_vec,
         IFNULL(p_iterations, 30),
         JSON_OBJECT('population_size', IFNULL(p_population, 50), 'diffusion_factor', 2));
     SET v_refined = JSON_EXTRACT(v_refined_json, '$.best_point');
 
-    CALL fractal_search_telemetry(p_node_table, p_node_emb_col, v_refined, 1, v_telemetry);
+    CALL _fractalsql_agent_search1(p_node_table, p_node_emb_col, v_refined, v_telemetry);
     CALL _fractalsql_agent_require_rows('fractal_agent_schedule_workload', 'no node rows found', v_telemetry);
 
     CALL _fractalsql_agent_nearest1(v_telemetry, v_assigned, v_dist);
@@ -955,7 +1179,7 @@ BEGIN
 
     CALL _fractalsql_agent_reason(v_session_id,
         CONCAT('Schedule this workload onto node ', IFNULL(v_assigned, '?'),
-               ' (cosine distance ', v_dist, ' after fractal_search refinement). ',
+               ' (cosine distance ', v_dist, ' after fractal_sfs_converge refinement). ',
                'Justify the placement in one sentence.'),
         IFNULL(p_context, '{}'),
         v_rationale, v_rationale_failed);
@@ -990,7 +1214,7 @@ BEGIN
     DECLARE v_sharpe    DOUBLE;
     DECLARE v_weights   JSON;
     DECLARE v_traj      TEXT;
-    DECLARE v_alloc_id  VARCHAR(255);
+    DECLARE v_alloc_id  TEXT;
     DECLARE v_dist       DOUBLE;
     DECLARE v_rationale  TEXT;
     DECLARE v_rationale_failed TEXT;
@@ -1047,7 +1271,7 @@ SQL SECURITY INVOKER
 BEGIN
     DECLARE v_session_id BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_traj     TEXT;
-    DECLARE v_fleet_id VARCHAR(255);
+    DECLARE v_fleet_id TEXT;
     DECLARE v_dist      DOUBLE;
     DECLARE v_bc         DOUBLE;
     DECLARE v_rationale  TEXT;
@@ -1098,7 +1322,7 @@ SQL SECURITY INVOKER
 BEGIN
     DECLARE v_session_id BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_traj     TEXT;
-    DECLARE v_track_id VARCHAR(255);
+    DECLARE v_track_id TEXT;
     DECLARE v_dist      DOUBLE;
     DECLARE v_dfa        DOUBLE;
     DECLARE v_rationale   TEXT;
@@ -1386,7 +1610,7 @@ BEGIN
     DECLARE v_baseline_vec  JSON;
     DECLARE v_current_vec   JSON;
     DECLARE v_traj          TEXT;
-    DECLARE v_predicted_id  VARCHAR(255);
+    DECLARE v_predicted_id  TEXT;
     DECLARE v_predicted_vec JSON;
     DECLARE v_drift         DOUBLE;
     DECLARE v_threshold     DOUBLE DEFAULT IFNULL(p_risk_threshold, 0.5);
@@ -1459,33 +1683,40 @@ BEGIN
         'risk_threshold_exceeded', (v_drift > v_threshold));
 END$$
 
--- fractal_search_agent(query, table_name, vector_col, pop_size, iterations, OUT result)
--- Embed the query, Scout-search a caller-named table's vector column
--- for the top pop_size nearest rows, reason over the MATCHED ROWS'
+-- fractal_search_agent(query, table_name, vector_col, pop_size, iterations, meta_filter, OUT result)
+-- Embed the query, find the pop_size nearest rows of a caller-named table's
+-- vector column (a Scout search, or fractal_search through an index when the
+-- session key agent_use_index allows it), reason over the MATCHED ROWS'
 -- CONTENT (never the raw vectors -- an LLM should never see a raw
 -- embedding array, and it's useless to it anyway; see
 -- _fractalsql_fetch_row_context's own header comment,
 -- sql/install_udf.sql), return the answer plus which rows fed it.
--- execution_time_ms is a real wall-clock measurement (SYSDATE(6)
--- start/end).
+-- meta_filter is a flat JSON object {"column": value, ...} (or NULL / '{}'
+-- for none): only rows where every named column equals its value are
+-- searched; a filter that is not an object, names a missing column, or
+-- matches no row is an error.
+-- Result: {answer, source_row_ids (the rows' primary keys, best first),
+-- execution_time_ms (a real SYSDATE(6) measurement), used_index,
+-- context_cut {cells, rows}, reasoning_step_failed}.
 CREATE PROCEDURE fractal_search_agent(
     IN  p_query       TEXT,
     IN  p_table_name  VARCHAR(128),
     IN  p_vector_col  VARCHAR(64),
     IN  p_pop_size    INT,
     IN  p_iterations  INT,
+    IN  p_meta_filter JSON,
     OUT p_result      JSON
 )
 SQL SECURITY INVOKER
 BEGIN
     DECLARE v_session_id BIGINT UNSIGNED DEFAULT CONNECTION_ID();
     DECLARE v_query_vec  JSON;
-    DECLARE v_corpus     JSON;
-    DECLARE v_ids        JSON;
     DECLARE v_k          INT DEFAULT IFNULL(p_pop_size, 50);
-    DECLARE v_topk       JSON;
     DECLARE v_doc_ids    JSON;
+    DECLARE v_used       BOOLEAN DEFAULT FALSE;
     DECLARE v_context    JSON;
+    DECLARE v_cut        INT DEFAULT 0;
+    DECLARE v_dropped    INT DEFAULT 0;
     DECLARE v_answer     TEXT;
     DECLARE v_answer_failed TEXT;
     DECLARE v_started    DATETIME(6);
@@ -1504,48 +1735,58 @@ BEGIN
         CALL _fractalsql_agent_fail('fractal_search_agent', 'embedding failed');
     END IF;
 
-    CALL _fractalsql_scan_corpus(p_table_name, p_vector_col, v_corpus, v_ids);
-    CALL _fractalsql_telemetry_topk(v_corpus, v_ids, v_query_vec, v_k, v_topk);
-
-    SET v_doc_ids = IFNULL(JSON_EXTRACT(v_topk, '$[*].doc_id'), JSON_ARRAY());
-    CALL _fractalsql_fetch_row_context(p_table_name, p_vector_col, v_doc_ids, v_context);
+    CALL _fractalsql_agent_retrieve('fractal_search_agent', p_table_name, p_vector_col, v_query_vec, v_k, p_meta_filter, v_doc_ids, v_used);
+    CALL _fractalsql_fetch_row_context(p_table_name, p_vector_col, v_doc_ids, v_context, v_cut, v_dropped);
 
     CALL _fractalsql_agent_reason(v_session_id, p_query, v_context,
         v_answer, v_answer_failed);
 
-    SET p_result = JSON_OBJECT(
+    SET p_result = JSON_MERGE_PRESERVE(JSON_OBJECT(
         'answer', v_answer,
-        'source_doc_ids', JSON_EXTRACT(v_doc_ids, '$'),
         'execution_time_ms', TIMESTAMPDIFF(MICROSECOND, v_started, SYSDATE(6)) / 1000.0,
-        'reasoning_step_failed', v_answer_failed);
+        'used_index', IF(v_used, TRUE, FALSE),
+        'context_cut', JSON_OBJECT('cells', CAST(v_cut AS SIGNED), 'rows', CAST(v_dropped AS SIGNED)),
+        'reasoning_step_failed', v_answer_failed),
+        -- The row ids are spliced in as a JSON literal: JSON_OBJECT
+        -- stringifies a JSON-typed argument, which mangled the caller's own
+        -- id text.
+        CONCAT('{"source_row_ids":', IFNULL(JSON_EXTRACT(v_doc_ids, '$'), '[]'), '}'));
 END$$
 
--- fractal_rag_agent(query, table_name, vector_col, meta_filter, OUT answer)
--- Same embed -> scan -> Scout search -> content-refetch -> reason
--- pipeline as fractal_search_agent above, with pop_size=50/
--- iterations=15 hardcoded instead of caller-configurable, returning
--- only the answer text (not source_doc_ids/execution_time_ms).
+-- fractal_rag_agent(query, table_name, vector_col, meta_filter, OUT result)
+-- Same embed -> search -> content-refetch -> reason pipeline as
+-- fractal_search_agent above, with pop_size=50 hardcoded, returning
+-- {answer, source_row_ids, used_index, context_cut} (no timing).
+-- meta_filter works exactly as it does for fractal_search_agent.
 -- Implemented as a thin wrapper around fractal_search_agent rather
--- than a second copy of the same pipeline. p_meta_filter is accepted
--- for future use but currently UNUSED: reserved for a future WHERE
--- clause; for now the whole corpus is scanned.
+-- than a second copy of the same pipeline.
 --
--- S-FT-004: this OUT is the bare answer scalar, so a session in
--- partial mode that hit a reasoning-endpoint failure returns NULL
--- here; the failure detail and source_doc_ids ride the underlying
--- fractal_search_agent document (see its comment, one procedure up).
+-- S-FT-004: in a session in partial mode that hit a reasoning-endpoint
+-- failure, answer is NULL and reasoning_step_failed carries the detail
+-- (see fractal_search_agent above).
 CREATE PROCEDURE fractal_rag_agent(
     IN  p_query        TEXT,
     IN  p_table_name   VARCHAR(128),
     IN  p_vector_col   VARCHAR(64),
     IN  p_meta_filter  JSON,
-    OUT p_answer       TEXT
+    OUT p_result       JSON
 )
 SQL SECURITY INVOKER
 BEGIN
     DECLARE v_result JSON;
-    CALL fractal_search_agent(p_query, p_table_name, p_vector_col, 50, 15, v_result);
-    SET p_answer = JSON_UNQUOTE(JSON_EXTRACT(v_result, '$.answer'));
+    CALL fractal_search_agent(p_query, p_table_name, p_vector_col, 50, 15, p_meta_filter, v_result);
+    -- The row ids, the index flag and the context budget are spliced in as
+    -- JSON literals, and are carried over from the search agent's result.
+    SET p_result = JSON_MERGE_PRESERVE(JSON_OBJECT(
+        -- JSON_VALUE, not JSON_UNQUOTE(JSON_EXTRACT(...)): the answer is the
+        -- model's own text, and MariaDB 10.6's JSON_UNQUOTE cannot carry a
+        -- character outside the BMP (an emoji in the answer came back as
+        -- "?"). JSON_VALUE hands the text over as it is.
+        'answer', IFNULL(JSON_VALUE(v_result, '$.answer'), ''),
+        'reasoning_step_failed', JSON_EXTRACT(v_result, '$.reasoning_step_failed')),
+        CONCAT('{"source_row_ids":', IFNULL(JSON_EXTRACT(v_result, '$.source_row_ids'), '[]'),
+               ',"used_index":', IFNULL(JSON_EXTRACT(v_result, '$.used_index'), 'false'),
+               ',"context_cut":', IFNULL(JSON_EXTRACT(v_result, '$.context_cut'), '{}'), '}'));
 END$$
 
 -- fractal_agent_plan_explore(initial_state, strategy_table, vector_col, max_branches, OUT result)
@@ -1583,6 +1824,9 @@ BEGIN
     DECLARE v_doc_id     JSON;
     DECLARE v_dist       DOUBLE;
     DECLARE v_vec        JSON;
+    DECLARE v_ix_name    VARCHAR(64);
+    DECLARE v_ix_res     LONGTEXT;
+    DECLARE v_ix_stats   LONGTEXT;
 
     CALL _fractalsql_agent_require_ident('fractal_agent_plan_explore', JSON_ARRAY(p_initial_state, p_strategy_table, p_vector_col),
         'initial_state, strategy_table and vector_col must not be NULL');
@@ -1592,8 +1836,19 @@ BEGIN
         CALL _fractalsql_agent_fail('fractal_agent_plan_explore', 'embedding failed');
     END IF;
 
-    CALL _fractalsql_scan_corpus(p_strategy_table, p_vector_col, v_corpus, v_ids);
-    CALL _fractalsql_telemetry_topk(v_corpus, v_ids, v_query_vec, v_k, v_topk);
+    -- agent_use_index: the max_branches nearest rows through the index when the session allows it (off scans; on uses any index on the
+    -- column; auto only a ready, calibrated one on a table of agent_index_min_rows rows). Every distance is still exact; the rows are
+    -- identified by the same primary key either way.
+    CALL _fractalsql_agent_index_name(p_strategy_table, p_vector_col, v_ix_name);
+    IF v_ix_name IS NOT NULL THEN
+        CALL fractal_search(p_strategy_table, p_vector_col, v_query_vec, v_k, '{}', v_ix_res, v_ix_stats);
+        SET v_topk = v_ix_res;
+        SET @_fractalsql_agent_search_path = 'index';
+    ELSE
+        CALL _fractalsql_scan_corpus(p_strategy_table, p_vector_col, v_corpus, v_ids);
+        CALL _fractalsql_telemetry_topk(v_corpus, v_ids, v_query_vec, v_k, v_topk);
+        SET @_fractalsql_agent_search_path = 'scan';
+    END IF;
 
     SELECT column_name INTO v_pk_col FROM information_schema.key_column_usage
     WHERE table_schema = DATABASE() AND table_name = p_strategy_table AND constraint_name = 'PRIMARY' LIMIT 1;
@@ -1606,13 +1861,17 @@ BEGIN
 
     SET v_n = JSON_LENGTH(v_topk);
     WHILE v_i < v_n DO
-        SET v_doc_id = JSON_EXTRACT(v_topk, CONCAT('$[', v_i, '].doc_id'));
+        SET v_doc_id = JSON_VALUE(v_topk, CONCAT('$[', v_i, '].doc_id'));
         SET v_dist   = JSON_VALUE(v_topk, CONCAT('$[', v_i, '].dist'));
 
+        -- The id goes into a SQL literal, so it has to be the plain text:
+        -- JSON_VALUE gives it as it is (MariaDB 10.6's JSON_UNQUOTE cannot
+        -- carry a character outside the BMP and would have handed over a
+        -- mangled id here), and IFNULL keeps an empty id an empty id.
         SET @_fractalsql_pe_sql = CONCAT(
             'SELECT ', v_col_expr, ' INTO @_fractalsql_pe_vec FROM ',
             _fractalsql_quote_ident(p_strategy_table), ' WHERE ', _fractalsql_quote_ident(v_pk_col),
-            ' = ', QUOTE(JSON_UNQUOTE(v_doc_id)));
+            ' = ', QUOTE(IFNULL(v_doc_id, '')));
         SET @_fractalsql_pe_vec = NULL;
         PREPARE _fractalsql_pe_stmt FROM @_fractalsql_pe_sql;
         EXECUTE _fractalsql_pe_stmt;
@@ -1623,10 +1882,13 @@ BEGIN
         -- elements by JSON semantics, not text munging -- see
         -- _fractalsql_scan_corpus's comment (sql/install_udf.sql) on why
         -- naive string concatenation of JSON fragments is unsafe here.
-        SET v_branches = JSON_MERGE_PRESERVE(v_branches, JSON_ARRAY(JSON_OBJECT(
-            'doc_id', JSON_EXTRACT(v_doc_id, '$'),
-            'plan_trajectory', JSON_EXTRACT(IFNULL(v_vec, JSON_ARRAY()), '$'),
-            'score', 1.0 - v_dist)));
+        --
+        -- The id is spliced in as a JSON literal: JSON_OBJECT stringifies a
+        -- JSON-typed argument, which mangled the caller's own id text.
+        SET v_branches = JSON_MERGE_PRESERVE(v_branches, JSON_ARRAY(JSON_MERGE_PRESERVE(
+            CONCAT('{"doc_id":', JSON_EXTRACT(v_doc_id, '$'), '}'),
+            JSON_OBJECT('plan_trajectory', JSON_EXTRACT(IFNULL(v_vec, JSON_ARRAY()), '$'),
+                        'score', 1.0 - v_dist))));
         SET v_i = v_i + 1;
     END WHILE;
 

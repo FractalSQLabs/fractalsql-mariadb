@@ -113,6 +113,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -177,7 +178,10 @@ static void
 sfs_detail_bounded(const char *detail, char *out, size_t cap)
 {
     size_t len = strlen(detail);
+    if (cap == 0) return;
     if (len + 1 <= cap) { memcpy(out, detail, len + 1); return; }
+    /* A buffer too small for the truncation marker takes a plain cut: cap - 1 - mark would wrap. */
+    if (cap < sizeof SFS_DETAIL_MARK) { memcpy(out, detail, cap - 1); out[cap - 1] = '\0'; return; }
     {
         size_t mark = sizeof SFS_DETAIL_MARK - 1;
         size_t keep = cap - 1 - mark;      /* room for the marker + NUL */
@@ -221,7 +225,11 @@ str_out_ensure(str_out_ctx *so, size_t need)
     char  *nb;
     if (need <= so->cap) return true;
     ncap = so->cap ? so->cap : 256;
-    while (ncap < need) ncap *= 2;
+    while (ncap < need) {
+        /* doubling must not wrap (to 0, which never reaches need) */
+        if (ncap > SIZE_MAX / 2) { ncap = need; break; }
+        ncap *= 2;
+    }
     nb = realloc(so->buf, ncap);
     if (nb == NULL) return false;
     so->buf = nb; so->cap = ncap;
@@ -1062,7 +1070,12 @@ embed_env_open(fsql_ctx *ctx, unsigned long long session_id,
 static void
 embed_env_close(char **saved)
 {
+    /* setenv/unsetenv rewrite the process environment vector, so the restore leg takes the same
+     * cross-TU lock every other tier's setenv burst holds (embed_env_open released it before
+     * returning): otherwise a restore can land inside another tier's publish -> plugin-load window. */
+    fractal_config_env_lock();
     embed_env_restore(saved);
+    fractal_config_env_unlock();
 }
 
 /* Load the reasoning plugin into `ctx` if not already loaded (per
@@ -1212,6 +1225,7 @@ fractal_reason(UDF_INIT *initid, UDF_ARGS *args, char *result,
     unsigned long ctx_json_len;
     bool    loaded = false;
     fsql_ctx *ctx;
+    char err_copy[SFS_DETAIL_MAX + 1];
     fsql_ai_response_t resp;
     int     rc;
     (void) result;
@@ -1263,9 +1277,18 @@ fractal_reason(UDF_INIT *initid, UDF_ARGS *args, char *result,
     }
     rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1],
                           ctx_json, ctx_json_len, &resp);
+    /* The core writes its error message into the context, and the tier's
+     * context is shared by every connection that uses the tier: read the
+     * message while the tier's lock is still held, or the read races
+     * another thread's dispatch (ThreadSanitizer sees exactly that). */
+    err_copy[0] = '\0';
+    if (rc != FSQL_OK || resp.rc != 0) {
+        const char *e = fsql_last_error(ctx);
+        if (e) snprintf(err_copy, sizeof err_copy, "%s", e);
+    }
     load_unlock();
     if (rc != FSQL_OK || resp.rc != 0) {
-        const char *err = fsql_last_error(ctx);
+        const char *err = err_copy;
         char detail[SFS_DETAIL_MAX + sizeof SFS_DETAIL_MARK];
         sfs_detail_bounded(err && *err ? err : "(no detail)",
                            detail, sizeof detail);
@@ -1293,6 +1316,17 @@ fractal_reason(UDF_INIT *initid, UDF_ARGS *args, char *result,
         SFS_INIT_ERROR(errbuf,
             "fractal_reason: reasoning plugin returned a NULL summary on a "
             "success status -- likely a plugin bug");
+        fsql_ai_response_free(&resp);
+        fractal_session_release_tier();
+        return agent_partial_or_error(sid, so, errbuf, length,
+                                      is_null, error);
+    }
+
+    /* A NUL inside the text would put a string on the wire whose length does not match its content. */
+    if (resp.summary_len > 0 && memchr(resp.summary, '\0', resp.summary_len) != NULL) {
+        SFS_INIT_ERROR(errbuf,
+            "fractal_reason: reasoning plugin returned a response with an embedded NUL "
+            "-- likely a plugin bug");
         fsql_ai_response_free(&resp);
         fractal_session_release_tier();
         return agent_partial_or_error(sid, so, errbuf, length,
@@ -1344,6 +1378,7 @@ fractal_embed(UDF_INIT *initid, UDF_ARGS *args, char *result,
     unsigned long long sid;
     bool    loaded = false;
     fsql_ctx *ctx;
+    char err_copy[SFS_DETAIL_MAX + 1];
     fsql_ai_response_t resp;
     int     rc;
     double *dv = NULL;
@@ -1395,11 +1430,20 @@ fractal_embed(UDF_INIT *initid, UDF_ARGS *args, char *result,
             *error = 1; return NULL;
         }
         rc = fsql_dispatch_ai(ctx, args->args[1], args->lengths[1], "{}", 2, &resp);
+    /* The core writes its error message into the context, and the tier's
+     * context is shared by every connection that uses the tier: read the
+     * message while the tier's lock is still held, or the read races
+     * another thread's dispatch (ThreadSanitizer sees exactly that). */
+        err_copy[0] = '\0';
+        if (rc != FSQL_OK || resp.rc != 0) {
+            const char *e = fsql_last_error(ctx);
+            if (e) snprintf(err_copy, sizeof err_copy, "%s", e);
+        }
         embed_env_close(saved);
         load_unlock();
     }
     if (rc != FSQL_OK || resp.rc != 0) {
-        const char *err = fsql_last_error(ctx);
+        const char *err = err_copy;
         char detail[SFS_DETAIL_MAX + sizeof SFS_DETAIL_MARK];
         sfs_detail_bounded(err && *err ? err : "(no detail)",
                            detail, sizeof detail);

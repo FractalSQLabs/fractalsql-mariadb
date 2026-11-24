@@ -99,6 +99,9 @@ enum {
     FSQL_CFG_ENTERPRISE_LEDGER_PATH,
     FSQL_CFG_ENTERPRISE_LEDGER_KEY,
     FSQL_CFG_ENTERPRISE_REQUIRE_SIGNATURE,
+    FSQL_CFG_AGENT_USE_INDEX,   /* session-only: off, on or auto: the agents search through a fractal_index */
+    FSQL_CFG_AGENT_INDEX_MIN_ROWS,     /* session-only: the smallest table auto mode searches through an index */
+    FSQL_CFG_AGENT_CONTEXT_ROW_BYTES,  /* session-only: the longest text cell the retrieval agents pass to the model */
     FSQL_CFG_KEY_COUNT
 };
 

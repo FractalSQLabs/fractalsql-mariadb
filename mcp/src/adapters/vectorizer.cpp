@@ -33,7 +33,7 @@ namespace fsqlmcp
             { Str( "source_table", true, "source table, bare name" ),
               Str( "text_col", true, "TEXT column to embed" ),
               Str( "embedding_col", true, "embedding column (TEXT or native VECTOR(n))" ),
-              Obj( "options", false, "{\"max_embeds_per_window\":n, \"rate_window_secs\":n (default 3600)}" ) },
+              Obj( "options", false, "{\"max_embeds_per_window\":n, \"rate_window_secs\":n (default 3600), \"chunk_size\":n (1..100000; turns chunking on), \"chunk_overlap\":n, \"chunk_mode\":\"paragraph|sentence|fixed\", \"chunk_table\":name}" ) },
             [ &db ]( const Json& a, CallCtx& )
             {
                 Json res = db.callProc( "fractal_vectorizer_create",
@@ -106,6 +106,15 @@ namespace fsqlmcp
                 return db.callProcResultSet( "fractal_vectorizer_process_queue",
                     { optInt( a, "batch_size" ), optInt( a, "stale_after" ) } );
             } ) );
+
+        t.push_back( mkTool( "fractal_vectorizer_status", "vectorizer", "pure", ToolClass::Cheap,
+            "One row per vectorizer: its id, source table, text and embedding columns, state (enabled or paused), the queue counts "
+            "(pending, done, failed) and the last error. The same data as the fractalsql://vectorizer/status resource.",
+            {},
+            [ &db ]( const Json&, CallCtx& )
+            {
+                return Json{ { "vectorizers", db.selectRowsRaw( "SELECT * FROM fractal_vectorizer_status" ) } };
+            }, true, 0 ) );
 
         return t;
     }

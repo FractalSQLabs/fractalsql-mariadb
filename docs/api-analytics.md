@@ -6,7 +6,7 @@
 
 The Analytics tier provides mathematical primitives for analyzing the "shape" of data and state, turning raw vectors into structural insights.
 
-MariaDB has no array types and no `DEFAULT`-argument syntax for `CREATE FUNCTION`. Every array argument is therefore a CSV-or-bracketed-JSON-array **string** (the same convention `fractal_search`'s own `vector_csv`/`query_csv` arguments already use: `'1,2,3'` or `'[1,2,3]'`), and every optional trailing scalar argument is bundled into one trailing JSON `params` string instead. Functions that return structured results return them as JSON-valid `STRING` values.
+MariaDB has no array types and no `DEFAULT`-argument syntax for `CREATE FUNCTION`. Every array argument is therefore a CSV-or-bracketed-JSON-array **string** (the same convention `fractal_sfs_converge`'s own `vector_csv`/`query_csv` arguments already use: `'1,2,3'` or `'[1,2,3]'`), and every optional trailing scalar argument is bundled into one trailing JSON `params` string instead. Functions that return structured results return them as JSON-valid `STRING` values.
 
 ---
 
@@ -68,6 +68,29 @@ DFA's complement: localizes *where* a series' mean and/or variance shifted, inst
 
 **Signature**: `fractal_change_point_detect(series_csv TEXT, win INT, threshold DOUBLE, max_points INT) RETURNS TEXT` (JSON array of ascending 0-indexed boundary positions, e.g. `"[12,47]"`)
 Sliding two-sample test over adjacent windows of `win` samples; flags a boundary when the mean differs by more than `threshold` pooled-standard-deviation units or the variance ratio exceeds `threshold` squared. Returns up to `max_points` boundaries. Requires at least `2 * win` points.
+
+### `fractal_chunk_text`
+**Split long text into chunks (pure, no model)**
+
+**Signature**: `fractal_chunk_text(text TEXT, size INT, overlap INT [, mode TEXT]) RETURNS TEXT` (JSON array of `{"no","start","end","text"}`)
+
+Splits `text` into chunks of at most `size` characters and returns a JSON array. `start` and `end` are character offsets into the original text (`end` is exclusive), and `text` is that slice. Characters are UTF-8 code points, not bytes. `size` is 1 to 100000, `overlap` is 0 to `size - 1`, and at most 100000 chunks are produced. A NULL text gives NULL; an empty or blank text gives `[]`. A bad size, overlap or mode gives NULL, as every UDF argument error does.
+
+| `mode` | How the text is cut |
+| --- | --- |
+| `paragraph` (the default) | At paragraph breaks (a run of blanks that contains at least two line feeds). Whole paragraphs are packed into a chunk while it stays within `size`. |
+| `sentence` | After a run of `.`, `!` or `?` that is followed by whitespace or the end. Whole sentences are packed the same way; a paragraph break also ends a sentence. |
+| `fixed` | Every `size - overlap` characters, ignoring the text's structure. |
+
+A paragraph or sentence longer than `size` is cut like a fixed span, and neighbouring pieces share `overlap` characters. `overlap` applies only to such cuts and to `fixed`. The chunk keeps the separators between the units it packs. The size is in characters, not tokens: pick it a little under your embedding model's limit.
+
+```sql
+SELECT j.no, j.text
+FROM JSON_TABLE(fractal_chunk_text('One. Two sentences! Is this three? Yes.', 20, 0, 'sentence'),
+                '$[*]' COLUMNS (no INT PATH '$.no', text TEXT PATH '$.text')) j;
+```
+
+The same function, with the same output, is available on every FractalSQL host. The vectorizer uses it when you give it a `chunk_size` (see [vectorizer-setup.md](vectorizer-setup.md)).
 
 ### `fractal_periodogram`
 **Classical Periodogram**
@@ -235,7 +258,7 @@ Both are stored PROCEDUREs, composing the existing `fractal_vector_l2_squared` U
 ### `fractal_store_morphology`
 Upserts a vector against a `doc_id`.
 
-**Signature**: `fractal_store_morphology(doc_id BIGINT, feature_array TEXT)` — `feature_array` is a JSON-array-string vector, the same convention as `fractal_search`'s `vector_csv`/`query_csv`.
+**Signature**: `fractal_store_morphology(doc_id BIGINT, feature_array TEXT)` — `feature_array` is a JSON-array-string vector, the same convention as `fractal_sfs_converge`'s `vector_csv`/`query_csv`.
 
 ```sql
 CALL fractal_store_morphology(1, '[0.1,0.2,0.3]');
@@ -299,6 +322,8 @@ SELECT fractal_vector_to_json(fractal_vector_from_text('[1,2,3]'));
 `VECTOR(n)` type: `VEC_FROMTEXT(fractal_vector_to_json(v))`. Below 11.7, store
 the canonical hex (or the JSON string) in a plain `TEXT`/`JSON` column and
 every function here works unchanged either way.
+
+Every distance in this section is computed by the one shared double-precision implementation, so the values agree to the last bit with the other SQL-visible distances and with every other FractalSQL host -- see the precision contract in [api-discovery.md](api-discovery.md).
 
 ### `fractal_vector_lp_distance`
 **Generalized $L_p$ Distance**

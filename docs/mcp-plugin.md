@@ -52,7 +52,7 @@ listed once, with its default, in
 authentication, protocol and session behaviour is described in
 [Security](#security).
 
-Requests whose JSON nests deeper than 128 levels are rejected with a parse error, and an HTTP request with ambiguous framing (a repeated or non-numeric `Content-Length`, or an unsupported `Transfer-Encoding`) is refused with `400`.
+Requests whose JSON nests deeper than 128 levels are rejected with a parse error, and an HTTP request with ambiguous framing (a repeated or non-numeric `Content-Length`, an unsupported `Transfer-Encoding`, or a repeated `Host`, `Authorization`, `Origin`, `Content-Type` or `Mcp-*` header) is refused with `400`.
 
 The server binary is the C++ build under `mcp/` (`mcp\dist\windows-mcp\fractalsql-mariadb-mcp.exe`
 on Windows, `mcp/fractalsql-mariadb-mcp` on macOS/POSIX — see the mcp README for the
@@ -111,8 +111,12 @@ symbols raise is exactly what makes an agent able to self-correct a bad call.
 
 | Tool | Purpose |
 |---|---|
-| `fractal_search` | Sniper-mode SFS convergence / inline-corpus top-k (this engine's one symbol does both: pass `corpus` for top-k, omit it for pure convergence; `{"debug":true}` in `params` gives the trajectory trace) |
-| `fractal_search_debug` | The convergence view of the SFS: no corpus, no top-k, the walk's own trace on one query point -> `{dim, n_corpus, best_fit, best_point, trace:{...}}`. Pass `seed` for a byte-stable result |
+| `fractal_sfs_converge` | Sniper-mode SFS convergence / inline-corpus top-k (this engine's one symbol does both: pass `corpus` for top-k, omit it for pure convergence; `{"debug":true}` in `params` gives the trajectory trace) |
+| `fractal_sfs_converge_debug` | The convergence view of the SFS: no corpus, no top-k, the walk's own trace on one query point -> `{dim, n_corpus, best_fit, best_point, trace:{...}}`. Pass `seed` for a byte-stable result |
+| `fractal_search` | Indexed k-NN over a real table, through the native IVF index when one exists on that table/column (an exact scan otherwise) -> `{result:[{doc_id, dist}], stats:{used_index, rows_scanned, cells_probed}}`. Every distance is exact: the index only narrows the candidates. Does NOT apply Diversify repulsion |
+| `fractal_index_ensure` | One call that leaves the index on a table and column fit to use: builds it when missing, folds in a few added rows, rebuilds after large changes, and otherwise changes nothing -> `{name, action, status, generation, rows}`. For a setup script or a scheduled job. |
+| `fractal_index_create` / `fractal_index_rebuild` / `fractal_index_refresh` / `fractal_index_drop` / `fractal_index_info` / `fractal_index_list` | The native IVF index's management surface: build (options: `name`, `vector_format`, `nlist`, `pca_dim`, `iters`, `sample`, `seed`), rebuild, refresh (fold in the rows added since the build), drop, the status/advice/sizes report, and the list of indexes |
+| `fractal_index_candidates` | The candidate row ids for a Scout pass over an indexed table: every row of the `near` nearest cells, `per_cell` representatives from the others, and the rows added since the build |
 | `fractal_search_explore` | Scout-mode diverse population search over an inline corpus (the anti-mode-collapse primitive) |
 | `fractal_search_telemetry` | Ground-truth k-NN over a real table: `[{doc_id, dist}]`; `doc_id` is the table's single-column PK value |
 | `fractal_hybrid_clinical_search` | Cohort-restricted telemetry: restrict the scan to an explicit `doc_ids` array first |
@@ -191,8 +195,8 @@ decision table instead of reading sixteen descriptions.
 
 | Tool | Shape |
 |---|---|
-| `fractal_search_agent` | embed -> Scout -> reason over matched rows' real content -> `{answer, source_doc_ids, execution_time_ms}` |
-| `fractal_rag_agent` | lighter single-turn: `{answer}` only |
+| `fractal_search_agent` | embed -> Scout -> reason over matched rows' real content -> `{answer, source_row_ids, execution_time_ms}` |
+| `fractal_rag_agent` | lighter single-turn: `{answer, source_row_ids, used_index, context_cut}`; `meta_filter` limits the rows searched |
 | `fractal_sql_agent` | self-correcting NL->SQL with an explicit `auto_execute` flag (default false) -> `{generated_sql, execution_status, result_json}` |
 | `fractal_agent_plan_explore` | MCTS-style strategy branches -> one entry per branch |
 | `fractal_agent_trajectory_predict` | forecast state vs. a table's own history |
@@ -208,7 +212,7 @@ least-privilege account (below) before even considering it.
 `fractal_dimension_dfa` (>=24 points in practice, not the documented 16),
 `fractal_dimension_boxcount` (hundreds of points for a stable estimate, not 8),
 `fractal_dimension_drift`, `fractal_state_fingerprint`, `fractal_cycle_detect`,
-`fractal_change_point_detect`, `fractal_periodogram`,
+`fractal_change_point_detect`, `fractal_chunk_text` (split text into chunks, for embedding), `fractal_periodogram`,
 `fractal_spectrogram_entropy`, `fractal_tda_persistence_diagram`,
 `fractal_vector_lp_distance` (not a proper metric for 0<p<1 -- never substitute it
 silently for cosine), `fractal_vector_quantize_int8`, `fractal_vector_quantize_binary`,
@@ -246,6 +250,17 @@ as the JSON/CSV text form, so a stored vector round-trips through either
 representation. `fractal_vector_to_json` is also the bridge to MariaDB 11.7+'s
 native `VECTOR(n)` type: `VEC_FROMTEXT(fractal_vector_to_json(v))`.
 
+**The vector algebra.** `fractal_vector_dims` (how many components a vector
+has), `fractal_vector_norm` (its L2 magnitude), `fractal_vector_normalize`
+(scaled to unit length), `fractal_vector_add` and `fractal_vector_sub`
+(element-wise sum and difference), `fractal_vector_scale` (multiplied by a
+factor), and the distances `fractal_vector_l2_distance`,
+`fractal_vector_l2_squared`, `fractal_vector_cosine_distance`,
+`fractal_vector_cosine_similarity` and `fractal_vector_negative_inner_product`.
+A vector comes back as a JSON array of numbers; a distance or a norm comes
+back as the number itself. Every one of them takes the canonical form or the
+JSON/CSV text form as input, like the three tools above.
+
 ### Enterprise (ledger)
 
 `fractal_ledger_flush` / `_load` / `_verify` / `_compact` / `_reset_soft` /
@@ -253,15 +268,17 @@ native `VECTOR(n)` type: `VEC_FROMTEXT(fractal_vector_to_json(v))`.
 `fractal_audit_log`. The write-path tools surface the clean dormant condition on
 Community; `fractal_ledger_verify` is a read-only forensic query that works on every
 tier. `fractal_ledger_reset_hard` empties in-memory history and carries the
-destructive annotation -- a human-consent client UI asks before calling it.
+destructive annotation -- a human-consent client UI asks before calling it. `fractal_ledger_compact`,
+`_reset_soft` and `_reset_hard` also refuse unless the server's operator has set
+`FRACTALSQL_LEDGER_ALLOW_DESTRUCTIVE=1` (see [enterprise.md](enterprise.md)); `_flush` is not affected.
 
 ### Vectorizer
 
 `fractal_vectorizer_create`, `_pause`, `_resume`, `_drop` (irreversible ->
 destructive annotation), `_enqueue` (this engine's manual per-row enqueue for rows the
-triggers couldn't see), `_process_queue`. There is no background worker by design:
-nothing embeds until you call `_process_queue` on your own schedule. Monitoring state
-is the `fractalsql://vectorizer/status` resource.
+triggers couldn't see), `_process_queue`, and the read-only `_status` (one row per vectorizer with its state, queue counts and last error). There is no background worker by design:
+nothing embeds until you call `_process_queue` on your own schedule. The same data is the
+`fractalsql://vectorizer/status` resource.
 
 The work queue does not grow forever: each `_process_queue` pass drops the rows that
 finished over an hour ago and the rows that failed over a day ago, for that account's
@@ -350,7 +367,7 @@ the daemon-wide values:
 
 A session may change the **tuning** keys and nothing else:
 `reasoning_model`, `embed_model`, `think`, `think_num_ctx`, `t2s_max_attempts`,
-`t2s_use_review`. The refusal is decided **by the engine**, by name, with the
+`t2s_use_review`, `agent_use_index`, `agent_index_min_rows`, `agent_context_row_bytes`. The refusal is decided **by the engine**, by name, with the
 reason -- this layer never decides what is allowed, it only reports the
 refusal. The key is checked before the value, so the refusal always names the
 key:
@@ -630,7 +647,7 @@ what makes a failure diagnosable:
 
 | Tools | Tier | What has to be right |
 |---|---|---|
-| `fractal_search`, `fractal_search_debug`, `fractal_search_explore`, the telemetry/hybrid/trajectory searches | Discovery | nothing but the daemon being up -- no model, no endpoint |
+| `fractal_sfs_converge`, `fractal_sfs_converge_debug`, `fractal_search_explore`, the telemetry/hybrid/trajectory searches | Discovery | nothing but the daemon being up -- no model, no endpoint |
 | `fractal_reason` | Reasoning | `reasoning_plugin` + `reasoning_url` (+ model) |
 | `fractal_embed` | Embedding | `embed_url` (+ model) |
 | `fractal_text_to_sql` | Text-to-SQL | the reasoning tier, plus the `t2s_*` knobs |
@@ -802,7 +819,7 @@ given its own tool allowlist:
 {
   "tokens": [
     { "name": "analyst", "sha256": "<hex sha256 of that client's token>",
-      "tools": ["fractal_search", "fractal_agent_data_analyst"],
+      "tools": ["fractal_sfs_converge", "fractal_agent_data_analyst"],
       "expires": "2027-01-31T00:00:00Z" },
     { "name": "batch", "sha256": "<hex sha256>", "tools": "*" }
   ]
@@ -831,9 +848,10 @@ What the server does with a request, in the order it decides:
 | Situation | Answer |
 | --- | --- |
 | A repeated `Content-Length`, a non-numeric one, an unsupported `Transfer-Encoding`, or both `Content-Length` and `Transfer-Encoding` | `400` -- the framing is ambiguous and is never resolved in favor of one reading |
-| `GET /healthz` and `GET /readyz` | served without a token (probes need orchestrator access without a credential baked into a healthcheck command); the JSON-RPC path is never exempt |
+| A repeated `Host`, `Authorization`, `Origin`, `Content-Type` or `Mcp-*` header | `400` — two values for a header the server acts on are never resolved in favour of one |
+| `GET /healthz` and `GET /readyz` | served without a token (probes need orchestrator access without a credential baked into a healthcheck command); the JSON-RPC path is never exempt; `/readyz` runs its engine probe at most once every 5 seconds and answers the cached result in between |
 | A path the server does not serve | `404` -- **before** the token check. The 404 IS the answer, the request is not dispatched, and no tool runs. That ordering is a deliberate trade: a misconfigured client gets a clear "wrong path" instead of a misleading `401`, and the only thing an unauthenticated caller learns from it is which path the JSON-RPC endpoint is on (`/healthz` already says that) |
-| A browser `Origin` header that is not on `FSQL_MCP_ALLOWED_ORIGINS` | `403`, also **before** the token, so an unapproved origin never reaches the credential check |
+| A browser `Origin` header that is not on `FSQL_MCP_ALLOWED_ORIGINS` | `403`, also **before** the token, so an unapproved origin never reaches the credential check; a loopback origin is `localhost`, `[::1]` or a literal address in `127.0.0.0/8` — a name that merely begins with `127.` is not one |
 | No credential presented | `401` with `WWW-Authenticate: Bearer realm="fractalsql-mcp"` |
 | A credential that was presented but is wrong, expired, or unknown | `401` with `WWW-Authenticate: Bearer realm="fractalsql-mcp", error="invalid_token"` |
 | A token in the query string instead of the `Authorization` header | `401` -- the header is the only place a credential is read from, because a query string lands in proxy logs and access logs |
@@ -1133,6 +1151,6 @@ configure, in [enterprise.md](enterprise.md) and
 | startup stderr: version-skew warning (`version_skew`) | The engine on the other end of the connection is not the release this plugin was built against the documented SQL surface of -- pin/align versions. |
 | `fractal_daemon_config_set` -> "the daemon did NOT accept the reload: ..." | Read the returned reason (range/empty/startup-only). The daemon kept its previous config (all-or-nothing); the file edit is intact for a restart instead. |
 | `server busy` | Concurrency caps from 10.7 -- lower parallelism, or raise `FSQL_MCP_MAX_CONCURRENT_*` deliberately. |
-| `fractal_search` returned NULL all of a sudden | Documented behavior: out-of-range SFS params make the WHOLE call NULL (e.g. `iterations > 10000`); fix the knobs. |
+| `fractal_sfs_converge` returned NULL all of a sudden | Documented behavior: out-of-range SFS params make the WHOLE call NULL (e.g. `iterations > 10000`); fix the knobs. |
 | A result carries `reasoning_step_failed: ...` with `isError: false` | The agent's data half computed fine; the LLM endpoint failed and the session reports it instead of discarding the computation (partial-result honesty). Fix the reasoning endpoint/model config via `fractal_configure_reasoning` and re-call. Set `FSQL_MCP_AGENT_PARTIAL=off` to return to the engine's raise-first behavior. |
 | 401 behind a shared deployment right after rotating the token | Token files hot-reload by mtime; if you rotated the env var instead, that's a restart (no hot-reload for env secrets). |

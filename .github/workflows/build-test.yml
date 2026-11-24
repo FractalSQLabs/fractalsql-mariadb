@@ -16,7 +16,8 @@ name: build-test
 #              winx64 zip, MariaDB 10.6/10.11/11.4/12.3 on
 #              windows-latest. See build_test.ps1's own .DESCRIPTION.
 #   darwin-gate-matrix: build_test.sh (the same script, unmodified) on
-#              macos-15, matrixed across the same 4 majors as
+#              macos-15 (Apple Silicon, plus one macos-15-intel cell for
+#              11.4), matrixed across the same 4 majors as
 #              gate-matrix/windows-gate-matrix, each pinned to Homebrew's
 #              versioned formula (mariadb@10.6, @10.11, @11.4, @12.3).
 #   linux-asan / linux-ubsan: build_test.sh --asan / --ubsan, MariaDB
@@ -170,10 +171,14 @@ jobs:
           exit $LASTEXITCODE
 
   darwin-gate-matrix:
-    name: build_test.sh mdb${{ matrix.mdb }} (macOS)
+    name: build_test.sh mdb${{ matrix.mdb }} (macOS${{ matrix.runner == 'macos-15-intel' && ' Intel' || '' }})
     if: github.event_name != 'schedule'
-    runs-on: macos-15
-    timeout-minutes: 30
+    runs-on: ${{ matrix.runner || 'macos-15' }}
+    # Per-cell budget: the arm64 cells finish the whole gate suite in about
+    # 15 minutes, while the Intel cell -- GitHub's last Intel image, a
+    # shared and much slower runner -- was still at gate 47 when the old
+    # flat 30-minute budget cancelled it (twice). It gets its own.
+    timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -189,6 +194,12 @@ jobs:
             # formula tracks the newest major (13.0 now), so it cannot
             # stand in for 12.3.
             formula: "mariadb@12.3"
+          # One Intel cell (macos-15-intel, GitHub's last Intel image, available until August 2027): release.yml builds
+          # the shim, the daemon and the MCP server natively there.
+          - mdb: "11.4"
+            formula: "mariadb@11.4"
+            runner: macos-15-intel
+            timeout: 75
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -212,7 +223,11 @@ jobs:
     name: build_test.sh --asan mdb11.4
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/2.x')
     runs-on: ubuntu-24.04  # not ubuntu-latest: MariaDB's apt repo has no release for Ubuntu 26.04 ('resolute')
-    timeout-minutes: 20
+    # 35, not 20: the instrumented daemon makes every gate slower, and the
+    # 2.x gate additions (83-87) took the cell past the old budget -- it was
+    # cancelled at 20 minutes while still running the suite. The ubsan cell
+    # (11 minutes) and the tsan cell (18) stay inside theirs.
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4

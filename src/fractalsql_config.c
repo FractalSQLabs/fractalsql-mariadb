@@ -82,7 +82,14 @@ static const fsq_cfg_key g_keys[FSQL_CFG_KEY_COUNT] = {
     { "enterprise_ledger_key",       FSQL_CFG_TYPE_STR,  0, 0, NULL,
       false, true,  NULL, 0 },
     { "enterprise_require_signature",FSQL_CFG_TYPE_BOOL, 0, 0, NULL,
-      false, false, NULL, 0 }
+      false, false, NULL, 0 },
+    /* Session-only and off by default: no daemon-wide value, no env var. */
+    { "agent_use_index",             FSQL_CFG_TYPE_ENUM, 0, 0, "off|on|auto",
+      true,  false, NULL, 0 },
+    { "agent_index_min_rows",        FSQL_CFG_TYPE_INT,  0, 2000000, NULL,
+      true,  false, NULL, 0 },
+    { "agent_context_row_bytes",     FSQL_CFG_TYPE_INT,  0, 1048576, NULL,
+      true,  false, NULL, 0 }
 };
 
 const fsq_cfg_key *fractal_config_key_table(void) { return g_keys; }

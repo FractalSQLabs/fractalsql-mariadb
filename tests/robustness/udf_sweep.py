@@ -199,16 +199,16 @@ def mode_params():
     for k in INT_KEYS + DOUBLE_KEYS:
         for v in PARAM_NUMBERS:
             p = '{"%s":%s}' % (k, v)
-            yield f"SELECT fractal_search({CORPUS},'0,0',2,{q(p)});"
+            yield f"SELECT fractal_sfs_converge({CORPUS},'0,0',2,{q(p)});"
             yield f"SELECT fractal_search_explore({CORPUS},'0,0',{q(p)});"
             yield f"SELECT fractal_diversify_enable(CONNECTION_ID()),fractal_diversify_set_params(CONNECTION_ID(),{q(p)});"
     for p in PARAM_SHAPES:
-        yield f"SELECT fractal_search({CORPUS},'0,0',2,{q(p)});"
+        yield f"SELECT fractal_sfs_converge({CORPUS},'0,0',2,{q(p)});"
         yield f"SELECT fractal_search_explore({CORPUS},'0,0',{q(p)});"
         yield f"SELECT fractal_diversify_set_params(CONNECTION_ID(),{q(p)});"
     for sid in ("9", "777", "0", "-1", "18446744073709551615"):
         yield (f"SELECT fractal_diversify_enable({sid});"
-               f"SELECT fractal_search({CORPUS},'0,0',2,'{{\"session_id\":{sid},\"debug\":true}}');"
+               f"SELECT fractal_sfs_converge({CORPUS},'0,0',2,'{{\"session_id\":{sid},\"debug\":true}}');"
                f"SELECT fractal_search_explore({CORPUS},'0,0','{{\"session_id\":{sid}}}');"
                f"SELECT fractal_explain_result({sid});SELECT fractal_detect_collapse({sid});"
                f"SELECT fractal_isolate_background({sid});SELECT fractal_diversify_disable({sid});"
@@ -216,7 +216,7 @@ def mode_params():
     for a in ("'0,0'", "'0,0',0", "'0,0',1", "'0,0',3,2", "'0,0',3,3,1", "'0,0',3,3,33", "'0,0',3,3,2,5",
               "'0,0',10001", "'0,0',3,10001", "'0,0',3,3,2,-1", "'0,0',NULL,NULL,NULL,NULL", "'0,0','x'",
               "'0,0',3.5", "'',3", "NULL", "'x'", "'0,0,0,0,0,0,0,0'"):
-        yield f"SELECT fractal_search_debug({a});"
+        yield f"SELECT fractal_sfs_converge_debug({a});"
 
 
 CONFIG_KEYS = ("reasoning_plugin reasoning_url reasoning_token reasoning_model reasoning_allow_plaintext embed_url "
@@ -258,8 +258,8 @@ def mode_config():
 
 def mode_oversize():
     big = "CONCAT(REPEAT('1,',2300000),'1')"        # about 4.4 MiB, past the 4 MiB query limit
-    calls = ["fractal_search(%s,%s,2,'{}')" % (CORPUS, big), "fractal_search(%s,'0,0',2,'{}')" % big,
-             "fractal_search_explore(%s,%s,'{}')" % (CORPUS, big), "fractal_search_debug(%s)" % big,
+    calls = ["fractal_sfs_converge(%s,%s,2,'{}')" % (CORPUS, big), "fractal_sfs_converge(%s,'0,0',2,'{}')" % big,
+             "fractal_search_explore(%s,%s,'{}')" % (CORPUS, big), "fractal_sfs_converge_debug(%s)" % big,
              "fractal_dimension_dfa(%s)" % big, "fractal_dimension_boxcount(%s,2)" % big,
              "fractal_dimension_drift(%s,16)" % big, "fractal_periodogram(%s,3)" % big,
              "fractal_change_point_detect(%s,16)" % big, "fractal_spectrogram_entropy(%s)" % big,

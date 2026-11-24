@@ -63,6 +63,11 @@ admin/config tools, over the daemon's own socket/named pipe and its own
 HMAC key — that is the suite's one deliberate two-credential realm
 (docs/mcp-plugin.md, "Admin").
 
+The connector is not redistributed: on Linux it is the system's
+`libmariadb` (a package dependency), on macOS Homebrew's
+`mariadb-connector-c`, and on Windows an install prerequisite the MSI
+checks for and `fractalsql-mcp.cmd` resolves onto PATH at start.
+
 ## Building & running
 
 ```bash
